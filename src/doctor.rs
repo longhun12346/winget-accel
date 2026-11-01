@@ -52,8 +52,14 @@ pub fn run(app: &App) -> (Vec<Check>, bool) {
     checks.push(check_listen(app));
     checks.push(check_ca(app));
     checks.push(check_pac(app));
-    checks.extend(check_accels(&app.accels, app.health_timeout));
-    checks.push(check_chain(app));
+
+    let accel_checks = check_accels(&app.accels, app.health_timeout);
+    let reachable = accel_checks
+        .iter()
+        .filter(|c| c.verdict == Verdict::Pass)
+        .count();
+    checks.extend(accel_checks);
+    checks.push(check_chain(app, reachable));
 
     let ok = checks.iter().all(|c| c.verdict != Verdict::Fail);
     (checks, ok)
@@ -161,24 +167,33 @@ fn check_accels(accels: &[Accel], timeout: Duration) -> Vec<Check> {
         .collect()
 }
 
-/// 回退链健康度。
+/// 候选整体可用性。
 ///
-/// 全挂时**不回退直连**（ADR-016），所以"只有 1 个候选"就是真实的单点，
-/// 值得告警；但这不是配置错误，因此是 WARN 而非 FAIL。
-fn check_chain(app: &App) -> Check {
+/// 全挂时**不回退直连**（ADR-016），所以"一个都不可达"必须判 FAIL：
+/// 此时下载一定会失败，用户不该等到装上才发现。
+fn check_chain(app: &App, reachable: usize) -> Check {
+    if reachable == 0 {
+        return Check::new(
+            "chain",
+            Verdict::Fail,
+            format!(
+                "{} 个候选全部不可达：下载会立即失败（不会回退直连，ADR-016）",
+                app.accels.len()
+            ),
+        );
+    }
     if app.accels.len() < 2 {
-        Check::new(
+        return Check::new(
             "chain",
             Verdict::Warn,
-            "只有 1 个加速器候选：它一旦不可用，请求会快速返回 502（本工具不回退直连，ADR-016）",
-        )
-    } else {
-        Check::new(
-            "chain",
-            Verdict::Pass,
-            format!("{} 个候选", app.accels.len()),
-        )
+            "只有 1 个加速器候选：它一旦不可用，请求会快速返回 502（不会回退直连，ADR-016）",
+        );
     }
+    Check::new(
+        "chain",
+        Verdict::Pass,
+        format!("{reachable}/{} 个候选可达", app.accels.len()),
+    )
 }
 
 /// 打印表格。返回是否存在 FAIL。
@@ -209,7 +224,7 @@ pub fn print(checks: &[Check]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{App, CliOverrides, FileConfig};
+    use crate::config::{AcceleratorCfg, App, CliOverrides, FileConfig};
 
     fn app() -> App {
         App::new(FileConfig::default(), CliOverrides::default()).unwrap()
@@ -232,9 +247,32 @@ mod tests {
     fn single_candidate_warns_about_single_point() {
         let app = app();
         assert_eq!(app.accels.len(), 1);
-        let check = check_chain(&app);
+        let check = check_chain(&app, 1);
         assert_eq!(check.verdict, Verdict::Warn);
         assert!(check.detail.contains("1 个加速器候选"));
+    }
+
+    #[test]
+    fn all_candidates_down_is_a_failure() {
+        let app = app();
+        let check = check_chain(&app, 0);
+        assert_eq!(check.verdict, Verdict::Fail);
+        assert!(check.detail.contains("全部不可达"));
+    }
+
+    #[test]
+    fn multi_candidate_all_reachable_passes() {
+        let file = FileConfig {
+            accelerators: vec![
+                AcceleratorCfg { name: "a".into(), template: "https://a.example".into(), priority: 1 },
+                AcceleratorCfg { name: "b".into(), template: "https://b.example".into(), priority: 2 },
+            ],
+            ..Default::default()
+        };
+        let app = App::new(file, CliOverrides::default()).unwrap();
+        let check = check_chain(&app, 2);
+        assert_eq!(check.verdict, Verdict::Pass);
+        assert!(check.detail.contains("2/2"));
     }
 
     #[test]

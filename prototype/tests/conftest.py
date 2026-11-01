@@ -168,6 +168,15 @@ def make_upstream_handler(requests: list[dict]):
 
         def do_GET(self):  # noqa: N802
             headers = {k.lower(): v for k, v in self.headers.items()}
+
+            # 健康探测会定期打 origin 根路径（UA 固定）。它不属于被测流量，
+            # 不能进 requests，否则会挤掉真实请求的断言位置。
+            if "winget-accel-health" in headers.get("user-agent", ""):
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+
             requests.append({"path": self.path, "headers": headers})
 
             if "boom" in self.path:

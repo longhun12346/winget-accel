@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +31,8 @@ pub struct Proxy {
     pub stats: Arc<Stats>,
     pub log: Arc<Logger>,
     pub health: Arc<Tracker>,
+    /// 上一次观测到的"全挂"状态，用来只在**状态翻转**时报警，避免每请求刷日志。
+    down: AtomicBool,
 }
 
 impl Proxy {
@@ -46,6 +49,7 @@ impl Proxy {
             stats,
             log,
             health,
+            down: AtomicBool::new(false),
         }
     }
 
@@ -201,6 +205,7 @@ impl Proxy {
                         self.note_accel_failure(accel_idx, &accel, &format!("上游返回 {status}"));
                     } else {
                         self.health.record_success(accel_idx);
+                        self.report_health_state();
                     }
                 }
                 let tag = if plan.rewritten { "REWRITE" } else { "PASS" };
@@ -239,34 +244,63 @@ impl Proxy {
                 accel.host
             ));
         }
+        self.report_health_state();
     }
 
-    /// 周期探测所有候选。只探各自 origin 的根路径，
-    /// 收到任意 HTTP 响应（含 404）即视为可达——不能拿 GitHub 资产路径去探，
-    /// 受限网络下那里本身就不通，会把所有候选一起误判为不健康。
-    fn spawn_health_prober(&self) {
-        if !self.app.health_enabled || self.health.accels().len() < 2 {
+    /// 全挂时**报错**，恢复时再报一次。
+    ///
+    /// 只在状态翻转时报：否则每个失败请求都会刷一条，日志里真正那条反而被埋掉。
+    fn report_health_state(&self) {
+        let down = self.health.all_unhealthy();
+        let was_down = self.down.swap(down, Ordering::Relaxed);
+
+        if down && !was_down {
+            let detail = self
+                .health
+                .snapshot()
+                .iter()
+                .map(|(host, health)| format!("{host}={}", health.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.log.error(&format!(
+                "ALL-ACCEL-DOWN 所有加速器均不可用（{detail}）：请求会立即返回 502，后台继续重试"
+            ));
+        } else if !down && was_down {
+            self.log.info(&format!(
+                "ALL-ACCEL-RECOVERED 已有 {} 个加速器恢复可用",
+                self.health.healthy_count()
+            ));
+        }
+    }
+
+    /// 周期探测所有候选。**单候选也探**——否则一旦被判死就永久 502，没有任何恢复路径。
+    ///
+    /// 只探各自 origin 的根路径，收到任意 HTTP 响应（含 404）即视为可达；
+    /// 不能拿 GitHub 资产路径去探，受限网络下那里本身就不通，会把候选全部误判。
+    fn spawn_health_prober(self: &Arc<Self>) {
+        if !self.app.health_enabled {
             return;
         }
-        let health = Arc::clone(&self.health);
-        let log = Arc::clone(&self.log);
-        let timeout = self.app.health_timeout;
-        let interval = self.app.health_interval;
+        let proxy = Arc::clone(self);
 
         std::thread::spawn(move || loop {
-            for (idx, accel) in health.accels().iter().enumerate() {
-                let ok = probe(accel, timeout);
-                health.mark(idx, ok);
-                log.log(
+            for (idx, accel) in proxy.health.accels().iter().enumerate() {
+                let ok = probe(accel, proxy.app.health_timeout);
+                proxy.health.mark(idx, ok);
+                proxy.log.log(
                     Level::Debug,
-                    &format!(
-                        "HEALTH {} -> {}",
-                        accel.host,
-                        if ok { "ok" } else { "fail" }
-                    ),
+                    &format!("HEALTH {} -> {}", accel.host, if ok { "ok" } else { "fail" }),
                 );
             }
-            std::thread::sleep(interval);
+            proxy.report_health_state();
+
+            // 全挂时缩短重试间隔，让恢复更快被发现
+            let wait = if proxy.down.load(Ordering::Relaxed) {
+                Duration::from_secs(30)
+            } else {
+                proxy.app.health_interval
+            };
+            std::thread::sleep(wait);
         });
     }
 
@@ -350,7 +384,7 @@ impl Proxy {
                 write_response(&mut stream, 200, "application/x-ns-proxy-autoconfig", &body)
             }
             ("GET", "/health") => {
-                // 在计数器之外附上每个候选的健康状态，便于排障时一眼看出切换到了谁
+                // 在计数器之外附上每个候选的健康状态与总体状态，便于排障与脚本化监控
                 let mut body = self.stats.to_json();
                 let accels: Vec<String> = self
                     .health
@@ -360,9 +394,17 @@ impl Proxy {
                         format!("{{\"host\":\"{host}\",\"health\":\"{}\"}}", health.as_str())
                     })
                     .collect();
+                let status = if self.health.all_unhealthy() {
+                    "down"
+                } else {
+                    "ok"
+                };
                 body.insert_str(
                     body.len() - 1,
-                    &format!(",\"accelerators\":[{}]", accels.join(",")),
+                    &format!(
+                        ",\"status\":\"{status}\",\"accelerators\":[{}]",
+                        accels.join(",")
+                    ),
                 );
                 write_response(&mut stream, 200, "application/json", &body)
             }

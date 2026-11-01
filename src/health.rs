@@ -120,6 +120,22 @@ impl Tracker {
             .map(|(accel, state)| (accel.host.clone(), state.health))
             .collect()
     }
+
+    /// 所有候选都被判定为不健康。
+    ///
+    /// 单候选时这就是"唯一那条路断了"，必须显式报告，而不是等用户从 502 里猜。
+    pub fn all_unhealthy(&self) -> bool {
+        let states = self.states.lock().expect("健康状态锁中毒");
+        !states.is_empty() && states.iter().all(|s| s.health == Health::Unhealthy)
+    }
+
+    pub fn healthy_count(&self) -> usize {
+        let states = self.states.lock().expect("健康状态锁中毒");
+        states
+            .iter()
+            .filter(|s| s.health == Health::Healthy)
+            .count()
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +224,29 @@ mod tests {
         t.record_success(9);
         t.mark(9, true);
         assert_eq!(t.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn all_unhealthy_only_when_every_candidate_is_down() {
+        let t = tracker(1);
+        assert!(!t.all_unhealthy(), "启动时是 Unknown，不该报全挂");
+        t.mark(0, false);
+        assert!(!t.all_unhealthy(), "还有一个 Unknown，不算全挂");
+        t.mark(1, false);
+        assert!(t.all_unhealthy());
+    }
+
+    #[test]
+    fn recovers_from_total_outage() {
+        // 单候选被判死之后，必须还能靠探测恢复——否则永久 502
+        let single = Tracker::new(vec![accel("only.example", 443)], 1);
+        single.mark(0, false);
+        assert!(single.all_unhealthy());
+        assert!(single.current().is_none());
+
+        single.mark(0, true);
+        assert!(!single.all_unhealthy());
+        assert_eq!(single.current().unwrap().0, 0);
+        assert_eq!(single.healthy_count(), 1);
     }
 }
