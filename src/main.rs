@@ -123,24 +123,37 @@ fn main() -> Result<()> {
         None
     };
 
-    logger.info(&format!(
-        "CA   = {}",
-        CertAuthority::ca_pem_path(&app.cert_dir).display()
-    ));
-    logger.info(&format!(
-        "PAC  = http://{}/winget-accel.pac",
-        app.listen
-    ));
+    // 启动信息排成对齐的一列，比一堵 "key = value" 好扫。
     let chain: Vec<String> = app
         .accels
         .iter()
-        .map(|a| format!("{}://{}:{}", a.scheme.as_str(), a.host, a.port))
+        .map(|a| a.host.clone())
         .collect();
-    logger.info(&format!("加速器链 = {}", chain.join(" > ")));
+    logger.info(&format!("winget-accel {} 已就绪", env!("CARGO_PKG_VERSION")));
+    logger.info(&format!(
+        "  CA       {}",
+        CertAuthority::ca_pem_path(&app.cert_dir).display()
+    ));
+    logger.info(&format!(
+        "  PAC      http://{}/winget-accel.pac",
+        app.listen
+    ));
+    logger.info(&format!("  listen   {}", app.listen));
+    logger.info(&format!(
+        "  accel    {}（{} 个候选）",
+        chain.join(" > "),
+        chain.len()
+    ));
     if app.accels.len() == 1 {
-        logger.warn("只有 1 个加速器候选：事实上没有回退链");
+        logger.warn("  只有 1 个加速器候选：事实上没有回退链");
     }
-    logger.info(&format!("改写范围 = {}", app.rewrite_hosts.join(", ")));
+    logger.info(&format!(
+        "  rewrite  {}",
+        app.rewrite_hosts.join(", ")
+    ));
+    if !auto_env {
+        logger.info("  env      未接管系统设置（--no-env），如需 winget 走代理请去掉该参数");
+    }
 
     let tracker = Arc::new(Tracker::new(app.accels.clone(), app.health_failures));
 

@@ -50,6 +50,38 @@ pub fn ensure_utf8() -> Option<Utf8Console> {
 
 const UTF8_CODE_PAGE: u32 = 65001;
 
+/// 尝试为当前控制台启用 ANSI 转义序列（VT processing）。
+///
+/// 返回 true 表示**可以安全地输出颜色**：既启用了 VT，stdout 也确实连着控制台。
+/// 输出被重定向到文件时为 false —— 否则 ANSI 转义码会写进日志文件，
+/// 用任何编辑器打开都是乱码。
+pub fn enable_ansi() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> *mut core::ffi::c_void;
+        fn GetConsoleMode(handle: *mut core::ffi::c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: *mut core::ffi::c_void, mode: u32) -> i32;
+    }
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle.is_null() {
+            return false;
+        }
+        let mut mode: u32 = 0;
+        // GetConsoleMode 失败说明 stdout 不是控制台（被重定向）
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return false;
+        }
+        if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
+            return true; // 已经开了
+        }
+        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,3 +101,4 @@ mod tests {
         drop(first);
     }
 }
+

@@ -71,7 +71,6 @@ impl Proxy {
     pub fn serve(self: Arc<Self>) -> Result<()> {
         let listener = TcpListener::bind(self.app.listen)
             .with_context(|| format!("端口被占用或不可用: {}", self.app.listen))?;
-        self.log.info(&format!("LISTEN {}", self.app.listen));
 
         self.spawn_health_prober();
 
@@ -305,11 +304,13 @@ impl Proxy {
                 let tag = if plan.rewritten { "REWRITE" } else { "PASS" };
                 // 带上实际使用的加速器：否则日志无法回答"这次是哪个候选在服务"
                 let via = if plan.rewritten { accel.host.as_str() } else { "-" };
-                let pin = if pin_hit { "pin" } else { "pick" };
+                let pin = if pin_hit { "bind" } else { "pick" };
+                // 只打改写后的路径（它自带目标 host），不再另外拼一遍 host ——
+                // 之前会出现 `github.com/https://github.com/...` 这种重复。
                 self.log.info(&format!(
-                    "{tag} via={via} {pin} retries={} {host}{} -> {status} {size}B {:.2}s",
+                    "{tag} via={via} {pin} retry={} {} -> {status} {size}B {:.2}s",
                     tried.len(),
-                    truncate(&plan.path, 90),
+                    crate::log::shorten(&plan.path, 76),
                     started.elapsed().as_secs_f64()
                 ));
                 // 非 2xx 单独告警：这是"用户看到下载失败"的直接原因，
@@ -322,8 +323,8 @@ impl Proxy {
                         0.0
                     };
                     self.log.warn(&format!(
-                        "REWRITE-FAILED via={via} status={status} size={size}B {speed:.0}KB/s tried={tried:?} path={}",
-                        truncate(&plan.path, 120)
+                        "REWRITE-FAILED via={via} status={status} size={size}B {speed:.0}KB/s tried={tried:?} {}",
+                        crate::log::shorten(&plan.path, 100)
                     ));
                 }
             }
@@ -781,13 +782,7 @@ fn split_host_port(target: &str) -> Result<(String, u16)> {
     }
 }
 
-fn truncate(text: &str, limit: usize) -> &str {
-    if text.len() <= limit {
-        text
-    } else {
-        &text[..limit]
-    }
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -805,24 +800,6 @@ mod tests {
         assert!(split_host_port(":443").is_err());
     }
 
-    #[test]
-    fn truncate_keeps_short_text() {
-        assert_eq!(truncate("abc", 10), "abc");
-    }
+
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
