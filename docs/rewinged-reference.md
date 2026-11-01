@@ -94,26 +94,31 @@ winget 的 schema 字段多且命名不一致，这两个文件能省掉大量�
 
 ---
 
-## 6. 版本模型裁剪策略（重要）
+## 6. 版本模型裁剪策略（已由 ADR-008 修订）
 
-按 ADR-008，倾向只保留必要版本。具体做法：
+> 本节原计划"只保留 1.10.0 + 1.9.0 的模型文件"。复核后 ADR-008 改为 **C′**：
+> 输出契约只做 1.10.0，**读侧不按版本建 struct**，因此**不移植** `models/` 那套体系。
 
-1. 先确认 winget 1.29.380 请求的 `ServerSupportedVersions` 与实际响应 schema
-2. 若目标只需 1.10.0 → 从 `models/manifests_1_10_0.go` + `models/api_1_10_0.go` 起步，
-   把版本相关的映射收敛到一个接口：
+具体做法：
 
-```go
-// 伪代码
-type ManifestCodec interface {
-    Version() string
-    Marshal(manifest *internal.Manifest) ([]byte, error)
-    Unmarshal(data []byte) (*internal.Manifest, error)
-}
+1. **读侧**：YAML → 通用树（`dict` / `Any`），不绑定任何 schema 版本
+2. **转换**：维护一张"跨 schema 版本字段改名/新增映射表"
+3. **输出**：投影成 1.10.0 JSON，由单一投影函数负责
+
+```python
+# 伪代码（语言无关，按 ADR-009 用 Python 形态书写）
+class ManifestCodec(Protocol):
+    contract_version: str                      # 固定 "1.10.0"
+    def load(self, yaml_bytes: bytes) -> dict: ...
+    def dump(self, tree: dict) -> bytes: ...
 ```
 
-3. 后续需要支持新版本时，新增一个 Codec 实现即可，不改端点逻辑
+4. 上游新增清单版本时，通常**只需补映射表条目**，不改代码
+5. 若映射表失控，回退到"照搬 rewinged 多版本模型"（ADR-008 的回退路径）
 
-这样即使将来 winget 升级到 1.11.0，改动也局限在一个文件。
+**从 rewinged 仍值得借鉴的**：`models/manifests_1_10_0.go` 与 `models/api_1_10_0.go`
+里的**字段名与 JSON tag**——它们是"1.10.0 契约到底有哪些字段"的最直观参考。
+借鉴的是字段语义，不是代码结构。
 
 ---
 

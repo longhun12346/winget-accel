@@ -81,13 +81,21 @@ winget 在 `source add` 之后会调用它做校验。
 
 响应需按 winget 请求的 schema 版本输出（见 `decisions.md` ADR-008）。
 
-### 3.4 未确认项（实现前必须解决）
+### 3.4 已核实项（原"未确认项"，2026-11-01 复核后关闭）
 
-- [ ] `ServerSupportedVersions` 的准确格式与取值
-- [ ] winget 1.29.380 实际请求的 schema 版本
-- [ ] `manifestSearch` 请求/响应的完整字段集
-- [ ] 错误响应格式（包不存在时返回 404 还是空结果？）
-- [ ] 是否需要 ETag / 缓存头
+依据：`documentation/WinGet-1.1.0.yaml`（61,887 字节，SHA-256 `883120cf…76fcc`）
+与 `winget-cli` 源码，详见 `verification-2026-11-01.md` §3。
+
+- [x] `ServerSupportedVersions`：`array<string>`，`minItems: 1`，`maxLength: 128`
+- [x] 版本协商：客户端对"自己支持的契约集"与"服务端声明集"取**交集再取最大值**；
+      服务端声明 `["1.10.0"]` 即锁定 1.10.0（ADR-008）
+- [x] `manifestSearch` 字段：请求 `MaximumResults` / `FetchAllManifests` / `Query` / `Inclusions` / `Filters`；
+      响应 `Data[]` + `RequiredPackageMatchFields` + `UnsupportedPackageMatchFields` + `ContinuationToken`
+- [x] 错误响应：包不存在返回 **404 + `array<Error{ErrorCode,ErrorMessage}>`**，不是空结果
+- [x] 三类文档形态：**单个响应内嵌套**（`Versions[]{ Locales[], Installers[] }`），不是三个请求
+- [ ] ETag / 缓存头：规范未要求，**可后置**，不阻塞开工
+
+**仍未确定**：HTTPS 是否强制（需一次提权实测，见 §6.2 与 `research.md` §8）。
 
 ---
 
@@ -135,37 +143,23 @@ data/
 
 ### 5.1 配置
 
-```jsonc
-{
-  "listen": "127.0.0.1:8443",
-  "certFile": "./certs/localhost.crt",
-  "keyFile":  "./certs/localhost.key",
-  "manifestDir": "./data/manifests",
+**字段形状的权威定义是 [`config.example.json`](../config.example.json)**；本节只解释语义，
+不再复制整份配置——此前 `design.md` 与 `config.example.json` 各存一份，已经出现过字段不一致
+（`failuresBeforeUnhealthy`、`stateFile`、`logLevel`）。
 
-  // 只有 host 命中这里的 URL 才会被改写（ADR-004）
-  "rewriteHosts": [
-    "github.com",
-    "objects.githubusercontent.com",
-    "codeload.github.com",
-    "release-assets.githubusercontent.com"
-  ],
+| 字段 | 语义 |
+|---|---|
+| `listen` | 监听地址，**只能**是 `127.0.0.1:<port>`（§9） |
+| `certFile` / `keyFile` | PEM 证书与私钥（§6） |
+| `manifestDir` | 本地清单根目录，结构须与上游一致（ADR-005） |
+| `stateFile` | 上次同步的 commit 与时间（§4.3） |
+| `rewriteHosts` | 改写白名单，按 host 精确匹配（ADR-004） |
+| `accelerators[]` | `name` / `template`（`{url}` 占位）/ `priority` / 可选 `probeUrl` |
+| `health.*` | 见 §5.3，`probeUrl` 默认 `{acceleratorOrigin}/` |
+| `fallbackToOriginal` | 全挂时是否回退原始 URL，见 §5.3 的风险说明 |
+| `logLevel` | `debug` / `info` / `warn` / `error` |
 
-  // 按 priority 升序尝试；{url} 会被替换为原始完整 URL
-  "accelerators": [
-    { "name": "gh-proxy", "template": "https://gh-proxy.com/{url}", "priority": 1 },
-    { "name": "ghfast",   "template": "https://ghfast.top/{url}",   "priority": 2 }
-  ],
-
-  "health": {
-    "enabled": true,
-    "intervalSeconds": 300,
-    "timeoutSeconds": 8,
-    "probeUrl": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip"
-  },
-
-  "fallbackToOriginal": true
-}
-```
+实现约定：以 `$` 开头的键（`$comment` 等）是注释，解析时必须忽略。
 
 ### 5.2 改写规则
 
@@ -184,12 +178,27 @@ https://gh-proxy.com/https://github.com/BurntSushi/ripgrep/releases/download/15.
 3. 按 priority 找第一个 `healthy == true` 的加速器 → 套模板
 4. 全部不健康 → 若 `fallbackToOriginal` 则返回原 URL，并记 warning 日志
 
+> 第 4 步有前提：**必须先确认直连可用**。受限网络下直连 `github.com` 是
+> "握手成功、传输中断"，回退等于让安装长时间无响应（§5.3 末尾、V2）。
+
 ### 5.3 健康检查
 
-- 周期性对 `probeUrl` 发 `HEAD`（不支持则退化为 1 字节 `Range` 请求）
-- 记录：可达性、TTFB、是否返回 2xx/3xx
-- **副作用约束**：探测频率不得高于 5 分钟一次，且必须并发上限 1，避免重蹈压测覆辙（ADR-006）
-- 探测失败**连续 2 次**才标记不健康（避免抖动）
+**探测目标：每个加速器探测它自己的入口**（默认 `{acceleratorOrigin}/`），
+不再共用一个 GitHub 资产 URL。
+
+> 原因（`verification-2026-11-01.md` V1）：受限网络下 **GitHub 资产本身就不通**，
+> 用资产 URL 当探针，测出来的是"GitHub 是否活着"，不是"加速器是否好"，
+> 结果是所有加速器被同时误判为不健康。
+
+- 发 `HEAD`，不支持则退化为 1 字节 `Range` GET
+- **判定：收到任意 HTTP 响应（含 404）即视为可达**，不要求 2xx/3xx；同时记录 TTFB
+- 探测必须带超时（`timeoutSeconds`），超时计入失败
+- 探测频率不得高于 5 分钟一次，并发上限 1，避免重蹈压测覆辙（ADR-006）
+- 连续 `failuresBeforeUnhealthy` 次（默认 2）失败才标记不健康，避免抖动
+
+**直连可达性要单独判定**：`fallbackToOriginal` 只在"加速器全挂"时生效，
+而受限网络下直连往往同样不可用。回退前应做一次低成本直连探测并记录结论，
+否则安装会表现为**长时间无响应**，比明确失败更难排查（V2）。
 
 ### 5.4 绝不改动的字段
 

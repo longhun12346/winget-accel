@@ -4,6 +4,9 @@
 让 `winget install / search / upgrade` 在国内网络下也能正常工作。
 
 > 状态：**调研完成，尚未开始编码**。本文档集是交给下一次会话的完整交接材料。
+>
+> **2026-11-01 复核**：直连 GitHub 资产已从"慢"恶化为"不可用"，两个加速器只剩一个可用；
+> 协议层的 5 个未决项已全部关闭。详见 [docs/verification-2026-11-01.md](docs/verification-2026-11-01.md)。
 
 ## 要解决的问题
 
@@ -14,6 +17,9 @@
 | 直连 GitHub 单连接 | 23–46 KB/s | 63.75 MB 的 Git for Windows 需约 30 分钟 |
 | 经 `gh-proxy.com` | 523–1,437 KB/s | 20–50 倍提升 |
 | winget 自带 Delivery Optimization | 34 KB/s | 与直连同源，无改善 |
+
+> 复核补记（2026-11-01）：上表是调研当日数据。复测时直连已是 **`000` / 20 秒超时，完全不可用**，
+> `ghfast.top` 亦不可达。也就是说"慢"已恶化为"断"，回退到原始 URL 的代价从"等"变成"卡死"。
 
 同时 `winget show` 的源层查询存在偶发严重延迟（实测 4.33 / 41.15 / 80.96 秒），
 本地源可一并消除这个问题。
@@ -70,6 +76,7 @@ winget source remove -n winget-accel
 ```
 docs/
   research.md    调研过程与全部实测数据（含失败与被否决的方向）
+  verification-2026-11-01.md  第二次复核：网络现状、已核实的协议事实、待办 V1–V8
   design.md      架构、REST 协议、清单流水线、证书、信任模型
   decisions.md   方案取舍记录（L1–L10 逐条判定）
   rewinged-reference.md  参考 jantari/rewinged 的具体部分与边界
