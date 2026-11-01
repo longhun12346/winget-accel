@@ -184,8 +184,8 @@ impl Proxy {
         // 换候选重试循环：遇到 429/503（限流/暂时不可用）就把该候选标记为不可用，
         // 换下一个再试。不把 429 直接透给客户端——winget 收到就失败了，
         // 而我们还有别的候选可用。
-        let (plan, accel_idx, accel, status, size) = loop {
-            let Some((accel_idx, accel)) = self.pick_for(host, &req.target, &tried) else {
+        let (plan, accel_idx, accel, status, size, pin_hit) = loop {
+            let Some((accel_idx, accel, from_pin)) = self.pick_for(host, &req.target, &tried) else {
                 // 没有可用候选（或都已试过）
                 Stats::bump(&self.stats.errors);
                 self.log.warn(&format!(
@@ -231,7 +231,7 @@ impl Proxy {
                         tried.push(accel_idx);
                         continue;
                     }
-                    break (plan, accel_idx, accel, status, size);
+                    break (plan, accel_idx, accel, status, size, from_pin);
                 }
                 Ok(Fwd::RateLimited(status)) => {
                     // 上游明确让我们退避：立即标记该候选不可用并换下一个。
@@ -305,11 +305,27 @@ impl Proxy {
                 let tag = if plan.rewritten { "REWRITE" } else { "PASS" };
                 // 带上实际使用的加速器：否则日志无法回答"这次是哪个候选在服务"
                 let via = if plan.rewritten { accel.host.as_str() } else { "-" };
+                let pin = if pin_hit { "pin" } else { "pick" };
                 self.log.info(&format!(
-                    "{tag} via={via} {host}{} -> {status} {size}B {:.2}s",
+                    "{tag} via={via} {pin} retries={} {host}{} -> {status} {size}B {:.2}s",
+                    tried.len(),
                     truncate(&plan.path, 90),
                     started.elapsed().as_secs_f64()
                 ));
+                // 非 2xx 单独告警：这是"用户看到下载失败"的直接原因，
+                // 必须在日志里一眼能找到，否则只能靠猜（前几轮就是这么浪费掉的）。
+                if plan.rewritten && !(200..300).contains(&status) {
+                    let elapsed = started.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        (size as f64 / 1024.0) / elapsed
+                    } else {
+                        0.0
+                    };
+                    self.log.warn(&format!(
+                        "REWRITE-FAILED via={via} status={status} size={size}B {speed:.0}KB/s tried={tried:?} path={}",
+                        truncate(&plan.path, 120)
+                    ));
+                }
             }
         }
 
@@ -342,14 +358,19 @@ impl Proxy {
     }
 
     /// 选候选：优先复用同一文件的 pin，否则加权随机。
-    fn pick_for(&self, host: &str, target: &str, tried: &[usize]) -> Option<(usize, crate::rewrite::Accel)> {
+    fn pick_for(
+        &self,
+        host: &str,
+        target: &str,
+        tried: &[usize],
+    ) -> Option<(usize, crate::rewrite::Accel, bool)> {
         let key = Self::pin_key(host, target);
         {
             let pins = self.pins.lock().expect("pin 锁中毒");
             if let Some((idx, exp)) = pins.get(&key) {
                 if *exp > std::time::Instant::now() && !tried.contains(idx) {
                     if let Some(accel) = self.health.accel_at(*idx) {
-                        return Some((*idx, accel));
+                        return Some((*idx, accel, true));
                     }
                 }
             }
@@ -367,7 +388,7 @@ impl Proxy {
                 &format!("PICK idx={idx} host={} | {}", a.host, weights.join(" ")),
             );
         }
-        picked
+        picked.map(|(i, a)| (i, a, false))
     }
     /// 记一次加速器失败；跨过阈值时打一条告警（便于用户从日志判断是否被切换）。
     fn note_accel_failure(&self, idx: usize, accel: &rewrite::Accel, why: &str) {
