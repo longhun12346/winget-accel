@@ -195,7 +195,7 @@ def test_non_whitelisted_host_is_tunneled_not_rewritten(start_proxy, tls_upstrea
 def test_pac_is_served_on_own_port(start_proxy):
     proxy = start_proxy(accel="gh-proxy.com")
 
-    with urllib.request.urlopen(f"http://127.0.0.1:{proxy.port}/proxy.pac", timeout=10) as r:
+    with urllib.request.urlopen(f"http://127.0.0.1:{proxy.port}/winget-accel.pac", timeout=10) as r:
         text = r.read().decode()
         ctype = r.headers.get("Content-Type", "")
 

@@ -107,7 +107,7 @@ fn main() -> Result<()> {
         CertAuthority::ca_pem_path(&app.cert_dir).display()
     ));
     logger.info(&format!(
-        "PAC  = http://{}/proxy.pac",
+        "PAC  = http://{}/winget-accel.pac",
         app.listen
     ));
     let chain: Vec<String> = app

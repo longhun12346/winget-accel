@@ -20,7 +20,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
 /// CA 有效期（天）。短一些是为了降低私钥泄露后的窗口期。
-const CA_VALIDITY_DAYS: i64 = 365;
+const CA_VALIDITY_DAYS: i64 = 90;
 /// 叶证书有效期（天）。只在内存里，重启即重建。
 const LEAF_VALIDITY_DAYS: i64 = 30;
 

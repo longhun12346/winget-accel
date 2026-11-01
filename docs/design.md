@@ -47,7 +47,7 @@ winget-accel doctor
 
 ## 3. PAC 生成与语义
 
-PAC 由**代理进程自己提供**，地址固定为 `http://127.0.0.1:<port>/proxy.pac`。
+PAC 由**代理进程自己提供**，地址固定为 `http://127.0.0.1:<port>/winget-accel.pac`。
 端口与 PAC 内容在同一进程内生成，不会出现"配置改了但 PAC 没改"的不一致。
 
 内容（与原型一致）：
@@ -79,7 +79,7 @@ function FindProxyForURL(url, host) {
 
 ```
 HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings\AutoConfigURL
-  = http://127.0.0.1:8443/proxy.pac
+  = http://127.0.0.1:8443/winget-accel.pac
 ```
 
 `setup` 在改动前把**原有 `AutoConfigURL`** 记进状态文件，`teardown` 原样写回。
@@ -95,7 +95,7 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings\AutoConfigURL
 |---|---|
 | `CONNECT <host>:<port>`，host 在 `rewriteHosts` 内 | **MITM**（§5），终止 TLS 并改写 |
 | `CONNECT <host>:<port>`，host 不在白名单 | **隧道**：连接上游后双向泵字节，不解析 |
-| `GET /proxy.pac` | 返回 PAC 文本（`PAC-SERVED`） |
+| `GET /winget-accel.pac` | 返回 PAC 文本（`PAC-SERVED`） |
 | `GET /health` 或 `/status` | 返回 JSON 计数 |
 | 其它明文请求 | `405`，记 `PLAIN-405` |
 
@@ -120,7 +120,7 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings\AutoConfigURL
 | `BasicConstraints` | `ca=true, path_length=0` | 只能签终端证书，不能签下级 CA |
 | `NameConstraints` | `permitted_subtrees` = 4 个 DNS，`critical` | **核心约束**：Windows 强制校验（§9.4） |
 | `KeyUsage` | `keyCertSign` + `crlSign` + `digitalSignature` | |
-| 有效期 | 365 天 | 过长不便轮换，过短频繁打扰用户 |
+| 有效期 | 90 天 | 过长不便轮换，过短频繁打扰用户 |
 
 ### 5.2 叶证书
 

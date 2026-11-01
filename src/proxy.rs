@@ -379,7 +379,7 @@ impl Proxy {
         let path = req.target.split('?').next().unwrap_or("");
 
         match (req.method.as_str(), path) {
-            ("GET", "/proxy.pac") => {
+            ("GET", "/winget-accel.pac") => {
                 let body = pac::build(self.app.listen.port(), &self.app.rewrite_hosts);
                 write_response(&mut stream, 200, "application/x-ns-proxy-autoconfig", &body)
             }
@@ -408,7 +408,7 @@ impl Proxy {
                 );
                 write_response(&mut stream, 200, "application/json", &body)
             }
-            _ => write_response(&mut stream, 405, "text/plain; charset=utf-8", "只支持 GET /proxy.pac 与 /health"),
+            _ => write_response(&mut stream, 405, "text/plain; charset=utf-8", "只支持 GET /winget-accel.pac 与 /health"),
         }
     }
 }

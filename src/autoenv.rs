@@ -67,7 +67,7 @@ impl EnvGuard {
         store_prior(prior.as_deref());
         install_exit_handler();
 
-        write_pac(&format!("http://127.0.0.1:{port}/proxy.pac"))?;
+        write_pac(&format!("http://127.0.0.1:{port}/winget-accel.pac"))?;
 
         // 拉起看门狗：进程无论怎么死，PAC 都会被还原
         spawn_watchdog(&state_path);

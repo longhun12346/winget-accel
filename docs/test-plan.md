@@ -117,7 +117,7 @@ PAC 是 JScript，这里不做 JS 求值，只锁定生成文本的结构；真�
 
 | ID | 断言 | 实现 |
 |---|---|---|
-| LCL-01 | `/proxy.pac` 返回 `application/x-ns-proxy-autoconfig`，内容含本实例端口 | `test_pac_is_served_on_own_port` |
+| LCL-01 | `/winget-accel.pac` 返回 `application/x-ns-proxy-autoconfig`，内容含本实例端口 | `test_pac_is_served_on_own_port` |
 | LCL-02 | `/health` 的 `rewrites` / `bytes` / `mitm` 随请求增长 | `test_health_reports_counters` |
 | LCL-03 | 其他明文请求返回 405 | `test_unknown_plain_request_gets_405` |
 | LCL-04 | `/health` 带 `status` 与 `accelerators[]`；全挂时 `status=down` | 手工验证（候选指向死端口，实测 `status=down`、请求 0.1 s 返回 502、日志一条 ERROR `ALL-ACCEL-DOWN`） |

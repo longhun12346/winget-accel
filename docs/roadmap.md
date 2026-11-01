@@ -56,7 +56,7 @@ REST 源时期的编号在此逐条交代去向，避免"文档里提到但没�
 - [ ] 配置加载：忽略 `$` 开头的键；校验 `listen` 只能是 `127.0.0.1:<port>`
 - [ ] 监听：Windows 上必须 `SO_EXCLUSIVEADDRUSE`（`SO_REUSEADDR` 会允许抢占已占用端口）
 - [ ] 端口占用 → 立即失败并打印占用进程，**不自动换端口**（PAC 里写死了端口）
-- [ ] `GET /proxy.pac` → 返回 PAC（内容见 `design.md` §3，与 `rewriteHosts` 同源生成）
+- [ ] `GET /winget-accel.pac` → 返回 PAC（内容见 `design.md` §3，与 `rewriteHosts` 同源生成）
 - [ ] `GET /health` → 返回连接/改写/隧道/字节/错误计数
 - [ ] `CONNECT` 解析：逐字节读到 `\r\n\r\n`，**不得吞掉后面的 ClientHello**
 - [ ] 非白名单 host → 纯隧道（双向泵字节，上游连接超时 15 s，失败回 `502` + `TUNNEL-FAIL`）

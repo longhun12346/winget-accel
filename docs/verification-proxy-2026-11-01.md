@@ -173,7 +173,7 @@ Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Setti
 本节改用 `prototype/`（PAC 服务 + CONNECT 分流 + MITM 改写 + 自签带约束 CA），
 验证**交付形态真正依赖的那几条性质**是否成立。
 
-环境：端口 `8443`，加速器 `gh-proxy.com`，CA 已装入 `CurrentUser\Root`，`AutoConfigURL` 指向 `http://127.0.0.1:8443/proxy.pac`。
+环境：端口 `8443`，加速器 `gh-proxy.com`，CA 已装入 `CurrentUser\Root`，`AutoConfigURL` 指向 `http://127.0.0.1:8443/winget-accel.pac`。
 
 ### 9.1 速率与端到端
 

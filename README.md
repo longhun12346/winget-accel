@@ -68,7 +68,7 @@ MITM 影响的只是"谁能看到你在下载什么"（都是公开安装包）�
 
 ## 安全边界（请读完再决定是否使用）
 
-- **会往「当前用户受信任根」装一张 CA**，有效期 365 天（`ca.rs` 的 `CA_VALIDITY_DAYS`）。
+- **会往「当前用户受信任根」装一张 CA**，有效期 **90 天**（`ca.rs` 的 `CA_VALIDITY_DAYS`）。
   这张 CA 的私钥以**明文**存放在 `certs\ca-key.pem`。
 - 该 CA 带 Name Constraints，**只能签这 4 个域名**：`github.com`、
   `objects.githubusercontent.com`、`codeload.github.com`、`release-assets.githubusercontent.com`。
@@ -101,7 +101,7 @@ Remove-Item .\certs, .\state.json, .\proxy.log -Recurse -Force -ErrorAction Sile
 
 ## PAC 与进程生命周期
 
-PAC 指向 `http://127.0.0.1:8443/proxy.pac`。代理不在时，WinINet **取不到 PAC 会退化为直连**——
+PAC 指向 `http://127.0.0.1:8443/winget-accel.pac`。代理不在时，WinINet **取不到 PAC 会退化为直连**——
 后果是"回到慢速直连"，不是"功能全挂"。即便如此，PAC 仍应被清理，因此做了三层保障：
 
 | 结束方式 | PAC 是否还原 | 机制 |
