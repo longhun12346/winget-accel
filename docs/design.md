@@ -120,7 +120,7 @@ HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings\AutoConfigURL
 | `BasicConstraints` | `ca=true, path_length=0` | 只能签终端证书，不能签下级 CA |
 | `NameConstraints` | `permitted_subtrees` = 4 个 DNS，`critical` | **核心约束**：Windows 强制校验（§9.4） |
 | `KeyUsage` | `keyCertSign` + `crlSign` + `digitalSignature` | |
-| 有效期 | 90 天 | 过长不便轮换，过短频繁打扰用户 |
+| 有效期 | 10 年（3650 天） | 过长不便轮换，过短频繁打扰用户 |
 
 ### 5.2 叶证书
 
