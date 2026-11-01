@@ -167,8 +167,15 @@ cd prototype
 | 网络（`NET`） | 同上 | 同理 |
 | 系统（`SYS`） | 仍是手工 | 交互确认无法自动化 |
 
-为支持第 2 行，`conftest.py` 需要加一个 `--target-binary` 选项（默认走
-`wgaccel.py`），Rust 版直接复用同一套用例。这是刻意设计：**行为契约不随语言迁移而重写**。
+为支持第 2 行，`conftest.py` 已实现 `--target-binary` 选项（默认走 `wgaccel.py`）：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest --target-binary ..\target\release\winget-accel.exe
+```
+
+该模式下 `test_units.py` 自动跳过（它测的是 Python 内部实现，Rust 侧有自己的单测）。
+Rust 二进制刻意沿用同一套 CLI 参数（`--port` / `--cert-dir` / `--log` / `--accel` / `--mitm-extra`），
+所以协议层的 17 个用例可以原样复用。这是刻意设计：**行为契约不随语言迁移而重写**。
 
 ## 8. 已知未覆盖
 

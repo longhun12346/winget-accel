@@ -1,6 +1,7 @@
 # 二进制/构建产物
 /bin/
 /dist/
+/target/
 *.exe
 *.dll
 *.pdb

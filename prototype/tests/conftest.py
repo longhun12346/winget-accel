@@ -97,7 +97,34 @@ class ProxyHandle:
 
 
 @pytest.fixture
-def start_proxy(tmp_path):
+def build_command(request):
+    """构造"启动一个代理实例"的命令行。
+
+    默认跑 Python 原型；传 `--target-binary <path>` 时改跑该可执行文件
+    （用于让同一套协议用例驱动 Rust 版）。两者的 CLI 参数刻意保持一致。
+    """
+
+    def _build(port, cert_dir, log, accel=None, extra=()):
+        target = request.config.getoption("--target-binary")
+        if target:
+            base = [target]
+        else:
+            base = [sys.executable, "-u", str(PROTO_DIR / "wgaccel.py")]
+        cmd = base + [
+            "--port", str(port),
+            "--cert-dir", str(cert_dir),
+            "--log", str(log),
+        ]
+        if accel is not None:
+            cmd += ["--accel", accel]
+        cmd += list(extra)
+        return cmd
+
+    return _build
+
+
+@pytest.fixture
+def start_proxy(tmp_path, build_command):
     """启动一个代理实例；可多次调用（不同端口/不同加速器）。"""
     procs: list[tuple[subprocess.Popen, object, object]] = []
 
@@ -113,20 +140,7 @@ def start_proxy(tmp_path):
         log = tmp_path / f"proxy-{port}.log"
         out = (tmp_path / f"proxy-{port}.out").open("wb")
         err = (tmp_path / f"proxy-{port}.err").open("wb")
-        cmd = [
-            sys.executable,
-            "-u",
-            str(PROTO_DIR / "wgaccel.py"),
-            "--port",
-            str(port),
-            "--cert-dir",
-            str(cd),
-            "--log",
-            str(log),
-            "--accel",
-            accel,
-            *extra,
-        ]
+        cmd = build_command(port, cd, log, accel, extra)
         proc = subprocess.Popen(cmd, cwd=str(PROTO_DIR), stdout=out, stderr=err)
         procs.append((proc, out, err))
         wait_http(f"http://127.0.0.1:{port}/health")
@@ -348,12 +362,24 @@ def pytest_addoption(parser):
         default=False,
         help="运行需要真实外网与可用加速器的用例",
     )
+    parser.addoption(
+        "--target-binary",
+        default=None,
+        metavar="PATH",
+        help="用外部可执行文件替代 Python 原型（例如 Rust 版的 winget-accel.exe）",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
-    if config.getoption("--network"):
-        return
-    skip = pytest.mark.skip(reason="需要真实网络（用 --network 开启）")
-    for item in items:
-        if "network" in item.keywords:
-            item.add_marker(skip)
+    if not config.getoption("--network"):
+        skip = pytest.mark.skip(reason="需要真实网络（用 --network 开启）")
+        for item in items:
+            if "network" in item.keywords:
+                item.add_marker(skip)
+
+    # 单元用例测的是 Python 内部实现；跑外部二进制时它们没有意义（Rust 侧有自己的单测）
+    if config.getoption("--target-binary"):
+        skip_units = pytest.mark.skip(reason="外部二进制模式下由 Rust 单测覆盖")
+        for item in items:
+            if item.fspath.basename == "test_units.py":
+                item.add_marker(skip_units)

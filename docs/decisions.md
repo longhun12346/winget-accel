@@ -418,6 +418,14 @@ T2 边界守不住——"结构趋同"不等于"参考"，同 workload 下极易
 | `tokio` / `axum` / `hyper` / `actix-web` | **仍禁** | 同步阻塞 I/O + 线程已经把问题解决干净；引入异步运行时只会扩大审计面（ADR-014 要求用户信任本工具改写安装流量） |
 | `native-tls` / `openssl` | **仍禁** | 同上，且静态链接困难 |
 | `reqwest`（默认特性） | **仍禁** | 健康探测只需要一次 HTTP HEAD/GET，`TcpStream` + `rustls` 足够 |
+| `webpki-roots` | **新增允许** | 上游（加速器）证书校验需要根证书。纯数据 crate，无传递依赖、无 C 代码。直接依赖因此为 8 个，正好触到上限 |
+| `rcgen` 版本 | **钉 0.14** | 0.14 才有 `Issuer::from_ca_cert_pem`，能把磁盘上已有的 CA 重新当作签发者；0.13 做不到，会导致每次重启换一张 CA、用户必须重新信任 |
+
+> **已确认（2026-11-01）**：`rcgen` 0.14 能表达 Name Constraints
+> （`NameConstraints { permitted_subtrees: Vec<GeneralSubtree>, excluded_subtrees }`，
+> 且 `GeneralSubtree::DnsName` 正好对应我们需要的 4 个域名）。
+> 上面「若 `rcgen` 无法表达 Name Constraints，改用 `x509-cert` 系」这条待验证项**关闭**，
+> 不需要 `x509-cert`。
 
 **手写 HTTP 的边界（调整后）**：
 

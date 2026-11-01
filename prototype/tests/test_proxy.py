@@ -230,17 +230,15 @@ def test_unknown_plain_request_gets_405(start_proxy):
 # ------------------------------------------------------- 端口与稳定性的边界
 
 
-def test_second_instance_on_same_port_fails_fast(start_proxy, tmp_path):
+def test_second_instance_on_same_port_fails_fast(start_proxy, build_command, tmp_path):
     proxy = start_proxy(accel="gh-proxy.com")
     other_certs = tmp_path / "other-certs"
     other_certs.mkdir()
 
-    proc = subprocess.run(
-        [sys.executable, str(PROTO_DIR / "wgaccel.py"),
-         "--port", str(proxy.port), "--cert-dir", str(other_certs),
-         "--log", str(tmp_path / "second.log"), "--accel", "gh-proxy.com"],
-        cwd=str(PROTO_DIR), capture_output=True, timeout=30,
+    cmd = build_command(
+        proxy.port, other_certs, tmp_path / "second.log", accel="gh-proxy.com"
     )
+    proc = subprocess.run(cmd, cwd=str(PROTO_DIR), capture_output=True, timeout=30)
 
     # Windows 上若用 SO_REUSEADDR 会静默抢占；必须是非零退出
     assert proc.returncode != 0

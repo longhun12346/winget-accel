@@ -1,0 +1,30 @@
+[package]
+name = "winget-accel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "用 PAC 把 GitHub 下载域名指到本机，再由本机改写为加速器 URL"
+license = "MIT"
+
+[dependencies]
+# 依赖预算：ADR-012 直接依赖 ≤ 8，传递 ≤ 30。禁用 tokio/hyper/openssl。
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# rustls 关掉默认的 aws-lc-rs：它在 Windows 上要 cmake + NASM，构建门槛太高。
+# 统一用 ring，rcgen 也指向同一个后端，避免两套加密实现。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+# rcgen 0.14 才有 `Issuer::from_ca_cert_pem`：能把磁盘上的 CA 重新当成签发者。
+# 0.13 做不到，会导致每次重启换一张 CA、用户必须重新信任。
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+# 上游（加速器）证书校验需要根证书；纯数据 crate，无传递依赖，无 C 代码。
+# 这是对 ADR-012 允许清单的一处新增，理由见 docs/design.md。
+webpki-roots = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

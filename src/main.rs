@@ -1,0 +1,172 @@
+//! winget-accel：用 PAC 把 4 个 GitHub 下载域名指到本机，
+//! 由本机终止 TLS 并把请求改写到加速器。
+//!
+//! 命令行参数刻意与 `prototype/wgaccel.py` 保持一致，
+//! 这样 docs/test-plan.md 里的协议用例可以直接驱动 Rust 二进制（见 §7）。
+
+mod ca;
+mod config;
+mod doctor;
+mod health;
+mod http;
+mod log;
+mod pac;
+mod proxy;
+mod rewrite;
+mod stats;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{bail, Result};
+
+use crate::ca::CertAuthority;
+use crate::config::{App, CliOverrides};
+use crate::health::Tracker;
+use crate::log::{Level, Logger};
+use crate::proxy::Proxy;
+use crate::stats::Stats;
+
+struct Args {
+    config: Option<PathBuf>,
+    overrides: CliOverrides,
+    log_level: Option<String>,
+    print_pac: bool,
+    doctor: bool,
+}
+
+fn main() -> Result<()> {
+    // rustls 0.23 要求先安装加密后端；用 ring 以避开 aws-lc-rs 的 cmake/NASM 依赖
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let args = parse_args()?;
+    let file = config::load(args.config.as_ref())?;
+    let log_level = args.log_level.unwrap_or_else(|| file.log_level.clone());
+    let app = App::new(file, args.overrides)?;
+
+    if args.print_pac {
+        print!("{}", pac::build(app.listen.port(), &app.rewrite_hosts));
+        return Ok(());
+    }
+
+    if args.doctor {
+        let (checks, _) = doctor::run(&app);
+        let failed = doctor::print(&checks);
+        if failed {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    let logger = Arc::new(Logger::new(Level::parse(&log_level), app.log_path.clone()));
+    let stats = Arc::new(Stats::default());
+
+    let ca = Arc::new(CertAuthority::load_or_create(&app.cert_dir, &app.rewrite_hosts)?);
+
+    logger.info(&format!(
+        "CA   = {}",
+        CertAuthority::ca_pem_path(&app.cert_dir).display()
+    ));
+    logger.info(&format!(
+        "PAC  = http://{}/proxy.pac",
+        app.listen
+    ));
+    let chain: Vec<String> = app
+        .accels
+        .iter()
+        .map(|a| format!("{}://{}:{}", a.scheme.as_str(), a.host, a.port))
+        .collect();
+    logger.info(&format!("加速器链 = {}", chain.join(" > ")));
+    if app.accels.len() == 1 {
+        logger.warn("只有 1 个加速器候选：事实上没有回退链");
+    }
+    logger.info(&format!("改写范围 = {}", app.rewrite_hosts.join(", ")));
+
+    let tracker = Arc::new(Tracker::new(app.accels.clone(), app.health_failures));
+
+    let proxy = Arc::new(Proxy::new(
+        Arc::new(app),
+        ca,
+        Arc::clone(&stats),
+        Arc::clone(&logger),
+        tracker,
+    ));
+    proxy.serve()
+}
+
+fn parse_args() -> Result<Args> {
+    let mut args = std::env::args().skip(1);
+    let mut config = None;
+    let mut overrides = CliOverrides::default();
+    let mut listen: Option<String> = None;
+    let mut log_level = None;
+    let mut print_pac = false;
+    let mut doctor = false;
+
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--config" => config = Some(PathBuf::from(next_value(&mut args, "--config")?)),
+            "--listen" => listen = Some(next_value(&mut args, "--listen")?),
+            "--port" => {
+                let port: u16 = next_value(&mut args, "--port")?
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--port 需要数字"))?;
+                listen = Some(format!("127.0.0.1:{port}"));
+            }
+            "--accel" => overrides.accel = Some(next_value(&mut args, "--accel")?),
+            "--cert-dir" => {
+                overrides.cert_dir = Some(PathBuf::from(next_value(&mut args, "--cert-dir")?))
+            }
+            "--log" => overrides.log = Some(PathBuf::from(next_value(&mut args, "--log")?)),
+            "--log-level" => log_level = Some(next_value(&mut args, "--log-level")?),
+            "--mitm-extra" => overrides
+                .mitm_extra
+                .push(next_value(&mut args, "--mitm-extra")?),
+            "--print-pac" => print_pac = true,
+            "--doctor" => doctor = true,
+            "--version" => {
+                println!("winget-accel {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            other => bail!("未知参数: {other}（用 --help 看用法）"),
+        }
+    }
+
+    overrides.listen = listen;
+    Ok(Args {
+        config,
+        overrides,
+        log_level,
+        print_pac,
+        doctor,
+    })
+}
+
+fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
+    args.next()
+        .ok_or_else(|| anyhow::anyhow!("{flag} 缺少取值"))
+}
+
+fn print_help() {
+    println!(
+        "winget-accel {}\n\n\
+         用法: winget-accel [选项]\n\n\
+         选项:\n\
+         \x20 --config <路径>        配置文件（默认无，用内置默认值）\n\
+         \x20 --listen <host:port>  监听地址，只允许回环（默认 127.0.0.1:8443）\n\
+         \x20 --port <端口>         等价于 --listen 127.0.0.1:<端口>\n\
+         \x20 --accel <基地址>      加速器，如 https://gh-proxy.com\n\
+         \x20 --cert-dir <目录>     CA 存放目录（默认 certs）\n\
+         \x20 --log <路径>          日志文件（默认 proxy.log）\n\
+         \x20 --log-level <级别>    error|warn|info|debug\n\
+         \x20 --mitm-extra <host>   额外拦截但不改写的 host（排障用，可重复）\n\
+         \x20 --doctor              检查配置、证书、PAC 与加速器可达性后退出\n\
+         \x20 --print-pac           打印 PAC 后退出\n\
+         \x20 --version             版本\n",
+        env!("CARGO_PKG_VERSION")
+    );
+}
