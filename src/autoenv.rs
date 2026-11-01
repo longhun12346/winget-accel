@@ -16,7 +16,6 @@ use anyhow::{bail, Context, Result};
 
 const INET_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 const STATE_FILE: &str = "state.json";
-const CA_SUBJECT: &str = "winget-accel local CA";
 
 /// 退出时还原 PAC 的守卫。`Drop` 在正常返回/`?` 提前返回时都会执行。
 pub struct EnvGuard {
@@ -138,10 +137,16 @@ fn delete_pac() -> Result<()> {
     Ok(())
 }
 
-/// CA 是否已在用户根存储里（按主题模糊匹配，不依赖指纹计算）。
-fn ca_is_trusted() -> bool {
+/// CA 是否已在用户根存储里。
+///
+/// **必须按指纹精确比对**：不同的 CA 可以有完全相同的 Subject
+/// （实测踩过——旧 CA 还在存储里，新 CA 的 Subject 一样，按名字匹配会误判为已信任，
+/// 导致客户端验签失败 `TRUST_E_CERT_SIGNATURE` / `0x80096004`）。
+fn ca_is_trusted(ca_pem: &Path) -> bool {
     let script = format!(
-        "if (Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object {{ $_.Subject -like '*{CA_SUBJECT}*' }}) {{ 'TRUSTED' }} else {{ 'MISSING' }}"
+        "$t = (Get-PfxCertificate -FilePath '{}').Thumbprint; \
+         if (Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object {{ $_.Thumbprint -eq $t }}) {{ 'TRUSTED' }} else {{ 'MISSING' }}",
+        ca_pem.display()
     );
     let out = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -156,7 +161,7 @@ fn ca_is_trusted() -> bool {
 /// 不在就导入。certutil 会弹一次确认框；无桌面会话下它**不报错而是永久阻塞**，
 /// 所以必须轮询 + 超时，超时后给出可手工执行的命令。
 fn ensure_ca_trusted(ca_pem: &Path) -> Result<()> {
-    if ca_is_trusted() {
+    if ca_is_trusted(ca_pem) {
         println!("本机 CA 已被信任，跳过导入。");
         return Ok(());
     }
