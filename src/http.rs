@@ -50,6 +50,9 @@ pub struct Head {
 }
 
 impl Head {
+    /// 按名取头的值（大小写不敏感）。目前只有单测用到，
+    /// 保留是因为按头决策（如 Accept-Encoding、If-Range）会落在这一层。
+    #[allow(dead_code)]
     pub fn header(&self, name: &str) -> Option<&str> {
         let want = name.to_ascii_lowercase();
         self.headers.iter().find_map(|line| {

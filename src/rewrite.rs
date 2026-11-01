@@ -52,7 +52,8 @@ pub struct Accel {
 }
 
 impl Accel {
-    /// 是否走默认端口（决定 Host 头是否需要带端口）。
+    /// 是否走默认端口。日志与 doctor 里用来判断 Host 头要不要带端口时用。
+    #[allow(dead_code)]
     pub fn uses_default_port(&self) -> bool {
         self.port == self.scheme.default_port()
     }
@@ -79,7 +80,7 @@ pub fn parse_accel(spec: &str) -> Result<Accel> {
     let rest = rest.replace("{url}", "");
     let (authority, prefix) = match rest.split_once('/') {
         Some((authority, path)) => (authority, format!("/{}", path.trim_end_matches('/'))),
-        None => (rest, String::new()),
+        None => (rest.as_str(), String::new()),
     };
     let prefix = if prefix == "/" { String::new() } else { prefix };
 

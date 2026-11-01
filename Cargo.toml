@@ -17,7 +17,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 # rcgen 0.14 才有 `Issuer::from_ca_cert_pem`：能把磁盘上的 CA 重新当成签发者。
 # 0.13 做不到，会导致每次重启换一张 CA、用户必须重新信任。
-rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+# `x509-parser` 是该方法的前置 feature（它要解析 PEM 里的证书）。
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
 # 上游（加速器）证书校验需要根证书；纯数据 crate，无传递依赖，无 C 代码。
 # 这是对 ADR-012 允许清单的一处新增，理由见 docs/design.md。
 webpki-roots = "1"

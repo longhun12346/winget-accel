@@ -12,7 +12,7 @@ use crate::pac;
 use crate::proxy::probe;
 use crate::rewrite::Accel;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Pass,
     Warn,
@@ -180,7 +180,7 @@ fn check_fallback(app: &App) -> Check {
 
 /// 打印表格。返回是否存在 FAIL。
 pub fn print(checks: &[Check]) -> bool {
-    println!("{:<10} {:<5} {}", "检查项", "结论", "详情");
+    println!("{:<10} {:<5} 详情", "检查项", "结论");
     println!("{}", "-".repeat(78));
     for check in checks {
         println!("{:<10} {:<5} {}", check.name, check.verdict.tag(), check.detail);

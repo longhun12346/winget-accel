@@ -51,6 +51,8 @@ impl Default for FileConfig {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcceleratorCfg {
+    /// 便于人读配置；日志与 doctor 后续会用它代替裸 URL。
+    #[allow(dead_code)]
     pub name: String,
     /// 完整基地址，如 `https://gh-proxy.com`。路径前缀由改写逻辑拼接。
     pub template: String,

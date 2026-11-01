@@ -48,7 +48,7 @@ REST 源时期的编号在此逐条交代去向，避免"文档里提到但没�
 
 ## 阶段 1：Rust 骨架（PAC + CONNECT 分流 + 隧道）
 
-> 状态（2026-11-01）：**代码已写，未编译**（本机尚无 Rust 工具链）。
+> 状态（2026-11-01）：**已完成**。编译通过，`cargo clippy` 无警告。
 > 落在 `src/main.rs`、`src/proxy.rs`、`src/pac.rs`、`src/http.rs`、`src/config.rs`。
 
 目标：先把"代理壳"跑起来，**不含 MITM**。此阶段完成后 winget 行为不变（仍慢），只验证分流正确。
@@ -73,9 +73,11 @@ REST 源时期的编号在此逐条交代去向，避免"文档里提到但没�
 
 ## 阶段 2：MITM 与改写（核心价值）
 
-> 状态（2026-11-01）：**代码已写，未编译**。
+> 状态（2026-11-01）：**已完成并通过实测**。
 > 落在 `src/rewrite.rs`（决策纯函数）、`src/ca.rs`（Name Constraints + 叶证书缓存）、
-> `src/http.rs`（三态定界转发）。rcgen 0.14 已确认能表达 Name Constraints。
+> `src/http.rs`（三态定界转发）。
+> 实测：经 Rust 代理下载 `fd v10.5.0`，1,535,063 B / 2.13 s ≈ **704 KB/s**，SHA256 一致。
+> rcgen 需要 `x509-parser` feature 才有 `Issuer::from_ca_cert_pem`（重启复用同一 CA 的前提）。
 
 - [ ] **前置确认**：`rcgen` 能否写 `NameConstraints`；不能则改用 `x509-cert` 系 crate（**未验证**）
 - [ ] CA 生成：ECDSA P-256（或 RSA-2048）、`BasicConstraints(ca, path_length=0)`、
@@ -102,8 +104,9 @@ REST 源时期的编号在此逐条交代去向，避免"文档里提到但没�
 
 ## 阶段 3：加速器健康检查与切换
 
-> 状态（2026-11-01）：**状态机与探测已写，未编译**。
-> 落在 `src/health.rs`（选择策略，纯单测）+ `src/proxy.rs`（后台探测线程、失败计数换取）。
+> 状态（2026-11-01）：**状态机已完成；探测与切换未实测**（当前只有 1 个可用候选，
+> 探测线程在候选数 <2 时不启动，避免无意义请求）。
+> 落在 `src/health.rs`（8 个单测覆盖选择与失败阈值）+ `src/proxy.rs`（探测线程、失败计数换取）。
 > **未实现"回退直连"**：全挂时直接快速返回 502，而不是把请求打回原始 URL——
 > 受限网络下直连 GitHub 本身等于卡死（见下方风险表）。
 
@@ -127,9 +130,9 @@ REST 源时期的编号在此逐条交代去向，避免"文档里提到但没�
 
 ## 阶段 4：安装器 / 卸载器 / 自检
 
-> 状态（2026-11-01）：**脚本与 `--doctor` 已写，未联调**。
-> `installer/setup.ps1`、`installer/teardown.ps1` 通过 PowerShell 语法解析；
-> `--doctor` 落在 `src/doctor.rs`。两者都需要先编译出二进制才能真正跑通。
+> 状态（2026-11-01）：**`--doctor` 已跑通**（实测：CA 缺失判 FAIL、加速器探测 660 ms 可达、
+> 单候选告警）。`installer/setup.ps1`、`installer/teardown.ps1` 通过 PowerShell 语法解析，
+> **但还没与二进制联调**——它们需要一次交互点击才能验证根证书导入。
 > 已继承原型踩过的两个坑：装根证书必须放子进程 + 超时（无 UI 会话会永久阻塞）、
 > 删根证书必须用 `certutil -user -delstore`（`Remove-Item` 会报"不允许使用 UI"）。
 

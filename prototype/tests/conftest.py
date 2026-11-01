@@ -355,31 +355,6 @@ def ca(cert_dir):
 # ---------------------------------------------------------------- 网络开关
 
 
-def pytest_addoption(parser):
-    parser.addoption(
-        "--network",
-        action="store_true",
-        default=False,
-        help="运行需要真实外网与可用加速器的用例",
-    )
-    parser.addoption(
-        "--target-binary",
-        default=None,
-        metavar="PATH",
-        help="用外部可执行文件替代 Python 原型（例如 Rust 版的 winget-accel.exe）",
-    )
+# 命令行选项（--network / --target-binary）与收集钩子在 prototype/conftest.py：
+# pytest 解析参数时就要注册，放这里太晚。
 
-
-def pytest_collection_modifyitems(config, items):
-    if not config.getoption("--network"):
-        skip = pytest.mark.skip(reason="需要真实网络（用 --network 开启）")
-        for item in items:
-            if "network" in item.keywords:
-                item.add_marker(skip)
-
-    # 单元用例测的是 Python 内部实现；跑外部二进制时它们没有意义（Rust 侧有自己的单测）
-    if config.getoption("--target-binary"):
-        skip_units = pytest.mark.skip(reason="外部二进制模式下由 Rust 单测覆盖")
-        for item in items:
-            if item.fspath.basename == "test_units.py":
-                item.add_marker(skip_units)

@@ -29,6 +29,8 @@ const CA_KEY_FILE: &str = "ca-key.pem";
 const CA_META_FILE: &str = "ca-meta.json";
 
 pub struct CertAuthority {
+    /// CA 证书 PEM。单测用它验证"重启后仍是同一张 CA"；doctor 后续也会用到。
+    #[allow(dead_code)]
     ca_pem: String,
     /// rcgen 的签发者：持有 CA 私钥，可按需签叶证书。
     issuer: Issuer<'static, KeyPair>,
@@ -132,6 +134,7 @@ impl CertAuthority {
         Ok(ca_pem)
     }
 
+    #[allow(dead_code)]
     pub fn ca_pem(&self) -> &str {
         &self.ca_pem
     }
@@ -169,7 +172,9 @@ impl CertAuthority {
         let cert_der: CertificateDer<'static> = cert.der().clone();
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
 
-        let cfg = ServerConfig::with_single_cert(vec![cert_der], key_der)
+        let cfg = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
             .context("构造 TLS 服务端配置失败")?;
         let cfg = Arc::new(cfg);
         cache.insert(host.to_string(), Arc::clone(&cfg));
@@ -250,7 +255,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wgaccel-ca-meta-{}", std::process::id()));
         CertAuthority::load_or_create(&dir, &["github.com".to_string()]).unwrap();
         // 白名单变了却沿用旧 CA：新 host 签不出证书，必须显式报错而不是静默继续
-        let err = CertAuthority::load_or_create(&dir, &["example.com".to_string()]).unwrap_err();
+        let err = CertAuthority::load_or_create(&dir, &["example.com".to_string()])
+            .err()
+            .expect("应当报错");
         assert!(err.to_string().contains("不一致"), "实际错误: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }

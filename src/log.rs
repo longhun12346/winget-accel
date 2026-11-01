@@ -75,6 +75,9 @@ impl Logger {
         self.log(Level::Warn, msg);
     }
 
+    /// 目前致命错误都经 `Result` 往上抛、由 Rust 打出来，
+    /// 保留这一级是为了将来"降级继续跑"的场景。
+    #[allow(dead_code)]
     pub fn error(&self, msg: &str) {
         self.log(Level::Error, msg);
     }

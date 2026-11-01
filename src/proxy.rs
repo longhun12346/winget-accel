@@ -5,7 +5,6 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -136,7 +135,7 @@ impl Proxy {
     }
 
     /// 终止 TLS 并改写请求。
-    fn do_mitm(&self, client: TcpStream, host: &str, port: u16) -> Result<()> {
+    fn do_mitm(&self, mut client: TcpStream, host: &str, port: u16) -> Result<()> {
         client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
 
         let server_cfg = self.ca.server_config(host)?;
@@ -164,7 +163,7 @@ impl Proxy {
                 "NO-HEALTHY-ACCEL {host} 所有加速器都不健康，返回 502"
             ));
             let _ = tls.write_all(BAD_GATEWAY);
-            let _ = tls.conn.send_close_notify();
+            tls.conn.send_close_notify();
             let _ = tls.flush();
             return Ok(());
         };
@@ -206,7 +205,7 @@ impl Proxy {
                 let tag = if plan.rewritten { "REWRITE" } else { "PASS" };
                 self.log.info(&format!(
                     "{tag} {host}{} -> {status} {size}B {:.2}s",
-                    truncate(&req.target, 90),
+                    truncate(&plan.path, 90),
                     started.elapsed().as_secs_f64()
                 ));
             }
@@ -225,7 +224,7 @@ impl Proxy {
         }
 
         // 必须发 close_notify，否则客户端会把"连接被重置"当成下载失败
-        let _ = tls.conn.send_close_notify();
+        tls.conn.send_close_notify();
         let _ = tls.flush();
         let _ = tls.sock.shutdown(std::net::Shutdown::Both);
         Ok(())
@@ -287,8 +286,8 @@ impl Proxy {
         }
 
         let result = http::relay_response(&mut upstream, tls, no_body);
-        let _ = upstream.conn.send_close_notify();
-        result
+        upstream.conn.send_close_notify();
+        result.map_err(Into::into)
     }
 
     fn forward_plain(
@@ -306,7 +305,7 @@ impl Proxy {
             return Ok(self.bad_gateway(plan, tls, err.into()));
         }
 
-        http::relay_response(&mut upstream, tls, no_body)
+        http::relay_response(&mut upstream, tls, no_body).map_err(Into::into)
     }
 
     fn open_tls_upstream(
@@ -330,11 +329,13 @@ impl Proxy {
         tls: &mut StreamOwned<ServerConnection, TcpStream>,
         err: anyhow::Error,
     ) -> (u16, u64) {
+        // 契约要求：加速器不可达时 errors 计数 +1（docs/test-plan.md ERR-02）
+        Stats::bump(&self.stats.errors);
         self.log.warn(&format!(
             "UPSTREAM-FAIL {}:{} {err:#}",
             plan.host, plan.port
         ));
-        let _ = tls.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n");
+        let _ = tls.write_all(BAD_GATEWAY);
         (502, 0)
     }
 
@@ -348,7 +349,20 @@ impl Proxy {
                 write_response(&mut stream, 200, "application/x-ns-proxy-autoconfig", &body)
             }
             ("GET", "/health") => {
-                let body = self.stats.to_json();
+                // 在计数器之外附上每个候选的健康状态，便于排障时一眼看出切换到了谁
+                let mut body = self.stats.to_json();
+                let accels: Vec<String> = self
+                    .health
+                    .snapshot()
+                    .iter()
+                    .map(|(host, health)| {
+                        format!("{{\"host\":\"{host}\",\"health\":\"{}\"}}", health.as_str())
+                    })
+                    .collect();
+                body.insert_str(
+                    body.len() - 1,
+                    &format!(",\"accelerators\":[{}]", accels.join(",")),
+                );
                 write_response(&mut stream, 200, "application/json", &body)
             }
             _ => write_response(&mut stream, 405, "text/plain; charset=utf-8", "只支持 GET /proxy.pac 与 /health"),
