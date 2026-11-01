@@ -53,7 +53,7 @@ pub fn run(app: &App) -> (Vec<Check>, bool) {
     checks.push(check_ca(app));
     checks.push(check_pac(app));
     checks.extend(check_accels(&app.accels, app.health_timeout));
-    checks.push(check_fallback(app));
+    checks.push(check_chain(app));
 
     let ok = checks.iter().all(|c| c.verdict != Verdict::Fail);
     (checks, ok)
@@ -161,19 +161,22 @@ fn check_accels(accels: &[Accel], timeout: Duration) -> Vec<Check> {
         .collect()
 }
 
-fn check_fallback(app: &App) -> Check {
-    if app.fallback_to_original && app.accels.len() < 2 {
+/// 回退链健康度。
+///
+/// 全挂时**不回退直连**（ADR-016），所以"只有 1 个候选"就是真实的单点，
+/// 值得告警；但这不是配置错误，因此是 WARN 而非 FAIL。
+fn check_chain(app: &App) -> Check {
+    if app.accels.len() < 2 {
         Check::new(
-            "fallback",
+            "chain",
             Verdict::Warn,
-            "fallbackToOriginal=true 且只有 1 个候选：全挂时会失败，且直连 GitHub 在受限网络下等于卡死；\
-             实际行为是快速返回 502",
+            "只有 1 个加速器候选：它一旦不可用，请求会快速返回 502（本工具不回退直连，ADR-016）",
         )
     } else {
         Check::new(
-            "fallback",
+            "chain",
             Verdict::Pass,
-            format!("{} 个候选，fallbackToOriginal={}", app.accels.len(), app.fallback_to_original),
+            format!("{} 个候选", app.accels.len()),
         )
     }
 }
@@ -226,10 +229,12 @@ mod tests {
     }
 
     #[test]
-    fn single_candidate_with_fallback_warns() {
+    fn single_candidate_warns_about_single_point() {
         let app = app();
         assert_eq!(app.accels.len(), 1);
-        assert_eq!(check_fallback(&app).verdict, Verdict::Warn);
+        let check = check_chain(&app);
+        assert_eq!(check.verdict, Verdict::Warn);
+        assert!(check.detail.contains("1 个加速器候选"));
     }
 
     #[test]

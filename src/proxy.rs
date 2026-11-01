@@ -156,8 +156,9 @@ impl Proxy {
         };
 
         let Some((accel_idx, accel)) = self.health.current() else {
-            // 全挂时快速失败。刻意不"回退到原始 URL"：受限网络下直连 GitHub
-            // 本身就是卡死，那会让 winget 长时间无响应（roadmap 风险表）。
+            // 全挂时快速失败，**不回退直连**（ADR-016）。
+            // 实测依据：直连 curl 只有 21 KB/s，而 winget 走 WinHTTP 会在 37 秒
+            // 报 12002 超时、0 字节落盘——"回退"对 winget 等于失败，只是让用户多等。
             Stats::bump(&self.stats.errors);
             self.log.warn(&format!(
                 "NO-HEALTHY-ACCEL {host} 所有加速器都不健康，返回 502"

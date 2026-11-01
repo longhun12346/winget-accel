@@ -177,7 +177,7 @@ ADR-008 的"代码量"估算低估了这件事，详见订正后的 ADR-008。
 | # | 事项 | 说明 |
 |---|---|---|
 | V1 | **健康检查改为按加速器各自探测** | 现 `probeUrl` 指向被封的 `github.com` 资产：直连都拿不到，测的就不是"加速器好坏"，而是"GitHub 是否活着"。全部加速器会因此被同时误判为不健康 |
-| V2 | **`fallbackToOriginal` 语义要用超时兜住** | 直连是"握手成功、传到一半卡死"，不是"慢但可用"。当前配置会让安装表现为**长时间无响应**，比明确失败更糟 |
+| V2 | ~~**`fallbackToOriginal` 语义要用超时兜住**~~ | **已关闭（ADR-016）**：实测直连 curl 21 KB/s、winget 37 s 报 12002 超时。决定不回退，全挂时快速 502 |
 | V3 | **验证加速器对每个白名单 host 是否都可用** | 已证实 gh-proxy 支持 `github.com` / `raw.githubusercontent.com`；`objects.` / `release-assets.` 未证实。改写前应做 host × 加速器 的能力矩阵 |
 | V4 | **核对本机客户端实际的 `ServerSupportedVersions` 交集** | 见 §3.3 第 4 点 |
 

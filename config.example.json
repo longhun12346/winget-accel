@@ -37,8 +37,7 @@
     "$comment_rate": "间隔不得短于 300 秒、探测并发上限 1，避免触发 CDN 侧惩罚（ADR-006）"
   },
 
-  "$comment_fallback": "所有加速器都不健康时是否回退直连（隧道到 github.com）。开启后受限网络下会表现为长时间无响应，必须配合超时与直连判定（design.md §9）",
-  "fallbackToOriginal": true,
+  "$comment_no_fallback": "没有 fallbackToOriginal 这一项：所有候选都不健康时直接快速返回 502，不回退直连（ADR-016）。实测直连 curl 仅 21 KB/s，而 winget 走 WinHTTP 会在 37 秒报 12002 超时、0 字节落盘——回退等于让用户多等一次失败",
 
   "logLevel": "info"
 }

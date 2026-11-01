@@ -27,7 +27,6 @@ pub struct FileConfig {
     pub rewrite_hosts: Vec<String>,
     pub accelerators: Vec<AcceleratorCfg>,
     pub health: HealthCfg,
-    pub fallback_to_original: bool,
     pub log_level: String,
 }
 
@@ -42,7 +41,6 @@ impl Default for FileConfig {
                 priority: 1,
             }],
             health: HealthCfg::default(),
-            fallback_to_original: true,
             log_level: "info".into(),
         }
     }
@@ -87,7 +85,6 @@ pub struct App {
     pub rewrite_hosts: Vec<String>,
     /// 按 priority 升序排列的加速器候选（回退链）。
     pub accels: Vec<Accel>,
-    pub fallback_to_original: bool,
     pub cert_dir: PathBuf,
     pub log_path: PathBuf,
     /// 额外拦截但不改写的 host（只用于验证 Name Constraints 与排障）。
@@ -140,7 +137,6 @@ impl App {
             listen,
             rewrite_hosts,
             accels,
-            fallback_to_original: file.fallback_to_original,
             cert_dir: cli.cert_dir.unwrap_or_else(|| PathBuf::from("certs")),
             log_path: cli.log.unwrap_or_else(|| PathBuf::from("proxy.log")),
             mitm_extra: cli.mitm_extra,
