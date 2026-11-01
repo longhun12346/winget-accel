@@ -1,293 +1,318 @@
 # 设计
 
+> 架构已于 2026-11-01 从"本地 REST 源"切换为"PAC + 本机 MITM 改写代理"（ADR-013）。
+> 事实依据：[docs/verification-proxy-2026-11-01.md](verification-proxy-2026-11-01.md)；
+> 安全边界：[docs/decisions.md](decisions.md) ADR-014。
+
 ## 1. 架构总览
 
 ```
-                    ┌──────────────────────────────────────────┐
-                    │           本机（127.0.0.1）              │
-                    │                                          │
-  winget CLI ──────▶│  winget-accel  (HTTPS :8443)             │
-   (REST client)    │    ├── /information                      │
-                    │    ├── /manifestSearch                   │
-                    │    └── /packageManifests/{id}            │
-                    │              │                           │
-                    │              │ 读取 + 改写               │
-                    │              ▼                           │
-                    │    data/manifests/  ◀── sync ──┐         │
-                    │    (官方 winget-pkgs 副本)      │         │
-                    └────────────────────────────────┼─────────┘
-                                                     │
-                                     git sparse-checkout（低频）
-                                                     │
-                                            microsoft/winget-pkgs
-
-  winget 拿到改写后的 InstallerUrl 后，自己直接去下载：
-  winget ──▶ https://<加速器>/https://github.com/... ──▶ GitHub
-              （字节不经过本项目）
+winget ──①查清单──▶ cdn.winget.microsoft.com        官方源，DIRECT，不经过本项目
+   │
+   └──②下载 InstallerUrl──▶ github.com:443
+                              │
+                    PAC 只把这 4 个 host 指给本机代理
+                              ▼
+                     127.0.0.1:8443（本项目常驻）
+                       ├ 命中白名单 → 终止 TLS（CA 签叶证书）
+                       │              → 请求改写为 https://<加速器>/<原始完整 URL>
+                       │              → 响应体原样转发
+                       └ 其余 host  → 纯隧道，字节不解析
+                              │
+                              ▼
+                        gh-proxy.com ──▶ GitHub
 ```
 
-**关键点：本项目不转发字节。** 它只在清单层面把 URL 换成加速器地址，
-真正的安装包下载由 winget 自己完成。
-
----
+**不实现 REST 源、不建索引、不注册源、不需要管理员。**
+winget 的清单仍来自官方源，`InstallerSha256` 也来自官方清单——被篡改就装不上，
+所以**完整性不因 MITM 下降**（实测：`"已成功验证安装程序哈希"`）。
 
 ## 2. 组件
 
 | 组件 | 职责 | 是否常驻 |
 |---|---|---|
-| `serve` | HTTPS REST 服务，响应 winget 的三种请求 | ✅ |
-| `sync` | 稀疏检出/增量更新 `winget-pkgs` 清单 | ❌ 定时或手动 |
-| `health` | 加速器可用性与延迟探测，结果供改写引擎选择 | 内嵌于 serve |
-| `cert` | 生成 localhost 自签证书、导出/安装到信任库 | ❌ 一次性 |
-| `setup` | 注册/移除 winget 源（需管理员） | ❌ 一次性 |
+| `proxy` | 监听端口、PAC 端点、CONNECT 分流、MITM 与改写、隧道、健康探测 | ✅ |
+| `setup` | 生成 CA、装 `CurrentUser\Root`、记录原 PAC、设 `AutoConfigURL` | ❌ 一次性 |
+| `teardown` | 删 CA、还原 `AutoConfigURL`、停进程、自校验无残留 | ❌ 一次性 |
+| `doctor` | 自检：CA 在库、PAC 生效、端口占用、加速器健康 | ❌ 按需 |
 
-CLI 形态建议（子命令）：
-
-```
-winget-accel serve   --config config.json
-winget-accel sync    --config config.json [--full]
-winget-accel cert    --out ./certs [--install]
-winget-accel setup   [--remove]        # 内部调用 winget source add/remove
-winget-accel doctor                    # 自检：证书、端口、源、清单、加速器
-```
-
----
-
-## 3. REST 协议
-
-**权威依据**：`microsoft/winget-cli-restsource` 仓库中的 OpenAPI 文档
-`documentation/WinGet-1.1.0.yaml`（实现阶段必须先拉下来逐字段核对）。
-
-已知的三个端点：
-
-### 3.1 `GET {base}/information`
-
-返回源元信息：源标识、支持的清单 schema 版本、协议版本等。
-winget 在 `source add` 之后会调用它做校验。
-
-### 3.2 `POST {base}/manifestSearch`
-
-请求体包含查询条件（`Query`、`Inclusions`、`Filters`、`MaximumResults` 等）。
-响应为匹配的包列表，含 `PackageIdentifier`、`PackageName`、`Publisher`、
-`Versions` 等。
-
-**注意**：`search` 只需要包标识级信息，**不需要** `InstallerUrl`——
-所以搜索路径不涉及改写。
-
-### 3.3 `GET {base}/packageManifests/{id}`
-
-返回该包的完整清单组合（version / installer / locale 三类文档）。
-**`InstallerUrl` 就在这里，改写发生在这个端点。**
-
-响应需按 winget 请求的 schema 版本输出（见 `decisions.md` ADR-008）。
-
-### 3.4 已核实项（原"未确认项"，2026-11-01 复核后关闭）
-
-依据：`documentation/WinGet-1.1.0.yaml`（61,887 字节，SHA-256 `883120cf…76fcc`）
-与 `winget-cli` 源码，详见 `verification-2026-11-01.md` §3。
-
-- [x] `ServerSupportedVersions`：`array<string>`，`minItems: 1`，`maxLength: 128`
-- [x] 版本协商：客户端对"自己支持的契约集"与"服务端声明集"取**交集再取最大值**；
-      服务端声明 `["1.10.0"]` 即锁定 1.10.0（ADR-008）
-- [x] `manifestSearch` 字段：请求 `MaximumResults` / `FetchAllManifests` / `Query` / `Inclusions` / `Filters`；
-      响应 `Data[]` + `RequiredPackageMatchFields` + `UnsupportedPackageMatchFields` + `ContinuationToken`
-- [x] 错误响应：包不存在返回 **404 + `array<Error{ErrorCode,ErrorMessage}>`**，不是空结果
-- [x] 三类文档形态：**单个响应内嵌套**（`Versions[]{ Locales[], Installers[] }`），不是三个请求
-- [ ] ETag / 缓存头：规范未要求，**可后置**，不阻塞开工
-
-**仍未确定**：HTTPS 是否强制（需一次提权实测，见 §6.2 与 `research.md` §8）。
-
----
-
-## 4. 清单流水线
-
-### 4.1 获取
-
-`microsoft/winget-pkgs` 全量约 1 GB 级别（数万包 × 多版本）。
-使用 **git sparse-checkout** 只取 `manifests/` 目录，并按首字母分批：
-
-```bash
-git clone --filter=blob:none --sparse https://github.com/microsoft/winget-pkgs.git
-cd winget-pkgs
-git sparse-checkout set manifests/g manifests/m manifests/7
-```
-
-> 若 GitHub 直连受限，`clone` 这一步同样需要经加速器（或在能联网的环境下同步后拷贝）。
-> 这是本项目**唯一**依赖大流量同步的环节，必须提供"离线导入"路径。
-
-### 4.2 存放
+Rust 交付形态的子命令：
 
 ```
-data/
-  manifests/            # 与上游一致的目录结构，禁止就地改写（ADR-005）
-  index.json            # 启动时构建的内存索引的持久化快照（可选）
-  state.json            # 上次同步的 commit id、时间
+winget-accel proxy      --config config.json
+winget-accel setup      [--config config.json]   # 会弹一次根证书确认
+winget-accel teardown
+winget-accel doctor
 ```
 
-### 4.3 增量更新
+## 3. PAC 生成与语义
 
-- 记录上次同步的 commit
-- 每次 `sync` 做 `git fetch` + `git sparse-checkout reapply`
-- 只重建受影响包的索引项（按 `git diff --name-only` 判断）
-- **完整性校验**：可选地抽样比对若干包的 `InstallerSha256` 与官方源
+PAC 由**代理进程自己提供**，地址固定为 `http://127.0.0.1:<port>/proxy.pac`。
+端口与 PAC 内容在同一进程内生成，不会出现"配置改了但 PAC 没改"的不一致。
 
-### 4.4 索引
+内容（与原型一致）：
 
-启动时扫描 `manifests/` 构建内存索引：
-`PackageIdentifier → { 最新版本, 全部版本, 各版本清单文件路径 }`。
-数万包的文件扫描应在几秒内完成；若过慢则读 `index.json` 快照。
+```javascript
+function FindProxyForURL(url, host) {
+  host = host.toLowerCase();
+  if (host == "github.com" || host == "objects.githubusercontent.com"
+   || host == "codeload.github.com" || host == "release-assets.githubusercontent.com"
+   || shExpMatch(host, "*.github.com")) {
+    return "PROXY 127.0.0.1:8443";
+  }
+  return "DIRECT";
+}
+```
 
----
+| 设计点 | 理由 |
+|---|---|
+| 只列 4 个 host + `*.github.com` | 爆炸半径最小化；`cf-winget-proxy` 全量改写是反面教材（ADR-002） |
+| 其余一律 `DIRECT` | Microsoft 域、商店域、其它软件源完全不受影响 |
+| 用 PAC 而非全局 `ProxyServer` | 代理进程挂掉时，只有这 4 个 host 失败；其余网络照常 |
+| `ProxyEnable=0` | 避免与 `ProxyServer` 语义叠加；PAC 单独生效（§9.3 实测） |
 
-## 5. 改写引擎
+> `*.github.com` 在 PAC 里只是转到代理，**不会**被终止 TLS：MITM 只发生在那 4 个
+> 精确匹配的 host 上，其余 `github.com` 子域走纯隧道（`design.md` §4）。
+> PAC 范围比 MITM 范围宽，是为了避免子域流量被系统直连卡住。
 
-### 5.1 配置
+系统侧只改一个值：
+
+```
+HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings\AutoConfigURL
+  = http://127.0.0.1:8443/proxy.pac
+```
+
+`setup` 在改动前把**原有 `AutoConfigURL`** 记进状态文件，`teardown` 原样写回。
+
+> PAC 取不到时，WinINet 会退化为直连。这是有意接受的行为：
+> 表现为"没有加速"，而不是"没有网络"。
+
+## 4. CONNECT 分流
+
+代理收到的第一条报文决定走哪条路：
+
+| 首行 | 处理 |
+|---|---|
+| `CONNECT <host>:<port>`，host 在 `rewriteHosts` 内 | **MITM**（§5），终止 TLS 并改写 |
+| `CONNECT <host>:<port>`，host 不在白名单 | **隧道**：连接上游后双向泵字节，不解析 |
+| `GET /proxy.pac` | 返回 PAC 文本（`PAC-SERVED`） |
+| `GET /health` 或 `/status` | 返回 JSON 计数 |
+| 其它明文请求 | `405`，记 `PLAIN-405` |
+
+实现约束：
+
+1. **只绑定 `127.0.0.1`**，不得绑 `0.0.0.0`
+2. Windows 上必须用 `SO_EXCLUSIVEADDRUSE`。原型最初用 `SO_REUSEADDR`，
+   实测在 Windows 上会允许**抢占已被占用的端口**，出现两个实例同时绑定、命中随机
+3. 读 `CONNECT` 头时**逐字节读到 `\r\n\r\n`**，不得多读——头后面紧跟 ClientHello，
+   多读会把 TLS 记录切碎（原型 `read_until_atomic` 即为此）
+4. 隧道上游连接超时 15 s，失败返回 `502` 并记 `TUNNEL-FAIL`
+5. 端口被占用时**立即失败并打印占用进程**，不静默换端口——PAC 里写死了端口，
+   换了端口就等于指向空气
+
+## 5. MITM 与叶证书
+
+### 5.1 CA 参数（已实测）
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| 算法 | ECDSA P-256 | 原型选择；Rust 版可改 RSA-2048 规避边缘兼容问题 |
+| `BasicConstraints` | `ca=true, path_length=0` | 只能签终端证书，不能签下级 CA |
+| `NameConstraints` | `permitted_subtrees` = 4 个 DNS，`critical` | **核心约束**：Windows 强制校验（§9.4） |
+| `KeyUsage` | `keyCertSign` + `crlSign` + `digitalSignature` | |
+| 有效期 | 365 天 | 过长不便轮换，过短频繁打扰用户 |
+
+### 5.2 叶证书
+
+| 项 | 值 |
+|---|---|
+| SAN | **只含该 host 一个** `DNSName` |
+| `BasicConstraints` | `ca=false`，`critical` |
+| `ExtendedKeyUsage` | `serverAuth` |
+| 有效期 | 30 天 |
+| 生成时机 | 首次遇到该 host 时生成并缓存（进程内） |
+
+> 原型的叶证书会落盘到 `certs/leaves/`。Rust 版应**在内存生成并缓存**，
+> 不落盘（ADR-015）。
+
+### 5.3 握手失败的处理
+
+握手失败只记 `MITM-HANDSHAKE-FAIL <host> <err>` 并关闭连接，**不重试、不改道**。
+最常见原因是客户端不信任 CA（未 `setup` 或 CA 被删）。
+
+## 6. URL 改写规则
+
+输入（`CONNECT github.com:443` 之后的请求行）：
+
+```
+GET /junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-windows_amd64.zip HTTP/1.1
+```
+
+改写为：
+
+```
+GET /https://github.com/junegunn/fzf/releases/download/v0.74.5/fzf-0.74.5-windows_amd64.zip HTTP/1.1
+Host: gh-proxy.com
+```
+
+规则：
+
+1. 目标 = 加速器模板 `https://<加速器>/{url}`，代入
+   `url = https://<原 host><原 path+query>`。实际报文是把
+   `/https://<原 host><原 path+query>` 作为请求路径、`Host` 设为加速器域名，
+   等价于 `https://gh-proxy.com/https://github.com/...`
+2. `Host` 头改成加速器域名
+3. **必须原样透传**：`Range`、`If-Range`、`If-None-Match`、`User-Agent`
+4. **必须剥离**逐跳头：`Proxy-Connection`、`Connection`、`Keep-Alive`、`TE`、`Trailer`、`Upgrade`
+5. 不改请求方法、不改查询串、不重新编码路径（`%2F` 之类保持原样）
+6. **只改 URL，不碰响应体**——这是完整性论证的前提（ADR-014 约束 3）
+
+> `Range` 透传是硬要求：实测 winget 用 4 段 Range 取同一个文件（§9.2），
+> 丢掉 `Range` 会退化为整包重传，或者拼出坏文件。
+
+## 7. 响应转发
+
+| 上游响应形态 | 处理 |
+|---|---|
+| 有 `Content-Length` | 按长度读满再转发 |
+| `Transfer-Encoding: chunked` | 按块解码转发（含 0 块后的 trailer） |
+| 两者都没有 | 读到 EOF |
+| 上游连接失败 | 回 `502`，记 `UPSTREAM-FAIL` |
+
+状态码、`Content-Range`、`Content-Type` 等响应头**原样转发**，不重写。
+请求侧统一加 `Connection: close`（原型为一连接一请求）；Rust 版支持 keep-alive 后
+这一条要相应调整，届时需重新验证「多请求复用一条隧道」下 `206` 仍正确。
+
+## 8. 加速器健康检查与切换
+
+### 8.1 配置形状
 
 **字段形状的权威定义是 [`config.example.json`](../config.example.json)**；本节只解释语义，
-不再复制整份配置——此前 `design.md` 与 `config.example.json` 各存一份，已经出现过字段不一致
+不再复制整份配置——此前 `design.md` 与 `config.example.json` 各存一份，出现过字段不一致
 （`failuresBeforeUnhealthy`、`stateFile`、`logLevel`）。
 
 | 字段 | 语义 |
 |---|---|
-| `listen` | 监听地址，**只能**是 `127.0.0.1:<port>`（§9） |
-| `certFile` / `keyFile` | PEM 证书与私钥（§6） |
-| `manifestDir` | 本地清单根目录，结构须与上游一致（ADR-005） |
-| `stateFile` | 上次同步的 commit 与时间（§4.3） |
-| `rewriteHosts` | 改写白名单，按 host 精确匹配（ADR-004） |
-| `accelerators[]` | `name` / `template`（`{url}` 占位）/ `priority` / 可选 `probeUrl` |
-| `health.*` | 见 §5.3，`probeUrl` 默认 `{acceleratorOrigin}/` |
-| `fallbackToOriginal` | 全挂时是否回退原始 URL，见 §5.3 的风险说明 |
+| `listen` | 监听地址，**只能**是 `127.0.0.1:<port>`；该端口同时写进 PAC |
+| `rewriteHosts` | 改写白名单，按 host 精确匹配；PAC 与 CONNECT 分流共用这一份（ADR-004 / ADR-014 约束 2） |
+| `accelerators[]` | `name` / `template`（`{url}` 占位）/ `priority` |
+| `health.*` | 见 §8.2 |
+| `fallbackToOriginal` | 全挂时是否回退直连，见 §9 |
 | `logLevel` | `debug` / `info` / `warn` / `error` |
 
 实现约定：以 `$` 开头的键（`$comment` 等）是注释，解析时必须忽略。
 
-### 5.2 改写规则
+`accelerators[]` 按 `priority` 升序，取第一个健康的：
 
-输入 `https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip`
-
-输出（priority=1 的加速器健康时）：
-
-```
-https://gh-proxy.com/https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip
+```json
+{ "name": "gh-proxy", "template": "https://gh-proxy.com/{url}", "priority": 1 }
 ```
 
-判断逻辑：
+### 8.2 探测
 
-1. 解析 `InstallerUrl`，取 host
-2. host 不在 `rewriteHosts` → **原样返回**
-3. 按 priority 找第一个 `healthy == true` 的加速器 → 套模板
-4. 全部不健康 → 若 `fallbackToOriginal` 则返回原 URL，并记 warning 日志
-
-> 第 4 步有前提：**必须先确认直连可用**。受限网络下直连 `github.com` 是
-> "握手成功、传输中断"，回退等于让安装长时间无响应（§5.3 末尾、V2）。
-
-### 5.3 健康检查
-
-**探测目标：每个加速器探测它自己的入口**（默认 `{acceleratorOrigin}/`），
-不再共用一个 GitHub 资产 URL。
-
-> 原因（`verification-2026-11-01.md` V1）：受限网络下 **GitHub 资产本身就不通**，
-> 用资产 URL 当探针，测出来的是"GitHub 是否活着"，不是"加速器是否好"，
-> 结果是所有加速器被同时误判为不健康。
-
-- 发 `HEAD`，不支持则退化为 1 字节 `Range` GET
-- **判定：收到任意 HTTP 响应（含 404）即视为可达**，不要求 2xx/3xx；同时记录 TTFB
-- 探测必须带超时（`timeoutSeconds`），超时计入失败
-- 探测频率不得高于 5 分钟一次，并发上限 1，避免重蹈压测覆辙（ADR-006）
-- 连续 `failuresBeforeUnhealthy` 次（默认 2）失败才标记不健康，避免抖动
-
-**直连可达性要单独判定**：`fallbackToOriginal` 只在"加速器全挂"时生效，
-而受限网络下直连往往同样不可用。回退前应做一次低成本直连探测并记录结论，
-否则安装会表现为**长时间无响应**，比明确失败更难排查（V2）。
-
-### 5.4 绝不改动的字段
-
-`InstallerSha256`、`InstallerType`、`InstallerSwitches`、依赖声明、区域设置文档——
-**只改 `InstallerUrl`**。这是安全模型的根基（调研 6.2）。
-
----
-
-## 6. 证书
-
-### 6.1 生成
-
-- 自签，密钥算法 RSA 2048 或 ECDSA P-256
-- **SAN 必须同时包含**：`DNS:localhost`、`IP:127.0.0.1`
-- 有效期建议 1 年（过长不便轮换，过短频繁维护）
-- 私钥权限收紧到当前用户
-
-### 6.2 信任
-
-winget 要求 REST 源使用 HTTPS（待实测确认，见 `research.md` 第 8 节）。
-证书需加入**本机**信任库：
-
-```powershell
-Import-Certificate -FilePath .\certs\localhost.crt -CertStoreLocation Cert:\LocalMachine\Root
-```
-
-**这是本项目唯一的机器级安全变更**，必须在安装时明确告知用户：
-它使本机信任一张我们生成的证书，但该证书仅对 `localhost` 有效。
-
-### 6.3 轮换与卸载
-
-- 提供 `cert --remove` 从信任库删除
-- 证书到期前 `doctor` 应告警
-
----
-
-## 7. 一次性安装步骤
-
-```powershell
-# 1. 生成并信任证书（管理员）
-winget-accel cert --install
-
-# 2. 注册源（管理员，内部执行 winget source add）
-winget-accel setup
-
-# 3. 同步清单（可普通权限）
-winget-accel sync
-
-# 4. 启动服务（可普通权限，建议做成登录自启）
-winget-accel serve
-```
-
-卸载：
-
-```powershell
-winget-accel setup --remove
-winget-accel cert --remove
-```
-
----
-
-## 8. 失败模式与处理
-
-| 场景 | 表现 | 处理 |
+| 项 | 值 | 依据 |
 |---|---|---|
-| 服务未启动 | winget 报源不可用 | `doctor` 明确提示；建议登录自启 |
-| 端口被占用 | 启动失败 | 立即失败并打印占用进程 |
-| 证书过期/未信任 | TLS 握手失败 | `doctor` 检查有效期与信任链 |
-| 加速器全挂 | 退化为直连（慢但可用） | 日志 warning，`doctor` 显示各加速器状态 |
-| 清单缺包 | 该包搜不到 | `sync` 未覆盖；`doctor` 提示覆盖范围 |
-| 清单过期 | 装到旧版本 | `sync` 定期化，`doctor` 显示上次同步时间 |
-| schema 版本不匹配 | winget 解析失败 | 按 ADR-008 处理，日志记录实际请求版本 |
+| 探测目标 | 加速器**自身 origin** 根路径 | 用 GitHub 资产当探针会把"GitHub 不通"误判为"加速器不健康"（`verification-2026-11-01.md` V1） |
+| 判定 | **收到任意 HTTP 响应（含 404）即可达** | 不要求 2xx/3xx；同时记录 TTFB |
+| 方法 | `HEAD`，不支持则退化为 1 字节 `Range` GET | |
+| 超时 | `health.timeoutSeconds`（默认 8） | 超时计一次失败 |
+| 间隔 | `health.intervalSeconds`（默认 300），不得更快 | 避免重蹈压测惩罚（ADR-006） |
+| 并发 | 1 | 同上 |
+| 判定阈值 | 连续 `failuresBeforeUnhealthy`（默认 2）次失败才标记不健康 | 抗抖动 |
 
----
+### 8.3 切换
 
-## 9. 安全注意事项（实现时必须遵守）
+改写发生在**每个请求**上，所以切换是即时的：健康状态一变，下一个请求就用新加速器。
+不需要重建任何缓存。
 
-1. **只绑定 `127.0.0.1`**，不得绑定 `0.0.0.0`
-2. **不提供任何文件下载端点**（我们不是镜像，不转发字节）
-3. 路径参数必须校验，防目录穿越（`{id}` 只允许 `[A-Za-z0-9._-]`）
-4. 不记录可能含敏感信息的完整请求体
-5. 配置里的加速器地址来自用户，不应在日志里输出带凭据的 URL
+> 未验证（H4）：并发下载中途加速器失效时，已建立的连接不会自动迁移。
+> 当前设计接受这一点——该连接会失败，winget 重试时才会命中新加速器。
 
----
+### 8.4 host × 加速器 能力矩阵
 
-## 10. 明确不做的事
+不同加速器对 host 的支持不一致。改写前必须查矩阵，不支持的组合**不得**改写
+（退化到直接隧道，慢但可用）。
 
-- 不实现 `autoInternalize`（不落地安装包）
-- 不实现 Entra ID / 多用户鉴权
-- 不做 MITM、不改 hosts、不装根证书
-- 不启用 `LocalManifestFiles`
-- 不做激进并发下载
+当前已证实的组合只有：`gh-proxy` 支持 `github.com`。
+`objects.githubusercontent.com` / `codeload.github.com` / `release-assets.githubusercontent.com`
+是否被支持**未验证**（原型实测的都是 `github.com` 直链）。
+
+### 8.5 当前候选
+
+| 加速器 | 状态（2026-11-01） |
+|---|---|
+| `gh-proxy.com` | ✅ 可用，支持 `Range` / `206`（§9.2） |
+| `ghfast.top` | ❌ 已失效（`000` / 12 s） |
+
+只有 1 个可用 ⇒ 事实上没有回退链。配置里保留多候选是给将来用的。
+
+## 9. 失败回退
+
+`fallbackToOriginal`（默认 `true`）决定**所有加速器都不健康**时的行为：
+
+| 取值 | 行为 | 代价 |
+|---|---|---|
+| `true` | 改成直连（即隧道到 `github.com`） | 受限网络下直连是"握手成功、传输中断"，表现为**长时间无响应**，比明确失败更难排查 |
+| `false` | 回 `502` + 明确错误 | 装不上，但原因清楚 |
+
+因此 `true` **必须**配合：
+
+1. 直连可达性判定（`doctor` 或首次回退前做一次低成本探测）
+2. 明确的 `warn` 日志，说明"已回退直连，可能很慢"
+3. 不得让请求无限挂起——回退路径同样带超时
+
+## 10. 失败模式与诊断
+
+| 场景 | 用户看到 | 诊断依据 |
+|---|---|---|
+| 代理未启动 | 这 4 个 host 的下载失败（其余网络正常） | `AutoConfigURL` 指向的端口无响应；`doctor` 报"代理未运行" |
+| CA 未安装 / 被删 | TLS 握手失败，`MITM-HANDSHAKE-FAIL` | `doctor` 查 `CurrentUser\Root` 指纹 |
+| CA 过期 | 同上 | `doctor` 查有效期 |
+| 端口被占用 | 启动即失败 | 打印占用进程（`SO_EXCLUSIVEADDRUSE` 保证不会静默抢占） |
+| 加速器全挂 | 回退直连（很慢）或 `502` | 日志 + `/health` 的加速器状态 |
+| PAC 未生效 | 完全没有加速，但一切正常 | `doctor` 读 `AutoConfigURL` 并与期望值比对 |
+| winget 改为不走系统 PAC | 同上 | 只能靠日志观察（H5） |
+
+### 10.1 日志
+
+| 行 | 含义 |
+|---|---|
+| `PAC-SERVED` | 有人来取 PAC（说明 PAC 生效） |
+| `REWRITE <host><path> -> <status> <bytes>B <time>s` | 白名单请求已改写并转发 |
+| `PASS ...` | 进入 MITM 但未改写（非白名单，理论上不该出现） |
+| `TUNNEL-FAIL` / `UPSTREAM-FAIL` | 上游不可达 |
+| `MITM-HANDSHAKE-FAIL` | 客户端不信任 CA |
+| `RELAY-ERR` | 转发中断 |
+| `CLIENT-ERR` | 客户端侧异常（含 Name Constraints 拒绝） |
+
+`GET /health` 返回计数：`connects / mitm / tunnel / rewrites / bytes / errors`。
+
+### 10.2 `doctor` 检查项
+
+1. 代理进程与端口（`127.0.0.1:8443` 是否可连）
+2. PAC：`AutoConfigURL` 是否等于期望值
+3. CA：是否在 `CurrentUser\Root`、指纹是否匹配、是否临近过期
+4. 加速器：逐个探测 origin，输出状态与 TTFB
+5. winget 版本（记录用，不进判定）
+
+## 11. 安全边界
+
+| 边界 | 实现 |
+|---|---|
+| CA 不能签别的域名 | `NameConstraints` 限定 4 个 DNS + `path_length=0`，Windows 强制校验（§9.4） |
+| 代理挂了不会全机断网 | PAC 而非全局 `ProxyServer`，只圈 4 个 host |
+| 下载内容不会被篡改 | winget 校验官方清单的 `InstallerSha256`；本项目不碰响应体 |
+| 只监听本机 | 绑定 `127.0.0.1` |
+| 不记录敏感内容 | **不记录请求/响应体**，只记 host、path 前缀、状态码、字节数 |
+| 私钥保护 | CA 私钥仅当前用户可读，`*.pem` / `*.key` 已被 `.gitignore` 排除 |
+| 可完整卸载 | `teardown` 删 CA + 还原 PAC + 停进程，并自校验 |
+
+## 12. 明确不做的事
+
+- 不实现 REST 源、不建索引、不同步清单、不注册源（ADR-013）
+- 不做 hosts 劫持、不改 DNS、不启用 `LocalManifestFiles`
+- 不代理 `microsoft.com` / 商店域 / 其它软件源
+- 不实现 HTTP/2——不协商 ALPN，强制 HTTP/1.1（原型即如此，实测 winget 接受）
+- 不做 CRL/OCSP（自签 CA 无吊销信息；`curl` schannel 需 `--ssl-no-revoke`，winget 不受影响）
+- 不做激进并发：健康探测并发 1、间隔 ≥5 分钟
+- 不缓存响应体（同一 URL 重复下载仍走加速器；是否加缓存待实测后再定）

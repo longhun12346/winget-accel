@@ -70,6 +70,8 @@ certutil -user -addstore Root "$PWD\certs\ca-cert.pem"
 | `curl` 直连 release 资源 | 302，随后卡住（`objects.` 被墙） |
 | `curl` 经原型 | **200，1,535,063 B / 2.39 s ≈ 634 KB/s** |
 | `curl` 经原型下载 18.3 MB 大文件 | **200，18,314,725 B / 8.86 s ≈ 2.07 MB/s**，落盘完整、无截断 |
+| 3 路并发 Range 分片 | 全部 `206`，分片和恰好 1,535,063 B，拼接后 SHA256 **与整包一致** |
+| 加速器不可达 | 0.12 s 内返回 `502`（快速失败，不挂死），`errors` 计数 +1 |
 | `winget download --id junegunn.fzf`（PAC 模式） | **退出码 0，7.7 s，2,544,236 B，"已成功验证安装程序哈希"** |
 | 非白名单 host（`api.github.com`） | 原样隧道，200 / 0.96 s，未被改写 |
 | Name Constraints 强制校验 | **生效**：签 `github.com` 被接受，签 `example.com` 被客户端拒绝 |
