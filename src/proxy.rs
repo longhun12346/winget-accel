@@ -384,14 +384,14 @@ impl Proxy {
                 write_response(&mut stream, 200, "application/x-ns-proxy-autoconfig", &body)
             }
             ("GET", "/health") => {
-                // 在计数器之外附上每个候选的健康状态与总体状态，便于排障与脚本化监控
-                let mut body = self.stats.to_json();
-                let accels: Vec<String> = self
+                // 计数器 + 每个候选的健康状态 + 总体状态，交给 serde_json 序列化
+                let accelerators: Vec<crate::stats::AccelHealth> = self
                     .health
                     .snapshot()
                     .iter()
-                    .map(|(host, health)| {
-                        format!("{{\"host\":\"{host}\",\"health\":\"{}\"}}", health.as_str())
+                    .map(|(host, health)| crate::stats::AccelHealth {
+                        host: host.clone(),
+                        health: health.as_str(),
                     })
                     .collect();
                 let status = if self.health.all_unhealthy() {
@@ -399,13 +399,7 @@ impl Proxy {
                 } else {
                     "ok"
                 };
-                body.insert_str(
-                    body.len() - 1,
-                    &format!(
-                        ",\"status\":\"{status}\",\"accelerators\":[{}]",
-                        accels.join(",")
-                    ),
-                );
+                let body = self.stats.health_json(status, accelerators);
                 write_response(&mut stream, 200, "application/json", &body)
             }
             _ => write_response(&mut stream, 405, "text/plain; charset=utf-8", "只支持 GET /winget-accel.pac 与 /health"),
@@ -541,3 +535,4 @@ mod tests {
         assert_eq!(truncate("abc", 10), "abc");
     }
 }
+

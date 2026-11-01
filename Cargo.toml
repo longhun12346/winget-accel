@@ -29,6 +29,8 @@ windows-sys = { version = "0.60", features = ["Win32_Security_Cryptography", "Wi
 # 解析证书的 NotAfter：windows-sys 没有导出 CERT_NOT_AFTER_FILETIME_PROP_ID，
 # 与其编一个常量，不如用成熟解析器。它已是 rcgen 的传递依赖（^0.18），不引入新 crate。
 x509-parser = "0.18"
+# 证书有效期计算：rcgen 已用 time 0.3，直接声明可统一版本、不新增 crate。
+time = "0.3"
 
 [profile.release]
 opt-level = "z"
@@ -36,5 +38,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
 
 
