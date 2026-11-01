@@ -90,8 +90,9 @@ winget-accel.exe --remove-ca
 它会枚举「当前用户受信任的根」，认出本工具的 CA 并用 **`certutil -user -delstore`** 删除
 （与安装用同一套工具），不依赖 `certs\` 目录是否还在。幂等，重复执行只提示"未找到"。
 
-> 已知例外：某些环境（实测 192.0.2.10）下 `certutil -delstore` 返回
-> `ERROR_NOT_SUPPORTED`，此时会自动回退为删注册表项，并在输出里注明。
+> 若该环境不支持 `certutil -delstore`（实测 192.0.2.10 返回 `ERROR_NOT_SUPPORTED`），
+> 程序会**如实报错**并提示手工处理，不会偷偷改走别的路径。手工方式：
+> `certutil -user -delstore Root <指纹>`，或用 `certmgr.msc` → 「受信任的根证书颁发机构」图形界面删除。
 
 下面是等价的手工步骤，供无法运行程序时使用：
 
@@ -271,6 +272,7 @@ PE 头：机器类型 `x64`、子系统 `Windows CUI`、子系统版本 `6.00`�
 ## 许可证
 
 MIT
+
 
 
 

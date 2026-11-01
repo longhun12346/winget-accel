@@ -159,14 +159,14 @@ fn wide(text: &str) -> Vec<u16> {
 /// 本工具 CA 的 Subject 关键字。
 const OUR_CA_SUBJECT: &str = "winget-accel local CA";
 
-/// 移除所有属于本工具的受信任根证书，返回（删除数量, 是否用过注册表兜底）。
+/// 移除所有属于本工具的受信任根证书，返回（成功数, 失败数）。
 ///
-/// **主路径用 `certutil -user -delstore`**，与安装（`certutil -user -addstore`）保持一致；
-/// 但实测在部分机器上 `delstore` 返回 `ERROR_NOT_SUPPORTED`（192.0.2.10 重现过），
-/// 那类环境只有删注册表项有效，所以保留兜底，并把"用过兜底"回报给调用方。
-pub fn remove_our_ca() -> (usize, bool) {
+/// **只用 `certutil -user -delstore`**，与安装（`certutil -user -addstore`）完全对称。
+/// 不写注册表：失败就如实报错，由调用方提示用户手工处理，
+/// 而不是偷偷换一条未文档化的路径把问题掩盖掉。
+pub fn remove_our_ca() -> (usize, usize) {
     let mut removed = 0;
-    let mut used_registry_fallback = false;
+    let mut failed = 0usize;
     unsafe {
         let store = C::CertOpenStore(
             C::CERT_STORE_PROV_SYSTEM_W,
@@ -176,7 +176,7 @@ pub fn remove_our_ca() -> (usize, bool) {
             wide("ROOT").as_ptr() as *const core::ffi::c_void,
         );
         if store.is_null() {
-            return (0, false);
+            return (0, 0);
         }
 
         // 先收集指纹（不能在枚举过程中删，会让枚举游标失效）
@@ -198,37 +198,21 @@ pub fn remove_our_ca() -> (usize, bool) {
         C::CertCloseStore(store, 0);
 
         for thumbprint in thumbprints {
-            // 主路径：certutil（与安装用同一套工具）
-            let via_certutil = std::process::Command::new("certutil")
+            let ok = std::process::Command::new("certutil")
                 .args(["-user", "-delstore", "Root", &thumbprint])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false);
-            if via_certutil {
+            if ok {
                 removed += 1;
-                continue;
-            }
-
-            // 兜底：certutil 在该环境不支持删除，只有删注册表项有效
-            let key = format!(
-                "HKCU\\Software\\Microsoft\\SystemCertificates\\Root\\Certificates\\{thumbprint}"
-            );
-            let via_registry = std::process::Command::new("reg")
-                .args(["delete", &key, "/f"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if via_registry {
-                removed += 1;
-                used_registry_fallback = true;
+            } else {
+                failed += 1;
             }
         }
     }
-    (removed, used_registry_fallback)
+    (removed, failed)
 }
 
 /// 取证书的简单显示名（通常是 Subject）。
@@ -261,5 +245,6 @@ fn subject_of(ctx: *const C::CERT_CONTEXT) -> Option<String> {
         Some(String::from_utf16_lossy(&buf))
     }
 }
+
 
 

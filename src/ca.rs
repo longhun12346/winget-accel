@@ -294,17 +294,22 @@ fn expiry_info(ca_pem: &Path) -> Option<(String, i32)> {
 }
 /// 从用户根存储移除指定指纹的证书。
 ///
-/// 用注册表键而非 `certutil -delstore`：后者在部分机器上返回
-/// ERROR_NOT_SUPPORTED（实测过，见 README 卸载章节）。
+/// 走 `certutil -user -delstore`，与安装对称；失败时只记日志，
+/// 不换别的路径（写注册表属于实现细节，不该作为常规手段）。
 fn remove_trusted_ca(thumbprint: &str) {
-    let key = format!(
-        "HKCU\\Software\\Microsoft\\SystemCertificates\\Root\\Certificates\\{thumbprint}"
-    );
-    let _ = std::process::Command::new("reg")
-        .args(["delete", &key, "/f"])
+    let ok = std::process::Command::new("certutil")
+        .args(["-user", "-delstore", "Root", thumbprint])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        println!(
+            "⚠ 移除旧 CA 失败（certutil -delstore 返回非零）。\
+             若该环境不支持，请用 certmgr.msc 手工删除后再启动。"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -341,3 +346,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+
+
