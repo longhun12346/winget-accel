@@ -257,3 +257,27 @@ Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Setti
 - 必须输出可直接复制的手动命令
 - 移除 CA 用 `certutil -user -delstore Root <thumbprint>`：
   `Remove-Item Cert:\CurrentUser\Root\...` 会因"用户根存储不允许 UI"失败（§1 同因）
+
+## 11. 加速是否真的生效（2026-11-01 A/B 复测，Rust 二进制）
+
+同一个资源（`fd v10.5.0` 的 x86_64-pc-windows-msvc.zip）、同一台机器、前后脚测。
+
+| 路径 | 结果 | 速率 |
+|---|---|---|
+| 直连 `curl -L`（30 s 上限） | 30 s 只收到 **636,355 B**，未下完；302 指向 `release-assets.githubusercontent.com` | **21 KB/s** |
+| 直连 `winget download` | **37 s 失败**：`WinHttpSendRequest: 12002`、`0x80072ee2`，0 字节落盘 | — |
+| 经 Rust 代理 `curl` | 200，**1,535,063 B / 2.07 s** | **724 KB/s** |
+| 经 Rust 代理 `winget download` | **13 s 成功**，2,544,236 B，"已成功验证安装程序哈希" | — |
+
+**结论**：可测的路径上约 **35 倍**差距（21 KB/s → 724 KB/s）。
+更要紧的是 `winget` 自己的判定：直连 37 秒超时失败，经代理 13 秒完成并通过官方哈希校验。
+
+### 对早期结论的修正
+
+早期文档写的是"直连 `000` / 20 s 超时"、"下载链路断了"。**这个说法不够准确**：
+
+- `curl` 直连其实**能通，只是慢**（21 KB/s，30 秒只下 636 KB）
+- 真正"断"的是 **WinHTTP 路径**：`winget` 用 WinHTTP，37 秒就因 `12002` 超时放弃
+
+两条路径的表现不同，原因在客户端超时策略而不是网络完全不通。
+对外表述应统一为"慢到不可用"，而不是"不通"——前者可复现、可量化，后者是当时的误判。
