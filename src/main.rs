@@ -36,6 +36,7 @@ struct Args {
     log_level: Option<String>,
     print_pac: bool,
     doctor: bool,
+    no_env: bool,
 }
 
 fn main() -> Result<()> {
@@ -58,8 +59,11 @@ fn main() -> Result<()> {
 
     let mut args = parse_args()?;
 
-    // 没有任何命令行参数时进入"绿色版"全自动模式（双击即用）
-    let auto_env = std::env::args().count() == 1;
+    // 系统环境接管（装 CA / 设 PAC / 退出还原）**默认开启**，用 --no-env 显式关闭。
+    //
+    // 早期规则是"只有 argc == 1 才接管"，那是个坏设计：
+    // 用户多加一个 --port 就静默失去核心功能，行为不可预期。
+    let auto_env = !args.no_env;
 
     // 绿色版：默认把证书与日志放在 **exe 所在目录**，而不是当前工作目录。
     // 这样整个文件夹可以整包拷到任意位置，从哪启动都不影响行为。
@@ -142,6 +146,7 @@ fn parse_args() -> Result<Args> {
     let mut log_level = None;
     let mut print_pac = false;
     let mut doctor = false;
+    let mut no_env = false;
 
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -164,6 +169,7 @@ fn parse_args() -> Result<Args> {
                 .push(next_value(&mut args, "--mitm-extra")?),
             "--print-pac" => print_pac = true,
             "--doctor" => doctor = true,
+            "--no-env" => no_env = true,
             "--version" => {
                 println!("winget-accel {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -183,6 +189,7 @@ fn parse_args() -> Result<Args> {
         log_level,
         print_pac,
         doctor,
+        no_env,
     })
 }
 
@@ -213,8 +220,10 @@ fn print_help() {
          \x20 --log-level <级别>    error|warn|info|debug\n\
          \x20 --mitm-extra <host>   额外拦截但不改写的 host（排障用，可重复）\n\
          \x20 --doctor              检查配置、证书、PAC 与加速器可达性后退出\n\
+         \x20 --no-env              不接管系统环境（不改 CA/PAC，测试用）\n\
          \x20 --print-pac           打印 PAC 后退出\n\
          \x20 --version             版本\n",
         env!("CARGO_PKG_VERSION")
     );
 }
+

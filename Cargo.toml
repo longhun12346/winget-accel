@@ -24,7 +24,7 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem",
 webpki-roots = "1"
 # Win32 证书存储 API：读写「当前用户受信任根」。
 # 用它替代原先调 powershell.exe 的做法（见 ADR-012 第 3 次修订）。
-windows-sys = { version = "0.60", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+windows-sys = { version = "0.60", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_SystemInformation"] }
 
 [profile.release]
 opt-level = "z"
@@ -32,3 +32,4 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+

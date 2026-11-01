@@ -272,8 +272,21 @@ fn restrict_permissions(dir: &Path) {
 // 所以到期前主动轮换：自动移除旧证书、删掉旧文件、重新生成。
 // 唯一无法自动化的是导入时的确认框（Windows 装根证书必然交互）。
 
-/// 提前多少天开始轮换。留一点余量，避免"今天能用明天突然坏"。
-const RENEW_BEFORE_DAYS: i32 = 7;
+/// 提前多少天开始轮换。
+///
+/// 不写死成魔法数字：按有效期的 2% 推导并夹在 7–30 天之间。
+/// 目的只是"避免今天能用、明天突然坏"，不需要精确值；
+/// 用比例表达的好处是改了 `CA_VALIDITY_DAYS` 之后阈值仍然自动合理。
+const RENEW_BEFORE_DAYS: i32 = {
+    let derived = (CA_VALIDITY_DAYS / 50) as i32; // 2%
+    if derived < 7 {
+        7
+    } else if derived > 30 {
+        30
+    } else {
+        derived
+    }
+};
 
 /// 读证书指纹与剩余天数（走 Win32 API，不依赖 PowerShell）。
 fn expiry_info(ca_pem: &Path) -> Option<(String, i32)> {

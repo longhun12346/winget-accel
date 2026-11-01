@@ -80,12 +80,17 @@ impl Logger {
     }
 }
 
-/// HH:MM:SS（UTC）
+/// HH:MM:SS（**本地时间**）。
+///
+/// 早先用 UTC，理由只是"不想引入时间依赖"——但国内用户看到的时间与本地差 8 小时，
+/// 排障时对不上任何其它日志。为一个依赖牺牲可用性不值得，改用 Win32 的 GetLocalTime。
 fn timestamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-        % 86_400;
-    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    // SAFETY: 传一个本地 SYSTEMTIME 的可写指针，SDK 约定该调用只写这块内存
+    unsafe {
+        let mut st = std::mem::zeroed();
+        GetLocalTime(&mut st);
+        format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
+    }
 }
+

@@ -114,6 +114,9 @@ def build_command(request):
             "--port", str(port),
             "--cert-dir", str(cert_dir),
             "--log", str(log),
+            # 二进制默认会接管系统环境（装 CA / 设 PAC）。测试必须显式关掉，
+            # 否则会污染测试机——这也是 --no-env 存在的原因。
+            "--no-env",
         ]
         if accel is not None:
             cmd += ["--accel", accel]
@@ -366,4 +369,5 @@ def ca(cert_dir):
 
 # 命令行选项（--network / --target-binary）与收集钩子在 prototype/conftest.py：
 # pytest 解析参数时就要注册，放这里太晚。
+
 
