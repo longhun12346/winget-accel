@@ -86,11 +86,14 @@ fn main() -> Result<()> {
     }
 
     if args.remove_ca {
-        let removed = crate::certinfo::remove_our_ca();
+        let (removed, used_fallback) = crate::certinfo::remove_our_ca();
         if removed == 0 {
             println!("未找到属于本工具的根证书（可能本来就没装）。");
         } else {
             println!("已从「当前用户受信任的根」移除 {removed} 张本工具证书。");
+            if used_fallback {
+                println!("（其中部分是通过删注册表项完成的：该环境不支持 certutil -delstore）");
+            }
         }
         println!("提示：若系统 PAC 仍指向本机代理，请一并清除：");
         println!("  reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v AutoConfigURL /f");
@@ -242,6 +245,7 @@ fn print_help() {
         env!("CARGO_PKG_VERSION")
     );
 }
+
 
 
 
