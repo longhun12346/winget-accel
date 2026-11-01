@@ -347,3 +347,41 @@ Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Setti
 
 配置已按中位数重排（ghfast 与 imciel 互换）。这也说明：**候选排序应该看多次中位数，
 而不是一次快照**——否则会得到一个随机的顺序。
+
+### 补充：从维护中的清单抓候选（2026-11-01 19:40）
+
+先说明方法问题：前面 26 个候选是**凭记忆列的常见服务**，不是穷举。
+改为从持续维护的清单里抓域名，再逐个实测，立刻多出可用候选。
+
+来源（只取域名，不信任其推荐结论）：
+- `hubporg/CF-GitHub-Proxy` 的 README
+- `lightjunction/magicnet` 的 `docs/github-downloads.md`
+
+新增 7 个候选的实测结果：
+
+| 候选 | 结果 |
+|---|---|
+| `gh.geekertao.top` | ✅ Range 206，整包哈希一致，**692 / 715 KB/s** |
+| `ghproxy.site` | ✅ Range 206，整包哈希一致，155 / 332 KB/s |
+| `gh.ddlc.top` | ⚠️ **429**（限流，非死亡） |
+| `ghfile.geekertao.top` | ⚠️ 429 |
+| `github.dpik.top` | ⚠️ 429 |
+| `gh.felicity.ac.cn` | ⚠️ 429 |
+| `gh.jasonzeng.dev` | ❌ TLS 握手失败 |
+
+**429 是一个需要单独记录的状态**：它既不是可用，也不该记为"已失效"——
+服务是活的，只是当前拒绝本机请求。健康探测若把它判成 unhealthy 是合理的（当下确实不能用），
+但把它从候选集里永久删掉就错了。将来复核时它们可能直接可用。
+
+当前可用候选 5 个（按多次测量中位数排序）：
+
+| priority | 候选 | 速率 |
+|---|---|---|
+| 1 | `gh-proxy.com` | 769 KB/s（最稳） |
+| 2 | `gh.geekertao.top` | ~703 KB/s |
+| 3 | `ghfast.top` | 339 KB/s |
+| 4 | `ghproxy.site` | ~243 KB/s |
+| 5 | `ghproxy.imciel.com` | 238 KB/s（抖动最大） |
+
+**结论**：这个池子不是封闭的，也不可能穷举。可行的方法是"维护一个清单 + 定期用同一标准复测"，
+而不是期望一次性找到全部。

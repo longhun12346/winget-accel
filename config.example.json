@@ -22,14 +22,24 @@
       "priority": 1
     },
     {
-      "name": "imciel",
-      "template": "https://ghproxy.imciel.com/{url}",
-      "priority": 3
+      "name": "geekertao",
+      "template": "https://gh.geekertao.top/{url}",
+      "priority": 2
     },
     {
       "name": "ghfast",
       "template": "https://ghfast.top/{url}",
-      "priority": 2
+      "priority": 3
+    },
+    {
+      "name": "ghproxy-site",
+      "template": "https://ghproxy.site/{url}",
+      "priority": 4
+    },
+    {
+      "name": "imciel",
+      "template": "https://ghproxy.imciel.com/{url}",
+      "priority": 5
     }
   ],
 
