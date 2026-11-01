@@ -1,0 +1,4 @@
+# 静态链接 MSVC CRT：产物不依赖 VCRUNTIME140.dll / UCRT 系列，
+# 拷到没装 VC++ 运行库的机器也能直接跑（ADR-009 的"零依赖"要求）。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
