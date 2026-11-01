@@ -423,3 +423,26 @@ Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Setti
 验证产生的文件都在 `%USERPROFILE%\wgaccel-test\`（二进制、config.json、certs、日志、下载样本）。
 没有安装 CA 到根存储、没有改 PAC —— 因此**没有系统状态残留**。
 我加到 `authorized_keys` 的公钥已清除（两个文件都归零）。
+
+### 退出还原：之前的说法有误，已修正（2026-11-01 20:40）
+
+**错误说法**：早期文档与对话里写"Ctrl+C 退出会自动还原 PAC"。
+
+**事实**：Rust 默认把 Ctrl+C 当作进程终止信号，**不展开栈**，`Drop` 不会执行；
+点窗口 X（`CTRL_CLOSE_EVENT`）同理。所以只靠 `EnvGuard::drop` 的话，
+Ctrl+C 和关窗口**都**不会还原 PAC。
+
+**修正**：新增 `install_exit_handler()`，用 `SetConsoleCtrlHandler` 注册控制台事件处理，
+在进程消失前同步调用 `restore_now()`（把原 PAC 写回，或删除该值），
+覆盖 Ctrl+C / 关闭窗口 / 注销 / 关机。原 PAC 值通过泄漏的静态缓冲区传递，
+避免在事件线程里加锁。
+
+**同时修正另一处**：此前说"PAC 指向死端口会让那 4 个域名全部失败"。
+实际 WinINet 在 PAC 取不到时会**退化为直连**，所以残留 PAC 的后果是
+"回到慢速直连"，不是"功能全挂"。这降低了该缺陷的严重性，但不改变"应该还原"的结论。
+
+**验证状态**：
+- `recover_stale`（下次启动清理残留）：已实测有效
+- `install_exit_handler`：已编译通过，但**关闭事件路径尚未实测**——
+  用 `taskkill`（不带 /F）测试无效，它不会给控制台程序发 `CTRL_CLOSE_EVENT`。
+  需要真实按 Ctrl+C 或真实关窗口才能验证。

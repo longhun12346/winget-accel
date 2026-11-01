@@ -64,6 +64,10 @@ impl EnvGuard {
         std::fs::write(&state_path, prior.clone().unwrap_or_default())
             .with_context(|| format!("写不了 {}", state_path.display()))?;
 
+        // 先登记原值再改 PAC：即使下一刻就被 Ctrl+C 打断，也能还原
+        store_prior(prior.as_deref());
+        install_exit_handler();
+
         write_pac(&format!("http://127.0.0.1:{port}/proxy.pac"))?;
 
         Ok(Self {
@@ -189,5 +193,80 @@ fn ensure_ca_trusted(ca_pem: &Path) -> Result<()> {
             }
             Err(err) => bail!("等待 certutil 失败: {err}"),
         }
+    }
+}
+
+// ---------------------------------------------------------------- 退出时还原
+//
+// 关键事实：Rust 里 Ctrl+C 的默认行为是**直接终止进程、不展开栈**，
+// 所以 Drop 不会执行。点窗口 X（CTRL_CLOSE_EVENT）同理。
+// 因此必须注册控制台事件处理，在进程消失前同步把 PAC 还原。
+
+use std::sync::atomic::Ordering as AtomicOrdering;
+
+/// 没有"原 PAC"时的哨兵长度值。
+const NO_PRIOR: usize = usize::MAX;
+
+static PRIOR_PTR: std::sync::atomic::AtomicPtr<u8> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static PRIOR_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(NO_PRIOR);
+
+/// 把原 PAC 值泄漏成静态数据，供控制台事件线程读取（不能在里面加锁）。
+fn store_prior(prior: Option<&str>) {
+    match prior {
+        Some(value) if !value.trim().is_empty() => {
+            let boxed = value.as_bytes().to_vec().into_boxed_slice();
+            let len = boxed.len();
+            let ptr = Box::into_raw(boxed) as *mut u8;
+            PRIOR_PTR.store(ptr, AtomicOrdering::SeqCst);
+            PRIOR_LEN.store(len, AtomicOrdering::SeqCst);
+        }
+        _ => PRIOR_LEN.store(NO_PRIOR, AtomicOrdering::SeqCst),
+    }
+}
+
+fn pending_prior() -> Option<String> {
+    let len = PRIOR_LEN.load(AtomicOrdering::SeqCst);
+    if len == NO_PRIOR {
+        return None;
+    }
+    let ptr = PRIOR_PTR.load(AtomicOrdering::SeqCst);
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: ptr/len 来自上面泄漏的 Box<[u8]>，进程存活期间一直有效
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+fn restore_now() {
+    match pending_prior() {
+        Some(value) => {
+            let _ = write_pac(&value);
+        }
+        None => {
+            let _ = delete_pac();
+        }
+    }
+}
+
+unsafe extern "system" fn on_console_event(_event: u32) -> i32 {
+    restore_now();
+    // 返回 1 = 不处理，交回默认动作让进程正常终止（只在终止前做完还原）
+    1
+}
+
+/// 注册控制台事件处理：Ctrl+C、关窗口、注销、关机都会触发还原。
+pub fn install_exit_handler() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+    }
+    // SAFETY: 只注册一个函数指针，handler 签名与 Win32 要求一致
+    unsafe {
+        SetConsoleCtrlHandler(Some(on_console_event), 1);
     }
 }
