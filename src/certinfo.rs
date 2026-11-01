@@ -15,15 +15,8 @@ use std::path::Path;
 
 use windows_sys::Win32::Security::Cryptography as C;
 
-/// 1601-01-01 到 1970-01-01 的秒数差（FILETIME 纪元换算用）。
-const FILETIME_UNIX_EPOCH_OFFSET_SECS: i64 = 11_644_473_600;
 
-/// `CERT_NOT_AFTER_FILETIME_PROP_ID`。
-///
-/// windows-sys 0.60 没有导出这个常量（只导出了 NOT_BEFORE=126；
-/// 值 127 被生成为 `CERT_NOT_BEFORE_ENHKEY_USAGE_PROP_ID`，属 SDK 里的别名冲突）。
-/// 官方值是 127，见 wincrypt.h。
-const CERT_NOT_AFTER_FILETIME_PROP_ID: u32 = 127;
+
 
 pub struct CertInfo {
     /// 大写十六进制 SHA-1，与 Windows 里显示的"指纹"一致。
@@ -41,33 +34,31 @@ pub fn read_ca_der(pem: &Path) -> Option<Vec<u8>> {
 }
 
 /// 从 PEM 读证书信息；失败返回 None（调用方应打印告警，不要静默）。
+///
+/// 有效期用 `x509-parser` 从 DER 解析：
+/// windows-sys 0.60 **没有导出** `CERT_NOT_AFTER_FILETIME_PROP_ID`
+/// （127 实际是 `CERT_NOT_BEFORE_ENHKEY_USAGE_PROP_ID`），
+/// 此前按"官方值 127"补常量是错的，导致读取永远失败、到期轮换从未生效。
+/// 指纹仍走 Win32（`CERT_SHA1_HASH_PROP_ID` 是真实存在的常量）。
 pub fn info(pem: &Path) -> Option<CertInfo> {
     let der = read_ca_der(pem)?;
-    let ctx = create_context(&der)?;
-    let result = (|| {
-        let thumbprint = property_bytes(ctx, C::CERT_SHA1_HASH_PROP_ID)
-            .map(|b| b.iter().map(|x| format!("{x:02X}")).collect::<String>())?;
-        let not_after = property_bytes(ctx, CERT_NOT_AFTER_FILETIME_PROP_ID)?;
-        if not_after.len() < 8 {
-            return None;
-        }
-        let mut raw = [0u8; 8];
-        raw.copy_from_slice(&not_after[..8]);
-        let filetime = u64::from_le_bytes(raw);
-        let unix_secs = (filetime / 10_000_000) as i64 - FILETIME_UNIX_EPOCH_OFFSET_SECS;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        Some(CertInfo {
-            thumbprint,
-            days_left: (unix_secs - now) / 86_400,
-        })
-    })();
-    unsafe { C::CertFreeCertificateContext(ctx) };
-    result
-}
+    let (_, parsed) = x509_parser::parse_x509_certificate(&der).ok()?;
+    let not_after = parsed.validity().not_after.timestamp();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
 
+    let ctx = create_context(&der)?;
+    let thumbprint = property_bytes(ctx, C::CERT_SHA1_HASH_PROP_ID)
+        .map(|b| b.iter().map(|x| format!("{x:02X}")).collect::<String>());
+    unsafe { C::CertFreeCertificateContext(ctx) };
+
+    Some(CertInfo {
+        thumbprint: thumbprint?,
+        days_left: (not_after - now) / 86_400,
+    })
+}
 /// 这张证书是否已在「当前用户受信任的根」里。
 ///
 /// 按**编码字节**逐一比较：不能按 Subject 比（同名不同证书合法且常见，
@@ -245,6 +236,8 @@ fn subject_of(ctx: *const C::CERT_CONTEXT) -> Option<String> {
         Some(String::from_utf16_lossy(&buf))
     }
 }
+
+
 
 
 

@@ -26,10 +26,15 @@ webpki-roots = "1"
 # 用它替代原先调 powershell.exe 的做法（见 ADR-012 第 3 次修订）。
 windows-sys = { version = "0.60", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_SystemInformation"] }
 
+# 解析证书的 NotAfter：windows-sys 没有导出 CERT_NOT_AFTER_FILETIME_PROP_ID，
+# 与其编一个常量，不如用成熟解析器。它已是 rcgen 的传递依赖（^0.18），不引入新 crate。
+x509-parser = "0.18"
+
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
 
