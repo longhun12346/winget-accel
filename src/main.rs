@@ -4,6 +4,7 @@
 //! 命令行参数刻意与 `prototype/wgaccel.py` 保持一致，
 //! 这样 docs/test-plan.md 里的协议用例可以直接驱动 Rust 二进制（见 §7）。
 
+mod autoenv;
 mod ca;
 mod config;
 mod doctor;
@@ -41,6 +42,9 @@ fn main() -> Result<()> {
 
     let mut args = parse_args()?;
 
+    // 没有任何命令行参数时进入"绿色版"全自动模式（双击即用）
+    let auto_env = std::env::args().count() == 1;
+
     // 绿色版：默认把证书与日志放在 **exe 所在目录**，而不是当前工作目录。
     // 这样整个文件夹可以整包拷到任意位置，从哪启动都不影响行为。
     let base = exe_dir();
@@ -73,6 +77,15 @@ fn main() -> Result<()> {
     let stats = Arc::new(Stats::default());
 
     let ca = Arc::new(CertAuthority::load_or_create(&app.cert_dir, &app.rewrite_hosts)?);
+
+    // 零参数启动 = 绿色版模式：自动信任 CA、设置 PAC，退出时还原。
+    // 带任何参数时保持纯代理（测试与高级用法不能被改系统状态）。
+    let _env_guard = if auto_env {
+        let _ = autoenv::EnvGuard::recover_stale(&base);
+        Some(autoenv::EnvGuard::enable(&base, app.listen.port())?)
+    } else {
+        None
+    };
 
     logger.info(&format!(
         "CA   = {}",
