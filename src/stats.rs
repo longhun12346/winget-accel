@@ -13,6 +13,7 @@ pub struct Stats {
     pub rewrites: AtomicU64,
     pub bytes: AtomicU64,
     pub errors: AtomicU64,
+    pub ratelimited: AtomicU64,
 }
 
 /// 单个加速器候选的健康状态（`/health` 里的一项）。
@@ -46,6 +47,7 @@ impl Stats {
             rewrites: u64,
             bytes: u64,
             errors: u64,
+            ratelimited: u64,
             status: &'a str,
             accelerators: Vec<AccelHealth>,
         }
@@ -57,6 +59,7 @@ impl Stats {
             rewrites: self.rewrites.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            ratelimited: self.ratelimited.load(Ordering::Relaxed),
             status,
             accelerators,
         };
@@ -124,3 +127,4 @@ mod tests {
         assert!(json.contains("\"health\":\"unhealthy\""), "{json}");
     }
 }
+

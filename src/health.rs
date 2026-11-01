@@ -101,12 +101,26 @@ impl Tracker {
     /// 优先 `Healthy`；若没有，退回第一个 `Unknown`——启动时还没来得及探测，
     /// 此时乐观放行比直接拒绝好，真实失败会立刻把状态推成 `Unhealthy`。
     /// 全部 `Unhealthy` 时返回 `None`。
+    #[allow(dead_code)] // 单测在用；生产路径改走 current_excluding
     pub fn current(&self) -> Option<(usize, Accel)> {
         let states = self.states.lock().expect("健康状态锁中毒");
         if let Some(idx) = states.iter().position(|s| s.health == Health::Healthy) {
             return Some((idx, self.accels[idx].clone()));
         }
         if let Some(idx) = states.iter().position(|s| s.health == Health::Unknown) {
+            return Some((idx, self.accels[idx].clone()));
+        }
+        None
+    }
+
+    /// 选一个当前该用、且不在 `exclude` 里的加速器（用于换候选重试）。
+    pub fn current_excluding(&self, exclude: &[usize]) -> Option<(usize, Accel)> {
+        let states = self.states.lock().expect("健康状态锁中毒");
+        let usable = |i: usize, s: &State| !exclude.contains(&i) && s.health != Health::Unhealthy;
+        if let Some(idx) = (0..states.len()).find(|&i| usable(i, &states[i]) && states[i].health == Health::Healthy) {
+            return Some((idx, self.accels[idx].clone()));
+        }
+        if let Some(idx) = (0..states.len()).find(|&i| usable(i, &states[i])) {
             return Some((idx, self.accels[idx].clone()));
         }
         None
@@ -249,4 +263,28 @@ mod tests {
         assert_eq!(single.current().unwrap().0, 0);
         assert_eq!(single.healthy_count(), 1);
     }
+
+    #[test]
+    fn current_excluding_skips_tried_candidates() {
+        let t = tracker(2);
+        // 两个都是 Unknown，先取第一个
+        let first = t.current_excluding(&[]).unwrap();
+        assert_eq!(first.0, 0);
+        // 排除 0 之后应给 1
+        let second = t.current_excluding(&[0]).unwrap();
+        assert_eq!(second.0, 1);
+        // 都排除则没有可用
+        assert!(t.current_excluding(&[0, 1]).is_none());
+    }
+
+    #[test]
+    fn current_excluding_skips_unhealthy() {
+        let t = tracker(1);
+        t.mark(1, false);
+        let got = t.current_excluding(&[]).unwrap();
+        assert_eq!(got.0, 0, "应跳过不健康的候选");
+    }
 }
+
+
+

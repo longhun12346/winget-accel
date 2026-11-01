@@ -136,34 +136,33 @@ pub fn content_length(head: &[u8]) -> Option<u64> {
 
 
 
-/// 转发响应，返回 (状态码, 正文字节数)。
+
+
+/// 按响应头决定如何转发正文，返回正文字节数。
 ///
-/// 分帧只有三种可能，这里不重写任何字节：
-/// - 有 `Content-Length`：精确拷贝这么多字节
-/// - 否则（chunked 或"连接关闭定界"）：拷到 EOF
-///
-/// 因为我们向上游发了 `Connection: close`，响应必然会以关闭结束，
-/// 所以 chunked 也能靠 EOF 定界，不需要自己解析 chunk 长度。
-pub fn relay_response<R: Read, W: Write>(
+/// 单独拆出来是为了让调用方**先看状态码再决定要不要转发**——
+/// 遇到 429/503 时要换候选重试，不能已经把响应头写给客户端。
+pub fn forward_body<R: Read, W: Write>(
     up: &mut R,
     dst: &mut W,
+    head: &[u8],
     no_body: bool,
-) -> io::Result<(u16, u64)> {
-    let head = read_head(up)?;
-    let status = status_code(&head).unwrap_or(0);
-    dst.write_all(&head)?;
-    dst.flush()?;
-
+) -> io::Result<u64> {
+    let status = status_code(head).unwrap_or(0);
     if no_body || status == 204 || status == 304 {
-        return Ok((status, 0));
+        return Ok(0);
     }
-
-    let copied = match content_length(&head) {
+    let copied = match content_length(head) {
         Some(len) => copy_exact(up, dst, len)?,
         None => copy_to_eof(up, dst)?,
     };
     dst.flush()?;
-    Ok((status, copied))
+    Ok(copied)
+}
+
+/// 429 / 503：被限流或暂时不可用，值得换一个候选重试。
+pub fn is_rate_limited(status: u16) -> bool {
+    matches!(status, 429 | 503)
 }
 
 fn copy_exact<R: Read, W: Write>(src: &mut R, dst: &mut W, len: u64) -> io::Result<u64> {
@@ -208,6 +207,20 @@ fn copy_to_eof<R: Read, W: Write>(src: &mut R, dst: &mut W) -> io::Result<u64> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// 等价于"读头 → 写头 → 转发正文"，供分帧测试使用。
+    /// 生产路径走 proxy::relay_checked（它在写头前会先判 429/503）。
+    fn relay_via_forward_body<R: Read, W: Write>(
+        up: &mut R,
+        dst: &mut W,
+        no_body: bool,
+    ) -> io::Result<(u16, u64)> {
+        let head = read_head(up)?;
+        let status = status_code(&head).unwrap_or(0);
+        dst.write_all(&head)?;
+        let n = forward_body(up, dst, &head, no_body)?;
+        Ok((status, n))
+    }
 
     #[test]
     fn read_head_stops_exactly_at_delimiter() {
@@ -278,7 +291,7 @@ mod tests {
         let mut up = Cursor::new(response);
         let mut out = Vec::new();
 
-        let (status, bytes) = relay_response(&mut up, &mut out, false).unwrap();
+        let (status, bytes) = relay_via_forward_body(&mut up, &mut out, false).unwrap();
 
         assert_eq!(status, 200);
         assert_eq!(bytes, 5);
@@ -291,7 +304,7 @@ mod tests {
         let mut up = Cursor::new(response);
         let mut out = Vec::new();
 
-        let (status, bytes) = relay_response(&mut up, &mut out, false).unwrap();
+        let (status, bytes) = relay_via_forward_body(&mut up, &mut out, false).unwrap();
 
         assert_eq!(status, 200);
         assert_eq!(bytes, b"no-length-body".len() as u64);
@@ -304,7 +317,7 @@ mod tests {
         let mut up = Cursor::new(response.clone());
         let mut out = Vec::new();
 
-        relay_response(&mut up, &mut out, false).unwrap();
+        relay_via_forward_body(&mut up, &mut out, false).unwrap();
 
         assert_eq!(out, response, "chunked 必须原样转发，不能重新分帧");
     }
@@ -315,7 +328,7 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhello".to_vec();
         let mut up = Cursor::new(response);
         let mut out = Vec::new();
-        assert!(relay_response(&mut up, &mut out, false).is_err());
+        assert!(relay_via_forward_body(&mut up, &mut out, false).is_err());
     }
 
     #[test]
@@ -323,8 +336,34 @@ mod tests {
         let response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_vec();
         let mut up = Cursor::new(response);
         let mut out = Vec::new();
-        let (status, bytes) = relay_response(&mut up, &mut out, false).unwrap();
+        let (status, bytes) = relay_via_forward_body(&mut up, &mut out, false).unwrap();
         assert_eq!((status, bytes), (204, 0));
     }
+
+    #[test]
+    fn rate_limit_statuses_are_recognized() {
+        assert!(is_rate_limited(429), "429 应识别为限流");
+        assert!(is_rate_limited(503), "503 应识别为暂时不可用");
+        assert!(!is_rate_limited(200));
+        assert!(!is_rate_limited(404));
+        assert!(!is_rate_limited(500), "500 是服务端错误，不算限流");
+    }
+
+    #[test]
+    fn forward_body_does_not_write_head() {
+        // forward_body 只转发正文；响应头由调用方在判定状态码之后再写。
+        // 这是"先判后转"的前提：若它把 header 也写了，就没法换候选。
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody".to_vec();
+        let mut up = Cursor::new(response);
+        let head = read_head(&mut up).unwrap();
+        let mut out = Vec::new();
+        let n = forward_body(&mut up, &mut out, &head, false).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(out, b"body", "只应包含正文");
+    }
 }
+
+
+
+
 

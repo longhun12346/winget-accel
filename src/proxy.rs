@@ -24,6 +24,15 @@ use crate::stats::Stats;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+/// 一次上游尝试的结果。
+///
+/// 拆成三态是为了支持"换候选重试"：
+/// 429/503 时上游还没把任何字节转发给客户端，可以安全地换一个候选；
+/// 而一旦开始转发正文，就不能再改主意了。
+enum Fwd {
+    Done(u16, u64),
+    RateLimited(u16),
+}
 
 pub struct Proxy {
     pub app: Arc<App>,
@@ -159,44 +168,93 @@ impl Proxy {
             return Ok(());
         };
 
-        let Some((accel_idx, accel)) = self.health.current() else {
-            // 全挂时快速失败，**不回退直连**（ADR-016）。
-            // 实测依据：直连 curl 只有 21 KB/s，而 winget 走 WinHTTP 会在 37 秒
-            // 报 12002 超时、0 字节落盘——"回退"对 winget 等于失败，只是让用户多等。
-            Stats::bump(&self.stats.errors);
-            self.log.warn(&format!(
-                "NO-HEALTHY-ACCEL {host} 所有加速器都不健康，返回 502"
-            ));
-            let _ = tls.write_all(BAD_GATEWAY);
-            tls.conn.send_close_notify();
-            let _ = tls.flush();
-            return Ok(());
-        };
+        let no_body = req.method.eq_ignore_ascii_case("HEAD");
+        // 只有幂等方法才允许换候选重试（GET/HEAD）。
+        // 这里的请求都是下载，正常情况下都是 GET。
+        let retryable = req.method.eq_ignore_ascii_case("GET") || no_body;
 
-        let plan = rewrite::plan(
-            &req.method,
-            host,
-            port,
-            &req.target,
-            &req.headers,
-            &self.app.rewrite_hosts,
-            &accel,
-        );
+        let started = std::time::Instant::now();
+        let mut tried: Vec<usize> = Vec::new();
+
+        // 换候选重试循环：遇到 429/503（限流/暂时不可用）就把该候选标记为不可用，
+        // 换下一个再试。不把 429 直接透给客户端——winget 收到就失败了，
+        // 而我们还有别的候选可用。
+        let (plan, accel_idx, accel, status, size) = loop {
+            let Some((accel_idx, accel)) = self.health.current_excluding(&tried) else {
+                // 没有可用候选（或都已试过）
+                Stats::bump(&self.stats.errors);
+                self.log.warn(&format!(
+                    "NO-HEALTHY-ACCEL {host} 无可用加速器（已试 {} 个），返回 502",
+                    tried.len()
+                ));
+                let _ = tls.write_all(BAD_GATEWAY);
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+                return Ok(());
+            };
+
+            let plan = rewrite::plan(
+                &req.method,
+                host,
+                port,
+                &req.target,
+                &req.headers,
+                &self.app.rewrite_hosts,
+                &accel,
+            );
+
+            let outcome = match plan.scheme {
+                rewrite::Scheme::Https => self.forward_tls(&plan, no_body, &mut tls),
+                rewrite::Scheme::Http => self.forward_plain(&plan, no_body, &mut tls),
+            };
+
+            match outcome {
+                Ok(Fwd::Done(status, size)) => break (plan, accel_idx, accel, status, size),
+                Ok(Fwd::RateLimited(status)) => {
+                    // 上游明确让我们退避：立即标记该候选不可用并换下一个。
+                    // 用 mark(false) 而不是计入失败次数——这是服务端的确定信号。
+                    self.health.mark(accel_idx, false);
+                    Stats::bump(&self.stats.ratelimited);
+                    self.log.warn(&format!(
+                        "ACCEL-RATELIMITED {} 返回 {status}，换下一个候选",
+                        accel.host
+                    ));
+                    tried.push(accel_idx);
+                    if !retryable || tried.len() >= self.health.accels().len() {
+                        Stats::bump(&self.stats.errors);
+                        let _ = tls.write_all(BAD_GATEWAY);
+                        tls.conn.send_close_notify();
+                        let _ = tls.flush();
+                        return Ok(());
+                    }
+                }
+                Err(err) => {
+                    Stats::bump(&self.stats.errors);
+                    self.log.warn(&format!(
+                        "UPSTREAM-FAIL {host} -> {}:{} {err:#}",
+                        plan.host, plan.port
+                    ));
+                    if plan.rewritten {
+                        self.note_accel_failure(accel_idx, &accel, &format!("{err:#}"));
+                    }
+                    tried.push(accel_idx);
+                    if !retryable || tried.len() >= self.health.accels().len() {
+                        let _ = tls.write_all(BAD_GATEWAY);
+                        tls.conn.send_close_notify();
+                        let _ = tls.flush();
+                        return Ok(());
+                    }
+                    self.log.warn(&format!("RETRY {host} 换下一个候选"));
+                }
+            }
+        };
 
         if plan.rewritten {
             Stats::bump(&self.stats.rewrites);
         }
 
-        let no_body = req.method.eq_ignore_ascii_case("HEAD");
-        let started = std::time::Instant::now();
-
-        let outcome = match plan.scheme {
-            rewrite::Scheme::Https => self.forward_tls(&plan, no_body, &mut tls),
-            rewrite::Scheme::Http => self.forward_plain(&plan, no_body, &mut tls),
-        };
-
-        match outcome {
-            Ok((status, size)) => {
+        {
+            {
                 Stats::add(&self.stats.bytes, size);
                 // 只有"被改写的请求"才把成败记到加速器账上；
                 // 隧道路径的失败属于目标站，与加速器无关。
@@ -216,18 +274,6 @@ impl Proxy {
                     truncate(&plan.path, 90),
                     started.elapsed().as_secs_f64()
                 ));
-            }
-            Err(err) => {
-                Stats::bump(&self.stats.errors);
-                // 不在这里写 502：失败可能发生在响应已经发出一半之后，
-                // 再追加一段状态行只会把响应彻底搞坏。连接会直接关闭。
-                self.log.warn(&format!(
-                    "UPSTREAM-FAIL {host} -> {}:{} {err:#}",
-                    plan.host, plan.port
-                ));
-                if plan.rewritten {
-                    self.note_accel_failure(accel_idx, &accel, &format!("{err:#}"));
-                }
             }
         }
 
@@ -311,7 +357,7 @@ impl Proxy {
         plan: &rewrite::Plan,
         no_body: bool,
         tls: &mut StreamOwned<ServerConnection, TcpStream>,
-    ) -> Result<(u16, u64)> {
+    ) -> Result<Fwd> {
         let mut upstream = match self.open_tls_upstream(plan) {
             Ok(stream) => stream,
             // 这里还没往客户端写任何字节，可以安全地回 502
@@ -322,9 +368,9 @@ impl Proxy {
             return Ok(self.bad_gateway(plan, tls, err.into()));
         }
 
-        let result = http::relay_response(&mut upstream, tls, no_body);
+        let result = self.relay_checked(&mut upstream, tls, no_body);
         upstream.conn.send_close_notify();
-        result.map_err(Into::into)
+        result
     }
 
     fn forward_plain(
@@ -332,7 +378,7 @@ impl Proxy {
         plan: &rewrite::Plan,
         no_body: bool,
         tls: &mut StreamOwned<ServerConnection, TcpStream>,
-    ) -> Result<(u16, u64)> {
+    ) -> Result<Fwd> {
         let mut upstream = match connect_tcp(&plan.host, plan.port) {
             Ok(stream) => stream,
             Err(err) => return Ok(self.bad_gateway(plan, tls, err)),
@@ -342,9 +388,30 @@ impl Proxy {
             return Ok(self.bad_gateway(plan, tls, err.into()));
         }
 
-        http::relay_response(&mut upstream, tls, no_body).map_err(Into::into)
+        self.relay_checked(&mut upstream, tls, no_body)
     }
 
+    /// 先读上游响应头，遇到 429/503 就**不转发**、直接报告限流，让调用方换候选。
+    ///
+    /// 这一点必须是"先判后转"：一旦把响应头发给客户端，就没法再换候选了。
+    fn relay_checked<R: std::io::Read>(
+        &self,
+        up: &mut R,
+        tls: &mut StreamOwned<ServerConnection, TcpStream>,
+        no_body: bool,
+    ) -> Result<Fwd> {
+        let head = http::read_head(up)?;
+        let status = http::status_code(&head).unwrap_or(0);
+
+        if http::is_rate_limited(status) {
+            return Ok(Fwd::RateLimited(status));
+        }
+
+        tls.write_all(&head)?;
+        tls.flush()?;
+        let size = http::forward_body(up, tls, &head, no_body)?;
+        Ok(Fwd::Done(status, size))
+    }
     fn open_tls_upstream(
         &self,
         plan: &rewrite::Plan,
@@ -365,7 +432,7 @@ impl Proxy {
         plan: &rewrite::Plan,
         tls: &mut StreamOwned<ServerConnection, TcpStream>,
         err: anyhow::Error,
-    ) -> (u16, u64) {
+    ) -> Fwd {
         // 契约要求：加速器不可达时 errors 计数 +1（docs/test-plan.md ERR-02）
         Stats::bump(&self.stats.errors);
         self.log.warn(&format!(
@@ -373,7 +440,7 @@ impl Proxy {
             plan.host, plan.port
         ));
         let _ = tls.write_all(BAD_GATEWAY);
-        (502, 0)
+        Fwd::Done(502, 0)
     }
 
     /// 明文请求：只提供 PAC 与 health，其余 405。
@@ -537,5 +604,8 @@ mod tests {
         assert_eq!(truncate("abc", 10), "abc");
     }
 }
+
+
+
 
 
