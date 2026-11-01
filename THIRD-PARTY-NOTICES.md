@@ -8,8 +8,10 @@
 
 - 上游：https://github.com/jantari/rewinged
 - 许可证：MIT
-- 使用方式：参考其 winget REST 源协议实现、清单模型组织方式与端点处理逻辑。
-  凡直接复制或改写其代码的文件，均在文件头保留原始版权声明并注明来源路径。
+- 使用方式：**仅参考其设计与事实性信息（T2/T3），不复制、不逐行翻译其代码**
+  （见 `docs/decisions.md` ADR-011）。参考范围见 `docs/rewinged-reference.md`，
+  逐次阅读记录见 `docs/reference-log.md`。
+  若日后发生代码级复用（T1），将逐文件保留上述版权声明并注明来源路径。
 
 ```
 MIT License

@@ -57,6 +57,12 @@ winget 把**所有能绕开官方源的机制都做成了管理员门禁**，实
 
 详见 [docs/design.md](docs/design.md)。
 
+## 实现形态
+
+**Rust 单文件二进制**（`x86_64-pc-windows-msvc` + `crt-static`，约 4–6 MB），无运行时依赖，
+解压即用、便于分发给他人。语言选择与依赖约束见
+[docs/decisions.md](docs/decisions.md) 的 ADR-009 / ADR-012（依赖预算：直接依赖 ≤8、传递 ≤30）。
+
 ## 前置条件（一次性，需管理员）
 
 ```powershell
@@ -78,16 +84,18 @@ docs/
   research.md    调研过程与全部实测数据（含失败与被否决的方向）
   verification-2026-11-01.md  第二次复核：网络现状、已核实的协议事实、待办 V1–V8
   design.md      架构、REST 协议、清单流水线、证书、信任模型
-  decisions.md   方案取舍记录（L1–L10 逐条判定）
-  rewinged-reference.md  参考 jantari/rewinged 的具体部分与边界
+  decisions.md   方案取舍记录（ADR-001–012 逐条判定）
+  rewinged-reference.md  参考 jantari/rewinged 的边界、范围与阅读顺序
+  reference-log.md  参考台账：每次阅读的来源、范围与产出
   roadmap.md     实现计划与验收标准
 ```
 
 ## 与 rewinged 的关系
 
-本项目**自行实现**，但参考 [jantari/rewinged](https://github.com/jantari/rewinged)（MIT）的
-REST 协议实现与清单模型组织方式。凡参考其代码，保留原始版权声明，见
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+本项目**自行实现**。与 [jantari/rewinged](https://github.com/jantari/rewinged)（MIT）的关系是
+**只参考设计与事实、不搬代码**（T2/T3，见 [docs/decisions.md](docs/decisions.md) ADR-011）：
+只借鉴"要处理哪些清单形态、1.10.0 有哪些字段"，不沿用它的模型体系与检索实现。
+逐次阅读记录见 [docs/reference-log.md](docs/reference-log.md)。
 
 ## 许可证
 

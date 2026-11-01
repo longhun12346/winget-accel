@@ -176,45 +176,71 @@ release-assets.githubusercontent.com
 
 ## ADR-009：实现语言
 
-**状态**：已修订（2026-11-01 复核）。原倾向 Go，**现倾向 Python + uv**。
+**状态**：**已定：Rust**（2026-11-01 第三次修订）。
 
-**现状（原记录已过时）**：原文写"本机没有 Go、没有 .NET SDK、没有 Node，只有 git 与系统自带 PowerShell"。
-复核后实际为：
+**变更史**（真正重要的是最后一列的"判据"，不是结论）：
 
-| 工具 | 状态 |
+| # | 语言 | 触发条件 | 失效原因 |
+|---|---|---|---|
+| 1 | Go（初稿） | 与参考对象同语言，"移植成本最低" | ADR-008 改为 C′ 后不再移植模型，理由消失 |
+| 2 | Python + uv（复核后） | 本机已有 `uv`、零安装、性能不敏感 | 隐含前提"只自己用"被推翻 |
+| 3 | **Rust（现在）** | **明确要产出单文件二进制对外分发** | — |
+
+**判据**（环境一变就重评，不凭偏好）：
+
+1. **谁长期维护**（交接成本）→ 自己维护，故不构成 Go/C# 的加分项
+2. **依赖预算**能否压到可审计范围（ADR-012）
+3. **Windows 系统集成**在关键路径上的权重 → 证书库是 `cert` / `setup` 的必经路径
+
+三条全指向 Rust。
+
+**为什么是 Rust**：
+
+1. **`windows-rs` 正好压在本项目唯一的系统集成层上**：证书存储
+   （`CertOpenStore` / `CertAddEncodedCertificateToStore`）、注册表（HKCU Run）、提权检测。
+   Go 的 `x/sys/windows` 是裸 syscall，需自封一层或转调 PowerShell。
+2. **类型系统能把"只改 `InstallerUrl`"变成编译期不变量**：newtype 区分
+   `OriginalUrl` / `RewrittenUrl`、字段私有、只留一个转换函数。本项目的核心卖点是
+   哈希信任链不变，Go 只能靠测试断言加人工评审。
+3. **产物 4–6 MB**，`+crt-static` 后零依赖（不需要 VC++ 运行库）；Go 约 11–13 MB。
+   用户恰在慢速网络上，体积是真实成本。
+4. **T2 边界更安全**（ADR-011）：跨语言重写天然不会滑向"搬运"；
+   同语言 + 同 workload 则极易趋同。
+5. **不需要异步**：本地单用户、并发 1–2，同步代码足够，`async` 与 borrow 纠缠的场景基本不出现。
+
+**实测支撑**（工具链可达性，2026-11-01）：
+
+| 源 | 结果 |
 |---|---|
-| `git`、`pwsh` 7.6.9 | ✅ |
-| **`uv`** | ✅ **已安装**（winget 包 `astral-sh.uv`），可 `uv python install` 拉取 CPython |
-| `go` / `python` / `node` / `dotnet` | ❌ 均不在 PATH |
+| `rsproxy.cn`（dist） | **200 / 0.58 s** |
+| `mirrors.ustc.edu.cn/rust-static` | 200 / 1.47 s |
+| `static.rust-lang.org`（官方） | 200 / 12.0 s |
+| `index.crates.io` / `static.crates.io` | 200 / 3.57 s、1.60 s |
+| 本机 MSVC | ✅ 14.51.36231 + Windows SDK 10.0.26100.0（VS Enterprise 2026） |
 
-另注：`D:\workspace\github` 下 `ashare-emotion-shortline`、`nvx` 两个项目均使用 `uv` + `.venv`，
-说明本机既有习惯就是 uv 工作流。
+官方源慢，但国内镜像比 Go 官方源（`dl.google.com` 3.0 s）**还快** ⇒ 工具链不构成阻碍。
+（初稿曾以"工具链慢"排除 Rust，那是没测镜像就下的判断，已作废。）
 
-| 语言 | 优势 | 劣势 |
-|---|---|---|
-| **Python + uv** | 零安装（uv 已在）；stdlib `http.server` + `ssl` 满足需求；绑定 127.0.0.1 无需 URL ACL；`uv run` 免激活；与既有项目一致 | 分发给他人需打包；启动比原生二进制慢（毫秒级，无实际影响） |
-| Go | 单文件二进制、免运行时；`crypto/tls` 处理证书简单；可移植 rewinged 代码 | 需先安装工具链；**"移植成本低"的理由已被 ADR-008 修订消解** |
-| C# | 与 winget 同栈，模型语义最贴近 | 需装 SDK；体积大 |
-| PowerShell | 系统自带零依赖 | `HttpListener` 绑定端口需 URL ACL（多为管理员）；异步与 JSON 处理笨重 |
+**为什么不选其它**：
 
-**决定（修订）**：**Python + uv**。
+| 语言 | 否决点（针对本项目） |
+|---|---|
+| Go | 系统集成层要自封 syscall；与参考同语言，T2 边界易破；体积 11–13 MB |
+| Python | **PyInstaller 产物杀软误报率高**——一个"要帮用户装软件"的工具被 Defender 拦下，信任直接归零；产物运行时解包到 temp、启动 1–3 s |
+| C# | NativeAOT 与 YamlDotNet 的反射冲突；非 AOT 自包含约 70 MB，对慢网用户不友好；本机无 .NET SDK |
 
-**理由**：
+**硬约束**（违反即重议）：
 
-1. **零安装成本**：`uv` 已在本机，不需要管理员、不需要从 `go.dev` 下载工具链
-2. 与既有工作流一致（两个兄弟项目都在用 uv + .venv），新会话上手无摩擦
-3. 协议工作是 JSON/YAML 投影 + 本地单用户 HTTPS 服务，**性能完全不敏感**
-4. 原 ADR 选 Go 的核心理由是"与参考对象同语言、移植成本最低"；
-   但 ADR-008 修订后我们**不再移植 rewinged 的模型体系**，这条理由基本失效
-5. `pyproject.toml` 锁依赖，`uv run` 直接跑，交付形态与 Go 单二进制的心智负担差距已不大
+- 依赖预算见 **ADR-012**
+- TLS 用 `rustls`（纯 Rust、静态链接友好），**不用** `native-tls`
+- 同步子命令用 `std::process::Command` 调系统 `git.exe`，**不用** `git2`（libgit2 会引入 C 工具链）
+- YAML 用 `serde_yaml_ng`（`serde_yaml` 已归档停维护）
+- 发布 `x86_64-pc-windows-msvc` + `-C target-feature=+crt-static` + strip + LTO
 
-**Go 的适用条件**：若最终确定要**分发给他人**并要求单文件二进制，再切 Go。
-这是**分发决策**而非实现决策；届时代码仅需重写实现层，`ManifestCodec` 接口与
-协议设计（`design.md` §3）可直接沿用。
+**代价**：编译比 Go 慢（首次含依赖 1–2 min，增量 5–20 s）；第三方读者读 Go 更容易；
+`serde_yaml` 生态分裂需显式锁定。
 
-**代价**：给自己用时无；要分发则需打包（`uv` 独立环境或 PyInstaller）。
-
-**待确认**：是否需要给他人分发（见 `roadmap.md` 待定问题 4）。
+**何时重审**：若需交给不熟 Rust 的人维护，或依赖面失控到 >40 个 crate。
 
 ---
 
@@ -225,3 +251,81 @@ release-assets.githubusercontent.com
 **理由**：本地单用户场景无意义；`autoInternalize` 与"不落地安装包"的目标直接冲突。
 
 **代价**：不能用于多用户共享的内网源——但那不是本项目目标。
+
+---
+
+## ADR-011：与 rewinged 的关系定为 T2（只参考设计与事实，不搬代码）
+
+**决定**：把"参考"分三档，本项目**只做 T2 与 T3，不做 T1**。
+
+| 档 | 含义 | 法律性质 | 义务 |
+|---|---|---|---|
+| T1 | 逐行翻译 / 改写其代码 | 衍生作品 | 逐文件保留版权头 + 注明来源路径 |
+| **T2** | 参考设计思路，用自己语言与结构重写 | 非衍生作品 | 台账注明出处 |
+| **T3** | 只取事实（字段名、JSON tag、协议字段、错误格式） | 事实性信息，不受版权保护 | 注明出处 |
+
+**理由**：
+
+1. 语言已改为 Rust（ADR-009），逐行翻译 Go 代码本就别扭——它的接口与反射体系在 Rust 无对应物
+2. 它的检索实现靠反射遍历 struct（`findField`），正是 ADR-008 C′ 要摆脱的东西
+3. 我们真正需要它的只有"哪些形态要处理、哪个字段会缺"，属 T2/T3 范畴
+4. 义务从"逐文件申报"降到"注明参考了哪个设计"，合规成本大幅下降
+
+**实测清单修正**（详见 `rewinged-reference.md` §2）：
+
+| 项 | 原记录（体积推断） | 实测（GitHub API） |
+|---|---|---|
+| Go 文件数 | 27 | **25** |
+| 总代码量 | 342.8 KB | 340.3 KB |
+| `models/` 占比 | "约 200 KB / 六成" | **286 KB / 84%** |
+| 文档漏列 | — | `controllers/information.go`、`models/api_common.go`、`models/manifests_common.go`、`settings/settings.go` |
+| 上游测试 | 树里未见 `*_test.go` | ✅ 属实 |
+
+**参考范围（4 个文件）**：`manifests.go`（摄取形态）、`models/manifests_1_10_0.go`（字段语义）、
+`models/internal.go`（索引形状，**不含检索**）、`controllers/packages.go`（端点组织）。
+
+**明确不参考**：`models/` 多版本体系、检索的反射实现、`autoInternalize`、
+Entra ID、`trustedProxies`、Docker / goreleaser。
+
+**顺序约束**：**先按 OpenAPI 规范写完三个端点骨架，再读参考文件**。顺序反过来，
+T2 边界守不住——"结构趋同"不等于"参考"，同 workload 下极易滑向搬运。
+
+**台账**：每读一个文件，在 `reference-log.md` 记一条（文件、看了什么、产出什么）。
+
+---
+
+## ADR-012：依赖预算与技术选型约束
+
+**决定**：直接依赖 ≤ 8 个，传递依赖 ≤ 30 个。超阈值须在提交说明里写明理由。
+
+统计方式：`cargo tree -e normal --prefix none | sort -u | wc -l`
+
+**理由**：本工具要求用户**信任**它改写安装源。一个自身带 80 个第三方 crate 的工具，
+逻辑上自相矛盾；且依赖越多，`cargo audit` 噪音越大、构建越慢、攻击面越广——
+对"能改写安装源的工具"来说，供应链攻击的收益极高，这是必须主动收敛的风险。
+
+**禁止清单**：
+
+| 依赖 | 原因 | 替代 |
+|---|---|---|
+| `tokio` / `axum` / `actix-web` / `hyper` | 本地单用户、并发 1–2，异步是过度设计 | `std::net::TcpListener` + 最小 HTTP/1.1 |
+| `git2` / `libgit2-sys` | 引入 C 工具链与 cmake 依赖 | `std::process::Command` 调系统 `git.exe` |
+| `native-tls` / `openssl` | 系统依赖、静态链接困难 | `rustls` + `rustls-pemfile` |
+| `serde_yaml` | **上游已归档停维护** | `serde_yaml_ng` |
+| `reqwest`（默认特性） | 拖入 tokio 与整套 TLS 栈 | 健康探测用 `TcpStream` + `rustls`，或最小 HTTP 客户端 |
+
+**允许的直接依赖**（预估，以实测为准）：`serde`、`serde_json`、`serde_yaml_ng`、
+`rustls`、`rustls-pemfile`、`windows`（限 feature）、`anyhow` 或 `thiserror`（二选一）。
+
+**手写最小 HTTP 的边界**：
+
+- 必须按 `Content-Length` 读请求体（`POST /manifestSearch` 带 JSON）
+- 支持 `Connection: keep-alive`；错误体为固定 JSON（404 / 500）
+- **不实现 chunked 请求体**——但必须先确认 winget 客户端不发 chunked（发则改为支持）
+- 不实现 HTTP/2、压缩、multipart
+
+**`windows` crate 的 feature 白名单**：`Win32_Security_Cryptography`、
+`Win32_System_Registry`、`Win32_Foundation`、`Win32_System_Threading`（提权检测）。
+不得为省事开启 `windows` 全量 feature。
+
+**检查方式**：CI 统计 `cargo tree` 数量，超阈值失败。

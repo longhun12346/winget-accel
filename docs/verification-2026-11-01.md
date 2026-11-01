@@ -149,11 +149,26 @@ ADR-008 的"代码量"估算低估了这件事，详见订正后的 ADR-008。
 | `go` | ❌ 不在 PATH |
 | `python` / `py` | ❌ 不在 PATH（但 `uv` 可按需拉取 CPython：`uv python install`） |
 | `node` / `pnpm` | ❌ |
-| `dotnet` | ❌ |
+| `dotnet` / .NET SDK | ❌（`C:\Program Files\dotnet` 不存在，VS 未装 .NET 工作负载） |
+| `cargo` / `rustc` / `rustup` | ❌（后续实测补充） |
+| **MSVC 14.51.36231 + Windows SDK 10.0.26100.0** | ✅ **已装**（VS Enterprise 2026），`x86_64-pc-windows-msvc` 可直接用 |
+
+> `decisions.md` ADR-009 原文写的"本机没有 Go、没有 .NET SDK、没有 Node，只有 git 与系统自带 PowerShell"
+> **在字面上已不成立**：`uv` 已安装，可零成本拉取 CPython。
+> 但语言最终定为 **Rust**——决定性因素是"要产出单文件二进制对外分发"，而不是本机已有哪个工具链
+> （见 ADR-009 的变更史）。本节只记录事实。
 
 同级目录 `D:\workspace\github` 下的 `ashare-emotion-shortline` 与 `nvx` 都在用 `uv` + `.venv`。
 
-> `decisions.md` ADR-009 写的"本机没有 Go、没有 .NET SDK、没有 Node，只有 git 与系统自带 PowerShell"**已不成立**：`uv` 提供了零摩擦的 Python 环境。
+**工具链下载源可达性**（补充实测，用于 ADR-009）：
+
+| 源 | 结果 |
+|---|---|
+| `rsproxy.cn`（Rust 镜像） | 200 / **0.58 s** |
+| `mirrors.ustc.edu.cn/rust-static` | 200 / 1.47 s |
+| `static.rust-lang.org`（Rust 官方） | 200 / 12.0 s |
+| `index.crates.io` / `static.crates.io` | 200 / 3.57 s、1.60 s |
+| `dl.google.com`（Go 官方） | 200 / 3.0 s |
 
 ## 6. 本次复核引出的待办
 
