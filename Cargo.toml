@@ -31,6 +31,10 @@ windows-sys = { version = "0.60", features = ["Win32_Security_Cryptography", "Wi
 x509-parser = "0.18"
 # 证书有效期计算：rcgen 已用 time 0.3，直接声明可统一版本、不新增 crate。
 time = "0.3"
+# HTTP/1.1 头部解析：hyper 内部用的就是它，零传递依赖。
+# 保留自己的逐字节读取策略（那个不能换，否则会吞掉 TLS ClientHello），
+# 只把"解析字节"这一步交给它。
+httparse = "1"
 
 [profile.release]
 opt-level = "z"
@@ -38,6 +42,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+
+
 
 
 

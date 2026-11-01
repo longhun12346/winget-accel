@@ -84,14 +84,30 @@ pub fn parse_accel(spec: &str) -> Result<Accel> {
     };
     let prefix = if prefix == "/" { String::new() } else { prefix };
 
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() => {
-            let port: u16 = port
-                .parse()
-                .map_err(|_| anyhow::anyhow!("加速器端口非法: {port}"))?;
-            (host, port)
+    // 用 proxy.rs 里同一套 host:port 拆分：它正确处理 IPv6 方括号
+    // （`[::1]:8080`），而 `rsplit_once(':')` 会把 `::1` 切成 `:` 与 `1`。
+    let host_str = authority.trim_start_matches('[').trim_end_matches(']');
+    let (host, port) = if authority.starts_with('[') {
+        // [v6]:port 或 [v6]
+        match authority.rsplit_once("]:") {
+            Some((h, p)) => {
+                let port: u16 = p
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("加速器端口非法: {p}"))?;
+                (h.trim_start_matches('[').to_string(), port)
+            }
+            None => (host_str.to_string(), scheme.default_port()),
         }
-        _ => (authority, scheme.default_port()),
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() => {
+                let port: u16 = p
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("加速器端口非法: {p}"))?;
+                (h.to_string(), port)
+            }
+            _ => (authority.to_string(), scheme.default_port()),
+        }
     };
 
     if host.is_empty() {
@@ -100,7 +116,7 @@ pub fn parse_accel(spec: &str) -> Result<Accel> {
 
     Ok(Accel {
         scheme,
-        host: host.to_string(),
+        host,
         port,
         prefix,
     })
@@ -438,4 +454,25 @@ mod tests {
             assert_eq!(plan.path, "/x");
         }
     }
+
+    #[test]
+    fn parse_accel_handles_ipv6() {
+        // 带方括号与端口
+        let a = parse_accel("http://[::1]:8080/{url}").unwrap();
+        assert_eq!(a.host, "::1", "方括号应被剥掉");
+        assert_eq!(a.port, 8080);
+        // 带方括号、默认端口
+        let b = parse_accel("http://[::1]/{url}").unwrap();
+        assert_eq!(b.host, "::1");
+        assert_eq!(b.port, 80);
+    }
+
+    #[test]
+    fn parse_accel_rejects_non_numeric_port() {
+        // 有冒号但端口不是数字 → 报错，不退化成"无端口"
+        let err = parse_accel("http://host:notaport").unwrap_err();
+        assert!(err.to_string().contains("端口"), "实际: {err}");
+    }
 }
+
+

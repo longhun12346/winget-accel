@@ -7,6 +7,9 @@ use std::io::{self, Read, Write};
 /// 请求/响应头的大小上限。超过即认为对端有问题，直接断开。
 pub const MAX_HEAD: usize = 32 * 1024;
 
+/// httparse 需要预先分配的头部槽位数。
+const MAX_HEADERS: usize = 64;
+
 const COPY_BUF: usize = 32 * 1024;
 
 /// 逐字节读到 `\r\n\r\n` 为止。
@@ -67,21 +70,35 @@ impl Head {
 }
 
 /// 解析请求头。畸形输入返回 `None`，由调用方决定怎么记录。
+///
+/// 解析交给 `httparse`（hyper 内部用的同一套，零传递依赖），
+/// 不再自己切请求行、扫冒号。`headers` 仍保留原始行文本，
+/// 因为转发时要逐行透传、且要按名字剥离逐跳头。
 pub fn parse_head(raw: &[u8]) -> Option<Head> {
-    let text = std::str::from_utf8(raw).ok()?;
-    let mut lines = text.split("\r\n");
-    let start = lines.next()?;
-    let mut parts = start.split(' ');
-    let method = parts.next()?.to_string();
-    let target = parts.next()?.to_string();
-    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut req = httparse::Request::new(&mut headers);
+    match req.parse(raw) {
+        Ok(httparse::Status::Complete(_)) => {}
+        _ => return None,
+    }
+
+    let method = req.method?.to_string();
+    let target = req.path?.to_string();
+    let version = match req.version {
+        Some(0) => "HTTP/1.0".to_string(),
+        _ => "HTTP/1.1".to_string(),
+    };
     if method.is_empty() || target.is_empty() {
         return None;
     }
 
-    let headers = lines
-        .take_while(|line| !line.is_empty())
-        .map(|line| line.to_string())
+    let headers = req
+        .headers
+        .iter()
+        .map(|h| {
+            let value = String::from_utf8_lossy(h.value);
+            format!("{}: {}", h.name, value.trim())
+        })
         .collect();
 
     Some(Head {
@@ -94,22 +111,30 @@ pub fn parse_head(raw: &[u8]) -> Option<Head> {
 
 /// 从响应头里取状态码。
 pub fn status_code(head: &[u8]) -> Option<u16> {
-    let text = std::str::from_utf8(head).ok()?;
-    text.split(' ').nth(1)?.parse().ok()
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut res = httparse::Response::new(&mut headers);
+    match res.parse(head) {
+        Ok(httparse::Status::Complete(_)) => res.code,
+        _ => None,
+    }
 }
 
 /// 从响应头里取 `Content-Length`。
 pub fn content_length(head: &[u8]) -> Option<u64> {
-    let text = std::str::from_utf8(head).ok()?;
-    text.lines().find_map(|line| {
-        let (k, v) = line.split_once(':')?;
-        if k.trim().eq_ignore_ascii_case("content-length") {
-            v.trim().parse().ok()
-        } else {
-            None
-        }
-    })
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut res = httparse::Response::new(&mut headers);
+    match res.parse(head) {
+        Ok(httparse::Status::Complete(_)) => {}
+        _ => return None,
+    }
+    res.headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+        .and_then(|h| std::str::from_utf8(h.value).ok())
+        .and_then(|v| v.trim().parse().ok())
 }
+
+
 
 /// 转发响应，返回 (状态码, 正文字节数)。
 ///
@@ -302,3 +327,4 @@ mod tests {
         assert_eq!((status, bytes), (204, 0));
     }
 }
+
