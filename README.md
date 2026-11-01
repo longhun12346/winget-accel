@@ -81,6 +81,17 @@ MITM 影响的只是"谁能看到你在下载什么"（都是公开安装包）�
 
 **先按 `Ctrl+C` 停掉**（PAC 会自动还原）。如果窗口是被强行关掉的，按下面手动清：
 
+**最省事的做法**：直接用内置参数移除证书。
+
+```powershell
+winget-accel.exe --remove-ca
+```
+
+它会枚举「当前用户受信任的根」，认出本工具的 CA 并删除（按 Win32 API 读取，
+不依赖 `certs\` 目录是否还在）。幂等，重复执行只会提示"未找到"。
+
+下面是等价的手工步骤，供无法运行程序时使用：
+
 ```powershell
 # 1) 清 PAC
 Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' `
@@ -135,6 +146,7 @@ PAC 指向 `http://127.0.0.1:8443/winget-accel.pac`。代理不在时，WinINet 
 
 ```
 --doctor               体检：端口 / CA / PAC / 5 个加速器可达性，不改任何系统设置
+--remove-ca            移除本工具装进「受信任的根」的证书（幂等，可重复执行）
 --print-pac            打印将要使用的 PAC 后退出
 --port <端口>          默认 127.0.0.1:8443
 --config <路径>        用配置文件（见 config.example.json）
@@ -256,6 +268,7 @@ PE 头：机器类型 `x64`、子系统 `Windows CUI`、子系统版本 `6.00`�
 ## 许可证
 
 MIT
+
 
 
 

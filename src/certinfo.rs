@@ -146,3 +146,98 @@ fn property_bytes(ctx: *const C::CERT_CONTEXT, prop: u32) -> Option<Vec<u8>> {
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
+
+// ------------------------------------------------------------ 移除本工具证书
+//
+// 供 `--remove-ca` 使用。不依赖 certs 目录是否还在：
+// 直接枚举「当前用户受信任的根」，按 Subject 认出本工具的 CA 并删除。
+//
+// 删除走注册表项而不是 `certutil -delstore` / `CertDeleteCertificateFromStore`：
+// 实测前者在部分机器返回 ERROR_NOT_SUPPORTED（后者是同一底层操作，风险相同），
+// 而删注册表项有效。
+
+/// 本工具 CA 的 Subject 关键字。
+const OUR_CA_SUBJECT: &str = "winget-accel local CA";
+
+/// 移除所有属于本工具的受信任根证书，返回删除数量。
+pub fn remove_our_ca() -> usize {
+    let mut removed = 0;
+    unsafe {
+        let store = C::CertOpenStore(
+            C::CERT_STORE_PROV_SYSTEM_W,
+            0,
+            0,
+            C::CERT_SYSTEM_STORE_CURRENT_USER,
+            wide("ROOT").as_ptr() as *const core::ffi::c_void,
+        );
+        if store.is_null() {
+            return 0;
+        }
+
+        // 先收集指纹（不能在枚举过程中删，会让枚举游标失效）
+        let mut thumbprints: Vec<String> = Vec::new();
+        let mut cursor: *const C::CERT_CONTEXT = std::ptr::null();
+        loop {
+            cursor = C::CertEnumCertificatesInStore(store, cursor);
+            if cursor.is_null() {
+                break;
+            }
+            if let Some(subject) = subject_of(cursor) {
+                if subject.contains(OUR_CA_SUBJECT) {
+                    if let Some(hash) = property_bytes(cursor, C::CERT_SHA1_HASH_PROP_ID) {
+                        thumbprints.push(hash.iter().map(|b| format!("{b:02X}")).collect());
+                    }
+                }
+            }
+        }
+        C::CertCloseStore(store, 0);
+
+        for thumbprint in thumbprints {
+            let key = format!(
+                "HKCU\\Software\\Microsoft\\SystemCertificates\\Root\\Certificates\\{thumbprint}"
+            );
+            let ok = std::process::Command::new("reg")
+                .args(["delete", &key, "/f"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+/// 取证书的简单显示名（通常是 Subject）。
+fn subject_of(ctx: *const C::CERT_CONTEXT) -> Option<String> {
+    unsafe {
+        let needed = C::CertGetNameStringW(
+            ctx,
+            C::CERT_NAME_SIMPLE_DISPLAY_TYPE,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        );
+        if needed <= 1 {
+            return None;
+        }
+        let mut buf = vec![0u16; needed as usize];
+        let written = C::CertGetNameStringW(
+            ctx,
+            C::CERT_NAME_SIMPLE_DISPLAY_TYPE,
+            0,
+            std::ptr::null(),
+            buf.as_mut_ptr(),
+            needed,
+        );
+        if written <= 1 {
+            return None;
+        }
+        buf.truncate((written - 1) as usize);
+        Some(String::from_utf16_lossy(&buf))
+    }
+}

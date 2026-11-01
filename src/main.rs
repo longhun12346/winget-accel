@@ -37,6 +37,7 @@ struct Args {
     print_pac: bool,
     doctor: bool,
     no_env: bool,
+    remove_ca: bool,
 }
 
 fn main() -> Result<()> {
@@ -84,6 +85,17 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.remove_ca {
+        let removed = crate::certinfo::remove_our_ca();
+        if removed == 0 {
+            println!("未找到属于本工具的根证书（可能本来就没装）。");
+        } else {
+            println!("已从「当前用户受信任的根」移除 {removed} 张本工具证书。");
+        }
+        println!("提示：若系统 PAC 仍指向本机代理，请一并清除：");
+        println!("  reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v AutoConfigURL /f");
+        return Ok(());
+    }
     if args.doctor {
         let (checks, _) = doctor::run(&app);
         let failed = doctor::print(&checks);
@@ -147,6 +159,7 @@ fn parse_args() -> Result<Args> {
     let mut print_pac = false;
     let mut doctor = false;
     let mut no_env = false;
+    let mut remove_ca = false;
 
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -170,6 +183,7 @@ fn parse_args() -> Result<Args> {
             "--print-pac" => print_pac = true,
             "--doctor" => doctor = true,
             "--no-env" => no_env = true,
+            "--remove-ca" => remove_ca = true,
             "--version" => {
                 println!("winget-accel {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -190,6 +204,7 @@ fn parse_args() -> Result<Args> {
         print_pac,
         doctor,
         no_env,
+        remove_ca,
     })
 }
 
@@ -221,9 +236,12 @@ fn print_help() {
          \x20 --mitm-extra <host>   额外拦截但不改写的 host（排障用，可重复）\n\
          \x20 --doctor              检查配置、证书、PAC 与加速器可达性后退出\n\
          \x20 --no-env              不接管系统环境（不改 CA/PAC，测试用）\n\
+         \x20 --remove-ca           移除本工具装进根存储的证书后退出\n\
          \x20 --print-pac           打印 PAC 后退出\n\
          \x20 --version             版本\n",
         env!("CARGO_PKG_VERSION")
     );
 }
+
+
 
