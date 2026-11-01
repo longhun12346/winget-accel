@@ -88,12 +88,13 @@ Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Inter
 
 # 2) 删 CA —— 注意：certutil -delstore 在部分机器上返回 ERROR_NOT_SUPPORTED，
 #    可靠做法是直接删注册表键
-$t = (Get-PfxCertificate "$PWD\certs\ca-cert.pem").Thumbprint
-Remove-Item "HKCU:\Software\Microsoft\Windows\SystemCertificates\Root\Certificates\$t" -Recurse -Force
-
-# 3) 删文件夹
-Remove-Item .\certs, .\state.json, .\proxy.log -Recurse -Force -ErrorAction SilentlyContinue
-```
+#    枚举根存储里的本工具证书，按指纹删掉对应的注册表项
+#    （certutil -delstore 在部分机器上返回 ERROR_NOT_SUPPORTED，故走注册表）
+Get-ChildItem Cert:\CurrentUser\Root |
+  Where-Object { $_.Subject -like '*winget-accel local CA*' } |
+  ForEach-Object {
+    Remove-Item "HKCU:\Software\Microsoft\SystemCertificates\Root\Certificates\$($_.Thumbprint)" -Recurse -Force
+  }```
 
 > **实测踩过的坑**：`certutil -user -delstore Root <指纹>` 与 .NET `X509Store.Remove()`
 > 在某些机器上都会返回 `ERROR_NOT_SUPPORTED`（即使以管理员身份运行），
@@ -202,7 +203,7 @@ docs/
 
 ## 系统要求与兼容性
 
-**实测环境**：Windows 10.0.26100（2 台机器，Win11 24H2/25H2）、winget v1.29.380、PowerShell 5.1、x64。
+**实测环境**（仅记录验证时的环境，非依赖）：Windows 10.0.26100（2 台，Win11 24H2/25H2）、winget v1.29.380、x64。
 
 PE 头：机器类型 `x64`、子系统 `Windows CUI`、子系统版本 `6.00`（仅为链接器默认值，
 不代表能在 Vista 上运行——实际下限由 Rust std 与依赖决定）。
@@ -255,4 +256,7 @@ PE 头：机器类型 `x64`、子系统 `Windows CUI`、子系统版本 `6.00`�
 ## 许可证
 
 MIT
+
+
+
 

@@ -54,7 +54,7 @@ impl CertAuthority {
         if cert_path.exists() {
             let info = expiry_info(&cert_path);
             if info.is_none() {
-                println!("⚠ 无法读取 CA 有效期（Get-PfxCertificate 未返回结果），跳过到期检查。");
+                println!("⚠ 无法读取 CA 有效期（Win32 证书 API 未返回结果），跳过到期检查。");
             }
             if let Some((thumb, days)) = info {
                 if days <= RENEW_BEFORE_DAYS {
