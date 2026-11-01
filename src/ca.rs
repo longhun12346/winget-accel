@@ -129,7 +129,7 @@ impl CertAuthority {
         // 记下授权域名，配置变化时能立刻发现
         std::fs::write(meta_path, serde_json::to_string(permitted)?)
             .with_context(|| format!("写不了 {}", meta_path.display()))?;
-        let _ = dir;
+        restrict_permissions(dir);
 
         Ok(ca_pem)
     }
@@ -226,6 +226,24 @@ fn civil_from_days(days: i64) -> (i32, u8, u8) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m as u8, d as u8)
+}
+
+/// 收紧证书目录权限：去掉继承，只保留当前用户与 SYSTEM。
+///
+/// CA 私钥是明文存放的，默认从父目录继承的 ACL 可能允许同机其他用户读取。
+/// 失败不致命（最多保持原状），所以只吞掉错误，不中断启动。
+fn restrict_permissions(dir: &Path) {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    let mut cmd = std::process::Command::new("icacls");
+    cmd.arg(dir).arg("/inheritance:r");
+    if !user.is_empty() {
+        cmd.arg("/grant:r").arg(format!("{user}:(OI)(CI)F"));
+    }
+    cmd.arg("/grant:r").arg("SYSTEM:(OI)(CI)F");
+    let _ = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 #[cfg(test)]
