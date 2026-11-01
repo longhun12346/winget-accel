@@ -21,6 +21,10 @@ pub struct Stats {
 pub struct AccelHealth {
     pub host: String,
     pub health: &'static str,
+    /// 实测吞吐（KB/s，衰减滑动平均）；样本不足时不可信。
+    pub kbps: u32,
+    /// 真实下载样本数。
+    pub samples: u32,
 }
 
 impl Stats {
@@ -100,6 +104,8 @@ mod tests {
         let accels = vec![AccelHealth {
             host: "evil\"host\\x".to_string(),
             health: "unknown",
+            kbps: 0,
+            samples: 0,
         }];
         let json = stats.health_json("ok", accels);
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("必须是合法 JSON");
@@ -116,10 +122,14 @@ mod tests {
             AccelHealth {
                 host: "a.example".into(),
                 health: "healthy",
+                kbps: 500,
+                samples: 5,
             },
             AccelHealth {
                 host: "b.example".into(),
                 health: "unhealthy",
+                kbps: 0,
+                samples: 0,
             },
         ];
         let json = stats.health_json("ok", accels);
@@ -127,4 +137,6 @@ mod tests {
         assert!(json.contains("\"health\":\"unhealthy\""), "{json}");
     }
 }
+
+
 

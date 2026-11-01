@@ -29,7 +29,30 @@ impl Health {
 struct State {
     health: Health,
     failures: u32,
+    /// 实测吞吐的衰减滑动平均（KB/s）。样本不足时不可信，见 MIN_SAMPLES。
+    ema_kbps: f64,
+    /// 累计样本数（启动粗筛也算，记满 MIN_SAMPLES）。
+    samples: u32,
+    /// 连续"低于绝对下限"的次数，用于决定是否排除。
+    consecutive_slow: u32,
 }
+
+/// 真实样本的衰减系数：半衰期约 20 个样本。
+const EMA_DECAY: f64 = 0.966;
+/// 少于这个样本数时速度不可信，权重按乐观值处理。
+const MIN_SAMPLES: u32 = 3;
+/// 权重地板：最慢的候选也保留 20% 份额，避免流量全压一个。
+const WEIGHT_FLOOR_RATIO: f64 = 0.2;
+/// 绝对下限（KB/s）：低于它说明这条链路基本没用（比直连还差）。
+///
+/// 刻意设得很低。实测同一时刻五个候选可能全都只有 34–40 KB/s，
+/// 如果门槛设成 64 KB/s 会把所有候选一起判死，反而没有可用候选。
+/// "相对太慢"由 `SLOW_RELATIVE_RATIO` 处理。
+pub const SLOW_FLOOR_KBPS: f64 = 24.0;
+/// 相对门槛：低于当前最快候选的这个比例，才算"太慢"。
+const SLOW_RELATIVE_RATIO: f64 = 0.25;
+/// 连续多少个样本都低于下限才排除（单次慢可能是抖动）。
+const SLOW_STRIKES: u32 = 3;
 
 pub struct Tracker {
     accels: Vec<Accel>,
@@ -44,6 +67,9 @@ impl Tracker {
             .map(|_| State {
                 health: Health::Unknown,
                 failures: 0,
+                ema_kbps: 0.0,
+                samples: 0,
+                consecutive_slow: 0,
             })
             .collect();
         Self {
@@ -113,18 +139,7 @@ impl Tracker {
         None
     }
 
-    /// 选一个当前该用、且不在 `exclude` 里的加速器（用于换候选重试）。
-    pub fn current_excluding(&self, exclude: &[usize]) -> Option<(usize, Accel)> {
-        let states = self.states.lock().expect("健康状态锁中毒");
-        let usable = |i: usize, s: &State| !exclude.contains(&i) && s.health != Health::Unhealthy;
-        if let Some(idx) = (0..states.len()).find(|&i| usable(i, &states[i]) && states[i].health == Health::Healthy) {
-            return Some((idx, self.accels[idx].clone()));
-        }
-        if let Some(idx) = (0..states.len()).find(|&i| usable(i, &states[i])) {
-            return Some((idx, self.accels[idx].clone()));
-        }
-        None
-    }
+
 
     pub fn snapshot(&self) -> Vec<(String, Health)> {
         let states = self.states.lock().expect("健康状态锁中毒");
@@ -149,6 +164,128 @@ impl Tracker {
             .iter()
             .filter(|s| s.health == Health::Healthy)
             .count()
+    }
+
+    /// 记录一次**真实下载**的速度样本（不是探测）。
+    ///
+    /// 小于 64 KiB 的样本会被忽略：winget 每次先发 `Range: bytes=0-1` 探大小，
+    /// 那种请求的耗时反映往返延迟而非吞吐，记进去会把速度算成接近 0。
+    pub fn record_sample(&self, idx: usize, bytes: u64, secs: f64) {
+        if bytes < 64 * 1024 || secs <= 0.0 {
+            return;
+        }
+        let kbps = (bytes as f64 / 1024.0) / secs;
+        let mut states = self.states.lock().expect("健康状态锁中毒");
+        // 先算同期最快值（不可变借用），再取可变借用
+        let best = states.iter().map(|s| s.ema_kbps).fold(0.0f64, f64::max);
+        let Some(state) = states.get_mut(idx) else {
+            return;
+        };
+        state.ema_kbps = if state.samples == 0 {
+            kbps
+        } else {
+            state.ema_kbps * EMA_DECAY + kbps * (1.0 - EMA_DECAY)
+        };
+        state.samples = state.samples.saturating_add(1);
+
+        // "太慢"要同时看绝对与相对：绝对下限挡掉基本没用的链路，
+        // 相对门槛挡掉"比同期最快的差一个数量级"的链路。
+        // 只用绝对门槛会在整体网络变差时把所有候选一起判死。
+        let too_slow =
+            kbps < SLOW_FLOOR_KBPS || (best > 0.0 && kbps < best * SLOW_RELATIVE_RATIO);
+
+        if too_slow {
+            state.consecutive_slow = state.consecutive_slow.saturating_add(1);
+            if state.consecutive_slow >= SLOW_STRIKES {
+                state.health = Health::Unhealthy;
+            }
+        } else {
+            state.consecutive_slow = 0;
+            if state.health == Health::Unhealthy {
+                state.health = Health::Healthy;
+            }
+        }
+    }
+
+    /// 启动粗筛结果：只用来排除"明显不可用/太慢"，不用于排序。
+    pub fn seed_speed(&self, idx: usize, kbps: f64) {
+        let mut states = self.states.lock().expect("健康状态锁中毒");
+        let Some(state) = states.get_mut(idx) else {
+            return;
+        };
+        state.ema_kbps = kbps;
+        state.samples = MIN_SAMPLES;
+        state.health = if kbps < SLOW_FLOOR_KBPS {
+            Health::Unhealthy
+        } else {
+            Health::Healthy
+        };
+    }
+
+    /// 按速度加权、随机选一个候选（排除 `exclude` 与不健康的）。
+    ///
+    /// 用加权随机而非"永远选最快"：流量全压一个更容易把它打到限流。
+    /// 样本不足的候选按当前最大值（乐观）参与，避免"还没数据"被永久压掉。
+    pub fn pick_excluding(&self, exclude: &[usize]) -> Option<(usize, Accel)> {
+        let states = self.states.lock().expect("健康状态锁中毒");
+        let cands: Vec<usize> = (0..states.len())
+            .filter(|&i| !exclude.contains(&i) && states[i].health != Health::Unhealthy)
+            .collect();
+        if cands.is_empty() {
+            return None;
+        }
+
+        let max_ema = cands
+            .iter()
+            .map(|&i| {
+                if states[i].samples >= MIN_SAMPLES {
+                    states[i].ema_kbps
+                } else {
+                    0.0
+                }
+            })
+            .fold(0.0f64, f64::max);
+
+        let weights: Vec<f64> = cands
+            .iter()
+            .map(|&i| {
+                let s = &states[i];
+                let base = if s.samples >= MIN_SAMPLES && s.ema_kbps > 0.0 {
+                    s.ema_kbps
+                } else {
+                    max_ema
+                };
+                base.max(max_ema * WEIGHT_FLOOR_RATIO).max(1.0)
+            })
+            .collect();
+
+        let total: f64 = weights.iter().sum();
+        let mut remaining = fastrand::f64() * total;
+        let mut chosen = *cands.last().expect("cands 非空");
+        for (idx, w) in cands.iter().zip(weights.iter()) {
+            if remaining < *w {
+                chosen = *idx;
+                break;
+            }
+            remaining -= *w;
+        }
+        drop(states);
+        Some((chosen, self.accels[chosen].clone()))
+    }
+
+    /// 按索引取候选（pin 命中时用）。
+    pub fn accel_at(&self, idx: usize) -> Option<Accel> {
+        self.accels.get(idx).cloned()
+    }
+
+    /// 供 /health 与 doctor：每候选的（host, KB/s, 样本数）。
+    pub fn speed_snapshot(&self) -> Vec<(String, f64, u32)> {
+        let states = self.states.lock().expect("健康状态锁中毒");
+        self.accels
+            .iter()
+            .zip(states.iter())
+            .map(|(a, s)| (a.host.clone(), s.ema_kbps, s.samples))
+            .collect()
     }
 }
 
@@ -265,26 +402,30 @@ mod tests {
     }
 
     #[test]
-    fn current_excluding_skips_tried_candidates() {
+    fn pick_excluding_respects_exclusions() {
         let t = tracker(2);
-        // 两个都是 Unknown，先取第一个
-        let first = t.current_excluding(&[]).unwrap();
-        assert_eq!(first.0, 0);
-        // 排除 0 之后应给 1
-        let second = t.current_excluding(&[0]).unwrap();
-        assert_eq!(second.0, 1);
+        // 加权随机下不假定选中谁，只验证"落在允许集合里"
+        let first = t.pick_excluding(&[]).unwrap();
+        assert!(first.0 < 2, "索引必须有效");
+        // 排除 0 之后只能给 1
+        let second = t.pick_excluding(&[0]).unwrap();
+        assert_eq!(second.0, 1, "排除 0 后只能是 1");
         // 都排除则没有可用
-        assert!(t.current_excluding(&[0, 1]).is_none());
+        assert!(t.pick_excluding(&[0, 1]).is_none());
     }
 
     #[test]
-    fn current_excluding_skips_unhealthy() {
+    fn pick_excluding_skips_unhealthy() {
         let t = tracker(1);
         t.mark(1, false);
-        let got = t.current_excluding(&[]).unwrap();
+        let got = t.pick_excluding(&[]).unwrap();
         assert_eq!(got.0, 0, "应跳过不健康的候选");
     }
 }
+
+
+
+
 
 
 

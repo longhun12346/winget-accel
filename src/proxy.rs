@@ -24,6 +24,8 @@ use crate::stats::Stats;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+/// 同一文件的候选绑定有效期。winget 下载一个包通常几十秒到几分钟。
+const PIN_TTL: Duration = Duration::from_secs(600);
 /// 一次上游尝试的结果。
 ///
 /// 拆成三态是为了支持"换候选重试"：
@@ -40,6 +42,8 @@ pub struct Proxy {
     pub stats: Arc<Stats>,
     pub log: Arc<Logger>,
     pub health: Arc<Tracker>,
+    /// 同一文件的候选绑定：键 = host + path，值 = (候选索引, 过期时刻)。
+    pins: std::sync::Mutex<std::collections::HashMap<String, (usize, std::time::Instant)>>,
     /// 上一次观测到的"全挂"状态，用来只在**状态翻转**时报警，避免每请求刷日志。
     down: AtomicBool,
 }
@@ -59,6 +63,7 @@ impl Proxy {
             log,
             health,
             down: AtomicBool::new(false),
+            pins: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -180,7 +185,7 @@ impl Proxy {
         // 换下一个再试。不把 429 直接透给客户端——winget 收到就失败了，
         // 而我们还有别的候选可用。
         let (plan, accel_idx, accel, status, size) = loop {
-            let Some((accel_idx, accel)) = self.health.current_excluding(&tried) else {
+            let Some((accel_idx, accel)) = self.pick_for(host, &req.target, &tried) else {
                 // 没有可用候选（或都已试过）
                 Stats::bump(&self.stats.errors);
                 self.log.warn(&format!(
@@ -251,6 +256,10 @@ impl Proxy {
 
         if plan.rewritten {
             Stats::bump(&self.stats.rewrites);
+            // 真实下载样本：这是唯一的可靠速度来源（探测只用于粗筛）
+            self.health
+                .record_sample(accel_idx, size, started.elapsed().as_secs_f64());
+            self.pin(host, &req.target, accel_idx);
         }
 
         {
@@ -284,6 +293,42 @@ impl Proxy {
         Ok(())
     }
 
+    /// 同一个文件（同 host + 同 path）固定用同一个候选。
+    ///
+    /// 代理看不到"文件"，只能看到请求；winget 对一个包发的多个 Range 分片
+    /// 除了 Range 头以外完全相同，所以用 host + target 作键。
+    /// 这样做有两个好处：同一批并发分片不会散到多个服务（避免同时施压），
+    /// 且分片速度一致不会拖慢整体。
+    fn pin_key(host: &str, target: &str) -> String {
+        format!("{host}{target}")
+    }
+
+    fn pin(&self, host: &str, target: &str, idx: usize) {
+        let key = Self::pin_key(host, target);
+        let mut pins = self.pins.lock().expect("pin 锁中毒");
+        // 顺手清理过期项，避免长期占内存
+        let now = std::time::Instant::now();
+        pins.retain(|_, (_, exp)| *exp > now);
+        if pins.len() < 512 {
+            pins.insert(key, (idx, now + PIN_TTL));
+        }
+    }
+
+    /// 选候选：优先复用同一文件的 pin，否则加权随机。
+    fn pick_for(&self, host: &str, target: &str, tried: &[usize]) -> Option<(usize, crate::rewrite::Accel)> {
+        let key = Self::pin_key(host, target);
+        {
+            let pins = self.pins.lock().expect("pin 锁中毒");
+            if let Some((idx, exp)) = pins.get(&key) {
+                if *exp > std::time::Instant::now() && !tried.contains(idx) {
+                    if let Some(accel) = self.health.accel_at(*idx) {
+                        return Some((*idx, accel));
+                    }
+                }
+            }
+        }
+        self.health.pick_excluding(tried)
+    }
     /// 记一次加速器失败；跨过阈值时打一条告警（便于用户从日志判断是否被切换）。
     fn note_accel_failure(&self, idx: usize, accel: &rewrite::Accel, why: &str) {
         if self.health.record_failure(idx) {
@@ -335,10 +380,31 @@ impl Proxy {
             for (idx, accel) in proxy.health.accels().iter().enumerate() {
                 let ok = probe(accel, proxy.app.health_timeout);
                 proxy.health.mark(idx, ok);
-                proxy.log.log(
-                    Level::Debug,
-                    &format!("HEALTH {} -> {}", accel.host, if ok { "ok" } else { "fail" }),
-                );
+                if !ok {
+                    proxy.log.log(Level::Debug, &format!("HEALTH {} -> fail", accel.host));
+                    continue;
+                }
+                // 只判"明显不可用/太慢"，不做排序（排序靠真实下载样本）
+                match probe_speed(accel, Duration::from_secs(15)) {
+                    Some(kbps) => {
+                        proxy.health.seed_speed(idx, kbps);
+                        proxy
+                            .log
+                            .log(Level::Debug, &format!("SPEED {} -> {:.0} KB/s", accel.host, kbps));
+                    }
+                    None => {
+                        // 拿不到探测资产**不等于服务不可用**：可能它不支持这个资产、
+                        // 或资产本身有问题。所以不判死，只表示"没有速度数据"，
+                        // 该候选按乐观权重参与选择（见 pick_excluding）。
+                        //
+                        // 之前的写法在这里 mark(false)，导致唯一候选被误判为全挂、
+                        // 所有请求 502 —— 协议用例直接抓到（3 个失败）。
+                        proxy.log.log(
+                            Level::Debug,
+                            &format!("SPEED {} -> 无数据（保留可用）", accel.host),
+                        );
+                    }
+                }
             }
             proxy.report_health_state();
 
@@ -454,13 +520,23 @@ impl Proxy {
             }
             ("GET", "/health") => {
                 // 计数器 + 每个候选的健康状态 + 总体状态，交给 serde_json 序列化
+                let speeds = self.health.speed_snapshot();
                 let accelerators: Vec<crate::stats::AccelHealth> = self
                     .health
                     .snapshot()
                     .iter()
-                    .map(|(host, health)| crate::stats::AccelHealth {
-                        host: host.clone(),
-                        health: health.as_str(),
+                    .enumerate()
+                    .map(|(i, (host, health))| {
+                        let (_, kbps, samples) = speeds
+                            .get(i)
+                            .cloned()
+                            .unwrap_or((host.clone(), 0.0, 0));
+                        crate::stats::AccelHealth {
+                            host: host.clone(),
+                            health: health.as_str(),
+                            kbps: kbps.max(0.0) as u32,
+                            samples,
+                        }
                     })
                     .collect();
                 let status = if self.health.all_unhealthy() {
@@ -516,6 +592,75 @@ fn connect_tcp_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpSt
     Err(last.unwrap_or_else(|| anyhow!("没有可用地址: {host}:{port}")))
 }
 
+/// 探测基准资产：用 release 资产（CDN 静态文件），不用 codeload 的 tag 归档。
+///
+/// 实测依据：`codeload` 的 tarball 在 5 个加速器里有 4 个返回 403/404/超时，
+/// 用它当基准会把正常候选误判成不可用；而 release 资产 5/5 都返回 206。
+/// 选 git-for-windows（组织级长期项目、固定 tag）比个人仓库更稳。
+const PROBE_ASSET: &str = "https://github.com/git-for-windows/git/releases/download/v2.43.0.windows.1/Git-2.43.0-64-bit.exe";
+/// 探测采样量。64 KB 实测约 1.6–1.9 秒（256 KB 要 5–7 秒），
+/// 5 个候选串行才不会把启动拖到半分钟以上，且仍能分辨速度量级。
+const PROBE_BYTES: u64 = 64 * 1024;
+
+/// 通过加速器取一段固定资产，量出吞吐（KB/s）。
+///
+/// 返回 None 表示拿不到（非 206、或读到的字节数明显不足）。
+fn probe_speed(accel: &rewrite::Accel, timeout: Duration) -> Option<f64> {
+    let started = std::time::Instant::now();
+    let mut upstream = match accel.scheme {
+        rewrite::Scheme::Http => connect_tcp_timeout(&accel.host, accel.port, timeout).ok()?,
+        rewrite::Scheme::Https => {
+            let cfg = upstream_client_config();
+            let name: Result<rustls::pki_types::ServerName<'static>, _> = accel.host.clone().try_into();
+            let Ok(name) = name else { return None };
+            let Ok(conn) = ClientConnection::new(cfg, name) else { return None };
+            let stream = connect_tcp_timeout(&accel.host, accel.port, timeout).ok()?;
+            let s = StreamOwned::new(conn, stream);
+            // 用 Box 统一类型太绕，这里直接分支处理
+            return probe_speed_tls(s, accel, started);
+        }
+    };
+
+    let head = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nRange: bytes=0-{}\r\nUser-Agent: winget-accel-probe\r\nConnection: close\r\n\r\n",
+        rewrite::rewrite_path(accel, "github.com", &PROBE_ASSET["https://github.com".len()..]),
+        rewrite::host_header(accel.scheme, &accel.host, accel.port),
+        PROBE_BYTES - 1
+    );
+    upstream.write_all(head.as_bytes()).ok()?;
+    upstream.flush().ok()?;
+    read_probe_response(&mut upstream, started)
+}
+
+fn probe_speed_tls(
+    mut s: StreamOwned<ClientConnection, TcpStream>,
+    accel: &rewrite::Accel,
+    started: std::time::Instant,
+) -> Option<f64> {
+    let head = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nRange: bytes=0-{}\r\nUser-Agent: winget-accel-probe\r\nConnection: close\r\n\r\n",
+        rewrite::rewrite_path(accel, "github.com", &PROBE_ASSET["https://github.com".len()..]),
+        rewrite::host_header(accel.scheme, &accel.host, accel.port),
+        PROBE_BYTES - 1
+    );
+    s.write_all(head.as_bytes()).ok()?;
+    s.flush().ok()?;
+    read_probe_response(&mut s, started)
+}
+
+fn read_probe_response<R: Read>(up: &mut R, started: std::time::Instant) -> Option<f64> {
+    let head = http::read_head(up).ok()?;
+    if http::status_code(&head) != Some(206) {
+        return None;
+    }
+    let mut sink = std::io::sink();
+    let copied = http::forward_body(up, &mut sink, &head, false).ok()?;
+    let secs = started.elapsed().as_secs_f64();
+    if copied < PROBE_BYTES / 2 || secs <= 0.0 {
+        return None;
+    }
+    Some((copied as f64 / 1024.0) / secs)
+}
 /// 探测加速器是否可达：打它自己的根路径，收到任意 HTTP 响应就算通。
 pub fn probe(accel: &rewrite::Accel, timeout: Duration) -> bool {
     let Ok(stream) = connect_tcp_timeout(&accel.host, accel.port, timeout) else {
@@ -604,6 +749,13 @@ mod tests {
         assert_eq!(truncate("abc", 10), "abc");
     }
 }
+
+
+
+
+
+
+
 
 
 

@@ -151,6 +151,8 @@ fn check_accels(accels: &[Accel], timeout: Duration) -> Vec<Check> {
             let started = std::time::Instant::now();
             let ok = probe(accel, timeout);
             let ms = started.elapsed().as_millis();
+            // doctor 只做可达性探测（不改系统状态、也不产生速度样本），
+            // 速度优选的数据来自运行期真实下载，见 /health 的 kbps 字段。
             let detail = format!(
                 "{}://{}:{} 探测 {}（{ms} ms）",
                 accel.scheme.as_str(),
@@ -298,4 +300,5 @@ mod tests {
         assert_eq!(Verdict::Fail.tag().len(), 4);
     }
 }
+
 
