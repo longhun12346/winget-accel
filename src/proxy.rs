@@ -209,8 +209,10 @@ impl Proxy {
                     }
                 }
                 let tag = if plan.rewritten { "REWRITE" } else { "PASS" };
+                // 带上实际使用的加速器：否则日志无法回答"这次是哪个候选在服务"
+                let via = if plan.rewritten { accel.host.as_str() } else { "-" };
                 self.log.info(&format!(
-                    "{tag} {host}{} -> {status} {size}B {:.2}s",
+                    "{tag} via={via} {host}{} -> {status} {size}B {:.2}s",
                     truncate(&plan.path, 90),
                     started.elapsed().as_secs_f64()
                 ));
@@ -535,4 +537,5 @@ mod tests {
         assert_eq!(truncate("abc", 10), "abc");
     }
 }
+
 
