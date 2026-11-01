@@ -39,7 +39,18 @@ fn main() -> Result<()> {
     // rustls 0.23 要求先安装加密后端；用 ring 以避开 aws-lc-rs 的 cmake/NASM 依赖
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let args = parse_args()?;
+    let mut args = parse_args()?;
+
+    // 绿色版：默认把证书与日志放在 **exe 所在目录**，而不是当前工作目录。
+    // 这样整个文件夹可以整包拷到任意位置，从哪启动都不影响行为。
+    let base = exe_dir();
+    if args.overrides.cert_dir.is_none() {
+        args.overrides.cert_dir = Some(base.join("certs"));
+    }
+    if args.overrides.log.is_none() {
+        args.overrides.log = Some(base.join("proxy.log"));
+    }
+
     let file = config::load(args.config.as_ref())?;
     let log_level = args.log_level.unwrap_or_else(|| file.log_level.clone());
     let app = App::new(file, args.overrides)?;
@@ -149,6 +160,14 @@ fn parse_args() -> Result<Args> {
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String> {
     args.next()
         .ok_or_else(|| anyhow::anyhow!("{flag} 缺少取值"))
+}
+
+/// exe 所在目录；取不到时退回当前目录（测试环境可能没有真实 exe 路径）。
+fn exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn print_help() {

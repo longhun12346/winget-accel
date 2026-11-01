@@ -20,6 +20,18 @@ pub const DEFAULT_REWRITE_HOSTS: [&str; 4] = [
 const DEFAULT_LISTEN: &str = "127.0.0.1:8443";
 const DEFAULT_ACCEL: &str = "https://gh-proxy.com";
 
+/// 内置候选链（按多次实测中位数排序，2026-11-01）。
+///
+/// 刻意内置多个：即使不写配置文件，也不能只有一个候选——
+/// 那个单点一挂，功能就整体不可用（不回退直连，ADR-016）。
+const DEFAULT_ACCELERATORS: [(&str, &str, u32); 5] = [
+    ("gh-proxy", "https://gh-proxy.com/{url}", 1),
+    ("geekertao", "https://gh.geekertao.top/{url}", 2),
+    ("ghfast", "https://ghfast.top/{url}", 3),
+    ("ghproxy-site", "https://ghproxy.site/{url}", 4),
+    ("imciel", "https://ghproxy.imciel.com/{url}", 5),
+];
+
 #[derive(Debug, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct FileConfig {
@@ -35,11 +47,14 @@ impl Default for FileConfig {
         Self {
             listen: DEFAULT_LISTEN.to_string(),
             rewrite_hosts: DEFAULT_REWRITE_HOSTS.iter().map(|s| s.to_string()).collect(),
-            accelerators: vec![AcceleratorCfg {
-                name: "gh-proxy".into(),
-                template: DEFAULT_ACCEL.into(),
-                priority: 1,
-            }],
+            accelerators: DEFAULT_ACCELERATORS
+                .iter()
+                .map(|(name, template, priority)| AcceleratorCfg {
+                    name: (*name).to_string(),
+                    template: (*template).to_string(),
+                    priority: *priority,
+                })
+                .collect(),
             health: HealthCfg::default(),
             log_level: "info".into(),
         }

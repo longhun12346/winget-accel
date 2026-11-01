@@ -245,11 +245,28 @@ mod tests {
 
     #[test]
     fn single_candidate_warns_about_single_point() {
-        let app = app();
+        // 默认配置现在内置 5 个候选，这里显式造一个单候选的配置
+        let file = FileConfig {
+            accelerators: vec![AcceleratorCfg {
+                name: "only".into(),
+                template: "https://only.example".into(),
+                priority: 1,
+            }],
+            ..Default::default()
+        };
+        let app = App::new(file, CliOverrides::default()).unwrap();
         assert_eq!(app.accels.len(), 1);
         let check = check_chain(&app, 1);
         assert_eq!(check.verdict, Verdict::Warn);
         assert!(check.detail.contains("1 个加速器候选"));
+    }
+
+    #[test]
+    fn default_config_ships_five_candidates() {
+        // 内置候选不能只有一个：单点一挂功能就整体不可用（ADR-016）
+        let app = app();
+        assert_eq!(app.accels.len(), 5);
+        assert_eq!(check_chain(&app, 5).verdict, Verdict::Pass);
     }
 
     #[test]
