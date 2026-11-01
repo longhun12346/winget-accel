@@ -7,6 +7,7 @@
 mod autoenv;
 mod ca;
 mod config;
+mod console;
 mod doctor;
 mod health;
 mod http;
@@ -39,6 +40,10 @@ struct Args {
 fn main() -> Result<()> {
     // rustls 0.23 要求先安装加密后端；用 ring 以避开 aws-lc-rs 的 cmake/NASM 依赖
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // 中文 Windows 控制台默认 936(GBK)，而本程序输出 UTF-8。
+    // 只在必要时切到 65001，并在退出时还原，避免影响同一终端里的其它程序。
+    let _console = console::ensure_utf8();
 
     let mut args = parse_args()?;
 
