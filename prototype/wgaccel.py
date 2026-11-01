@@ -16,6 +16,7 @@ import socket
 import ssl
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from ca import WHITELIST, CertAuthority
@@ -29,7 +30,8 @@ class Cfg:
     def __init__(self, args: argparse.Namespace) -> None:
         self.port: int = args.port
         self.listen: str = args.listen
-        self.accel: str = args.accel
+        self.accel_spec: str = args.accel
+        self.accel: tuple[str, str, int] = parse_accel(args.accel)
         self.log_path = Path(args.log)
         self.ca = CertAuthority(Path(args.cert_dir))
         self.mitm_extra: tuple[str, ...] = tuple(args.mitm_extra)
@@ -127,6 +129,112 @@ def pac_text(port: int) -> str:
 
 
 # ---------------------------------------------------------------- 处理逻辑
+DEFAULT_ACCEL_SCHEME = "https"
+
+# 逐跳头（RFC 7230 §6.1）：只对单跳连接有意义，不得转发到上游。
+# Host 单独处理：改写时替换为加速器，透传时保留客户端的原值。
+HOP_BY_HOP = frozenset(
+    {"proxy-connection", "connection", "keep-alive", "te", "trailer", "upgrade"}
+)
+
+
+def parse_accel(value: str) -> tuple[str, str, int]:
+    """解析加速器地址：`host` / `host:port` / `scheme://host:port`。
+
+    允许 http 是为了测试与自建场景（真实加速器是 https）。
+    """
+    scheme, rest = DEFAULT_ACCEL_SCHEME, value
+    if "://" in rest:
+        scheme, rest = rest.split("://", 1)
+    scheme = scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"不支持的加速器协议: {scheme}")
+    host, _, port_s = rest.partition(":")
+    if not host:
+        raise ValueError(f"加速器地址缺少主机名: {value!r}")
+    if port_s:
+        if not port_s.isdigit():
+            raise ValueError(f"加速器端口非法: {port_s!r}")
+        port = int(port_s)
+    else:
+        port = 443 if scheme == "https" else 80
+    return scheme, host, port
+
+
+def rewrite_path(host: str, target: str) -> str:
+    """把 origin-form 的 target 改写为加速器的路径前缀形式。"""
+    return f"/https://{host}{target}"
+
+
+def host_header(scheme: str, host: str, port: int) -> str:
+    """Host 头：非默认端口必须带端口，否则加速器会按 80/443 解释。"""
+    default_port = 443 if scheme == "https" else 80
+    return host if port == default_port else f"{host}:{port}"
+
+
+@dataclass(frozen=True)
+class UpstreamPlan:
+    """一次改写/透传的全部决策结果；纯数据，便于单测。"""
+
+    scheme: str
+    host: str
+    port: int
+    path: str
+    head: bytes
+    rewritten: bool
+
+
+def plan_upstream(
+    method: str,
+    host: str,
+    port: int,
+    target: str,
+    header_lines: list[str],
+    accel: tuple[str, str, int],
+) -> UpstreamPlan:
+    """决定上游地址、请求行与要转发的头。不碰 socket。"""
+    accel_scheme, accel_host, accel_port = accel
+    rewritten = host in WHITELIST
+    if rewritten:
+        scheme, up_host, up_port = accel_scheme, accel_host, accel_port
+        up_path = rewrite_path(host, target)
+    else:
+        # 透传：客户端已经和原站建立了 TLS 预期，上游必须仍是 https
+        scheme, up_host, up_port, up_path = "https", host, port, target
+
+    fwd = [f"{method} {up_path} HTTP/1.1"]
+    if rewritten:
+        fwd.append(f"Host: {host_header(scheme, up_host, up_port)}")
+    for line in header_lines:
+        if not line:
+            break
+        name = line.split(":", 1)[0].strip().lower()
+        if name in HOP_BY_HOP:
+            continue
+        if rewritten and name == "host":
+            continue
+        fwd.append(line)
+    fwd.append("Connection: close")
+    head = ("\r\n".join(fwd) + "\r\n\r\n").encode("latin-1")
+    return UpstreamPlan(scheme, up_host, up_port, up_path, head, rewritten)
+
+
+def shutdown_tls(sock: socket.socket) -> None:
+    """优雅关闭 TLS：先发 close_notify 再关 socket。
+
+    直接 close() 会让客户端报 `missing close_notify`（curl 会当作下载失败），
+    即使字节已经完整收到——对"靠连接关闭定界"的响应尤其致命。
+    """
+    try:
+        sock.unwrap()  # 发送并等待 close_notify
+    except (OSError, ssl.SSLError, ValueError):
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
 def do_tunnel(client: socket.socket, host: str, port: int, cfg: Cfg) -> None:
     try:
         upstream = socket.create_connection((host, port), timeout=15)
@@ -182,34 +290,22 @@ def do_mitm(client: socket.socket, host: str, port: int, cfg: Cfg) -> None:
         tls.close()
         return
 
-    rewrite = host in WHITELIST
-    if rewrite:
-        up_host = cfg.accel
-        up_target = f"/https://{host}{target}"
+    plan = plan_upstream(method, host, port, target, lines[1:], cfg.accel)
+    if plan.rewritten:
         bump("rewrites")
-    else:
-        up_host = host
-        up_target = target
-
-    skip = {"host", "proxy-connection", "connection", "keep-alive", "te", "trailer", "upgrade"}
-    fwd = [f"{method} {up_target} HTTP/1.1", f"Host: {up_host}"]
-    for line in lines[1:]:
-        if not line:
-            break
-        name = line.split(":", 1)[0].strip().lower()
-        if name in skip:
-            continue
-        fwd.append(line)
-    fwd.append("Connection: close")
-    payload = ("\r\n".join(fwd) + "\r\n\r\n").encode("latin-1")
 
     started = time.time()
     try:
-        raw = socket.create_connection((up_host, 443), timeout=15)
-        up_tls = ssl.create_default_context().wrap_socket(raw, server_hostname=up_host)
+        raw = socket.create_connection((plan.host, plan.port), timeout=15)
+        if plan.scheme == "https":
+            upstream: socket.socket = ssl.create_default_context().wrap_socket(
+                raw, server_hostname=plan.host
+            )
+        else:
+            upstream = raw
     except (OSError, ssl.SSLError) as exc:
         bump("errors")
-        cfg.log(f"UPSTREAM-FAIL {host} -> {up_host} {exc}")
+        cfg.log(f"UPSTREAM-FAIL {host} -> {plan.host}:{plan.port} {exc}")
         try:
             tls.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
         except OSError:
@@ -217,16 +313,19 @@ def do_mitm(client: socket.socket, host: str, port: int, cfg: Cfg) -> None:
         tls.close()
         return
 
-    up_tls.sendall(payload)
-    up = Conn(up_tls)
+    upstream.sendall(plan.head)
+    up = Conn(upstream)
     status, size = relay_response(up, tls, host, cfg)
     elapsed = time.time() - started
     bump("bytes", size)
-    tag = "REWRITE" if rewrite else "PASS"
+    tag = "REWRITE" if plan.rewritten else "PASS"
     cfg.log(f"{tag} {host}{target[:90]} -> {status} {size}B {elapsed:.2f}s")
 
-    up_tls.close()
-    tls.close()
+    try:
+        upstream.close()
+    except OSError:
+        pass
+    shutdown_tls(tls)
 
 
 def relay_response(up: Conn, dst: socket.socket, host: str, cfg: Cfg) -> tuple[int, int]:
@@ -376,7 +475,8 @@ def main() -> None:
     cfg = Cfg(args)
     cfg.log(f"CA thumbprint = {cfg.ca.thumbprint}")
     cfg.log(f"PAC  = http://{cfg.listen}:{cfg.port}/proxy.pac")
-    cfg.log(f"ACCEL= https://{cfg.accel}/<原始 URL>")
+    scheme, accel_host, accel_port = cfg.accel
+    cfg.log(f"ACCEL= {scheme}://{accel_host}:{accel_port}/<原始 URL>")
     cfg.log(f"改写范围 = {', '.join(WHITELIST)}")
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

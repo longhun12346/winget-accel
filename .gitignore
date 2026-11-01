@@ -30,7 +30,8 @@ config.local.json
 /prototype/.venv/
 /prototype/certs/
 /prototype/state.json
-/prototype/__pycache__/
+__pycache__/
+/prototype/.pytest_cache/
 /prototype/*.stdout.txt
 /prototype/*.stderr.txt
 /prototype/*.out

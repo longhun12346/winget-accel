@@ -78,6 +78,26 @@ certutil -user -addstore Root "$PWD\certs\ca-cert.pem"
 
 细节与日志见 [../docs/verification-proxy-2026-11-01.md](../docs/verification-proxy-2026-11-01.md)。
 
+## 测试
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest              # 49 个：无网、无副作用
+.\.venv\Scripts\python.exe -m pytest --network    # 加 3 个：真实加速器
+```
+
+用例清单与判定标准见 [docs/test-plan.md](../docs/test-plan.md)。
+
+这一层刻意**不碰系统状态**：CA 用 `curl --cacert` 显式信任，不装进根存储；PAC 不写注册表。
+所以在无管理员、无交互、无外网的环境也能跑，跑完不留残留。
+
+写用例时抓到三个只有在自动化下才暴露的问题：
+
+| 问题 | 触发条件 | 表现 |
+|---|---|---|
+| `Host` 头丢端口 | 加速器不在 443 | 上游按错误端口解释 Host |
+| 结束不发 `close_notify` | 响应靠连接关闭定界 | 字节完整却报 `(56) missing close_notify` |
+| 叶证书生成非原子 | 并发首连同 host | 读到半截 PEM，TLS 连接被重置 |
+
 ## 安全边界
 
 | 边界 | 实现方式 |

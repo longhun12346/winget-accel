@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import ssl
+import threading
 from pathlib import Path
 
 from cryptography import x509
@@ -44,6 +45,9 @@ class CertAuthority:
         self.ca_days = ca_days
         self.leaf_days = leaf_days
         self._contexts: dict[str, ssl.SSLContext] = {}
+        # 叶证书是"生成文件 + 加载文件"两步；并发首连同一 host 时若不加锁，
+        # 后一个线程可能读到写了一半的 PEM，表现为 TLS 握手被重置（实测过）。
+        self._leaf_lock = threading.Lock()
         self._load_or_create()
 
     # ------------------------------------------------------------------ CA
@@ -130,7 +134,14 @@ class CertAuthority:
         ctx = self._contexts.get(host)
         if ctx is not None:
             return ctx
+        with self._leaf_lock:
+            # 等锁期间可能已被其它线程建好
+            ctx = self._contexts.get(host)
+            if ctx is not None:
+                return ctx
+            return self._build_leaf_context(host)
 
+    def _build_leaf_context(self, host: str) -> ssl.SSLContext:
         leaf_key = ec.generate_private_key(ec.SECP256R1())
         now = dt.datetime.now(dt.timezone.utc)
         leaf_cert = (
