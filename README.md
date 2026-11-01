@@ -6,6 +6,29 @@ GitHub 加速服务——让 `winget install` 在国内网络下也能下得动�
 > 状态（2026-11-01）：**Rust 实现已完成并在两台机器上实测通过**。
 > 单文件 1.6 MB、静态链接、无运行时依赖、不需要管理员。
 
+## 获取
+
+从 [Releases](../../releases) 下载 `winget-accel-<版本>-win-x64.zip`，解压后双击
+`winget-accel.exe` 即可。包内含：
+
+| 文件 | 说明 |
+|---|---|
+| `winget-accel.exe` | 单文件二进制，静态链接 CRT，无需 VC++ 运行库 |
+| `QUICKSTART.txt` | 三步上手 + 常见问题排查 |
+| `SHA256.txt` | exe 的校验和 |
+| `LICENSE` / `THIRD-PARTY-NOTICES.md` | 许可证 |
+
+校验：
+```powershell
+Get-FileHash .\winget-accel.exe -Algorithm SHA256   # 与 SHA256.txt 对照
+```
+
+自己构建发布包（本地与 CI 共用同一个脚本）：
+```powershell
+.\packaging\make-release.ps1          # 产物在 dist\
+.\packaging\make-release.ps1 -SkipBuild   # 已构建过时
+```
+
 ## 快速开始
 
 把 `winget-accel.exe` 放到任意文件夹，**双击它**（或直接运行，不带任何参数）：
@@ -205,6 +228,8 @@ src/                  Rust 实现（唯一的交付物）
    health.rs          加速器健康状态机
    doctor.rs          --doctor 检查表
    console.rs         控制台代码页自适应
+packaging/            发布打包（make-release.ps1 + QUICKSTART.txt），本地与 CI 共用
+.github/workflows/    ci.yml（测试）与 release.yml（打 tag 自动构建发布）
 prototype/            Python 原型 + 协议测试用例（验证产物，不参与交付）
 docs/
   design.md           架构设计
@@ -272,6 +297,8 @@ PE 头：机器类型 `x64`、子系统 `Windows CUI`、子系统版本 `6.00`�
 ## 许可证
 
 MIT
+
+
 
 
 

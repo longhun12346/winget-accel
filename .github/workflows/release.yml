@@ -1,0 +1,93 @@
+name: Release
+
+# 打 tag（v*）时自动构建并发布；也可以手动触发只拿 artifact。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建发布产物
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # 打包前先跑一遍测试：产物必须来自测试通过的代码
+      - name: 单元测试
+        run: cargo test --all-targets
+
+      - name: clippy（警告即失败）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 组装发布包
+        id: pack
+        shell: pwsh
+        run: ./packaging/make-release.ps1
+
+      # 冒烟：产出的 exe 必须能跑，且不依赖 VC++ 运行库
+      - name: 冒烟测试产物
+        shell: pwsh
+        run: |
+          $exe = "target\release\winget-accel.exe"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "--version 失败" }
+          & $exe --print-pac | Select-Object -First 2
+          if ($LASTEXITCODE -ne 0) { throw "--print-pac 失败" }
+          # 确认没有 VCRUNTIME / UCRT 依赖（静态 CRT 是否生效）
+          $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($dumpbin) {
+            $deps = & $dumpbin.FullName /dependents $exe 2>&1 | Select-String '\.dll'
+            $bad = $deps | Where-Object { $_ -match 'VCRUNTIME|MSVCP|api-ms-win-crt' }
+            if ($bad) { throw "产物仍依赖 VC++ 运行库: $bad" }
+            Write-Host "依赖检查通过（无 VCRUNTIME/UCRT）"
+          } else {
+            Write-Host "未找到 dumpbin，跳过依赖检查"
+          }
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: winget-accel-win-x64
+          path: ${{ steps.pack.outputs.zip }}
+          if-no-files-found: error
+
+      - name: 发布到 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pack.outputs.zip }}
+          name: winget-accel ${{ steps.pack.outputs.version }}
+          body: |
+            ## 安装
+            1. 解压 zip
+            2. 双击 `winget-accel.exe`，在弹出的安全警告里点「是」
+            3. 另开窗口正常使用 `winget install ...`
+            4. 停止：回到程序窗口按 `Ctrl+C`（会自动还原系统代理设置）
+
+            详细说明与排障见包内 `QUICKSTART.txt`。
+
+            ## 校验
+            ```
+            SHA256(zip) = ${{ steps.pack.outputs.zip_hash }}
+            ```
+            包内 `SHA256.txt` 含 exe 自身的校验和。
+
+            > 本程序会在「当前用户受信任的根证书」里装一张 CA，
+            > 该 CA 被限制为只能签发 4 个 GitHub 下载域名（Name Constraints），
+            > 不能冒充其它站点。不需要管理员权限。
+          draft: false
+          prerelease: false
