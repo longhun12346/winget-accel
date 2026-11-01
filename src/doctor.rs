@@ -1,7 +1,7 @@
 //! `--doctor`：把"装没装好"这件事检查成一张表。
 //!
 //! 设计约束：**只做本地可判定的事**，不猜。
-//! 根证书是否已装进用户根存储，需要通过 `certutil` 或 PowerShell 看证书存储，
+//! 根证书是否已装进用户根存储，用 Win32 API 可读（`certinfo`），此处只给人工核对命令，
 //! 这里不调用系统工具（也不引入 `windows` crate），只给出确切的验证命令。
 
 use std::time::Duration;
@@ -215,7 +215,7 @@ pub fn print(checks: &[Check]) -> bool {
         println!("全部通过。");
         println!();
         println!("根证书是否已被信任需要你自己确认（这里不读系统存储）：");
-        println!("  certutil -user -store Root | Select-String winget-accel");
+        println!("  certutil -user -store Root | findstr /i winget-accel");
     }
     failed
 }
@@ -298,3 +298,4 @@ mod tests {
         assert_eq!(Verdict::Fail.tag().len(), 4);
     }
 }
+

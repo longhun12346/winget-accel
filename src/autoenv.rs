@@ -4,9 +4,12 @@
 //! **不加命令行参数**。所以"绿色版"的入口就是双击 exe —— 无参数即全自动。
 //! 带任何参数时退回纯代理模式，供测试与高级用法使用（测试不能改系统状态）。
 //!
-//! 不用 Win32 FFI：注册表走 `reg.exe`、证书走 `certutil.exe`/PowerShell，
+//! 依赖的只是 Windows 自带组件：注册表走 `reg.exe`、证书导入走 `certutil.exe`；
 //! 因此零新增依赖。代价是已运行的长驻程序（浏览器）可能不立即感知 PAC 变化；
 //! 但 winget 每次是新进程，直接从注册表读配置，不受影响。
+//!
+//! 证书的**读取**（是否已信任、有效期）走 Win32 API（见 `certinfo.rs`），
+//! 不依赖 PowerShell。
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -126,7 +129,7 @@ fn write_pac(value: &str) -> Result<()> {
         .status()
         .context("调用 reg.exe 失败")?;
     if !status.success() {
-        bail!("写注册表失败（reg add 退出码 {status}）");
+        bail!("写注册表失败（reg add 退出码 {}）", describe_status(status.code().unwrap_or(-1)));
     }
     Ok(())
 }
@@ -177,7 +180,7 @@ fn ensure_ca_trusted(ca_pem: &Path) -> Result<()> {
                     println!("CA 已加入受信任的根证书。");
                     return Ok(());
                 }
-                bail!("导入 CA 失败（certutil 退出码 {status}）");
+                bail!("导入 CA 失败（certutil 退出码 {}）", describe_status(status.code().unwrap_or(-1)));
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -333,4 +336,45 @@ pub fn run_watchdog(parent_pid: u32, state_path: &Path) -> ! {
         }
     }
     std::process::exit(0);
+}
+
+/// 把退出码格式化成「十进制（十六进制）+ 常见原因」。
+///
+/// certutil / reg 的失败信息是本地化文字，过去我们直接丢弃，
+/// 导致拿到 `ERROR_NOT_SUPPORTED` 时无从判断。数字码是可搜索、可对照的。
+fn describe_status(code: i32) -> String {
+    let raw = code as u32;
+    let hint = match raw {
+        0x8007_0005 => "，拒绝访问（常见于安全软件拦截）",
+        0x8007_0032 => "，系统不支持该操作（该环境禁止写证书存储）",
+        _ => "",
+    };
+    format!("{code}（0x{raw:08X}）{hint}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describes_known_error_codes() {
+        // 0x80070032 = ERROR_NOT_SUPPORTED，这是实测踩到的那个
+        let text = describe_status(0x8007_0032u32 as i32);
+        assert!(text.contains("0x80070032"), "应含十六进制: {text}");
+        assert!(text.contains("不支持"), "应给出原因提示: {text}");
+    }
+
+    #[test]
+    fn describes_access_denied() {
+        let text = describe_status(0x8007_0005u32 as i32);
+        assert!(text.contains("0x80070005"));
+        assert!(text.contains("拒绝访问"));
+    }
+
+    #[test]
+    fn unknown_code_still_shows_number() {
+        let text = describe_status(1);
+        assert!(text.contains('1'));
+        assert!(text.contains("0x00000001"));
+    }
 }
