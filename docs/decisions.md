@@ -427,6 +427,32 @@ T2 边界守不住——"结构趋同"不等于"参考"，同 workload 下极易
 > 上面「若 `rcgen` 无法表达 Name Constraints，改用 `x509-cert` 系」这条待验证项**关闭**，
 > 不需要 `x509-cert`。
 
+### 预算实测与超标记录（2026-11-01）
+
+`cargo tree` 实测：**直接 7 个**（预算 ≤8，合规）、**传递 47 个**（预算 ≤30，**超标 17**）。
+
+超标来源是 `rcgen` 的 `x509-parser` feature 这一条链：`x509-parser` → `asn1-rs`（含
+`asn1-rs-derive` / `asn1-rs-impl`）→ `der-parser` → `nom` / `num-bigint` / `num-integer` /
+`num-traits` / `rusticata-macros` / `oid-registry` / `data-encoding` / `lazy_static` /
+`minimal-lexical` / `thiserror` 等。
+
+**为什么必须留着**：`Issuer::from_ca_cert_pem` 只在 `cfg(all(feature = "pem", feature = "x509-parser"))`
+下存在。没有它就无法把磁盘上已有的 CA 重新当作签发者——只能每次启动重新生成 CA，
+而新 CA 的指纹必然不同（序列号与 ECDSA 签名都带随机性），**用户每次重启都要重新点一次信任**。
+这与「装一次、之后无感」的产品前提直接冲突，所以这条依赖是硬性的，不是图省事。
+
+**评估过但否掉的替代**：
+
+| 方案 | 否掉原因 |
+|---|---|
+| 每次启动重新生成 CA | 用户每次重启都要重新信任，不可接受 |
+| 只持久化 `CertificateParams`，重启用 `Issuer::new` 重建 | ECDSA 签名随机、序列号渐变，DER 不会一致，指纹仍会变 |
+| 换 `x509-cert` 系 | 依赖面更大，且 ADR 原本就是作为"rcgen 不行时"的备选 |
+
+**结论**：接受 47 个传递依赖，阈值从 ≤30 调整为 **≤50**（按实测留一点余量）。
+透明度上做两件事：`Cargo.lock` 入库（可复现）、本段记录原因。
+**何时重审**：若要引入第二个证书相关 crate，或传递依赖再涨，就说明该换整体方案了。
+
 **手写 HTTP 的边界（调整后）**：
 
 - 必须正确解析 `CONNECT host:port`，且**不能越过头部边界读走 ClientHello**（原型为此逐字节读）
