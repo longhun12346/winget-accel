@@ -22,6 +22,9 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem",
 # 上游（加速器）证书校验需要根证书；纯数据 crate，无传递依赖，无 C 代码。
 # 这是对 ADR-012 允许清单的一处新增，理由见 docs/design.md。
 webpki-roots = "1"
+# Win32 证书存储 API：读写「当前用户受信任根」。
+# 用它替代原先调 powershell.exe 的做法（见 ADR-012 第 3 次修订）。
+windows-sys = { version = "0.60", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
 
 [profile.release]
 opt-level = "z"

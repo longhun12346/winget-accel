@@ -142,25 +142,16 @@ fn delete_pac() -> Result<()> {
 
 /// CA 是否已在用户根存储里。
 ///
-/// **必须按指纹精确比对**：不同的 CA 可以有完全相同的 Subject
-/// （实测踩过——旧 CA 还在存储里，新 CA 的 Subject 一样，按名字匹配会误判为已信任，
-/// 导致客户端验签失败 `TRUST_E_CERT_SIGNATURE` / `0x80096004`）。
+/// 按证书**编码字节**精确比对（`CertEnumCertificatesInStore`），
+/// 不按 Subject，也不依赖 PowerShell。
+/// 踩过的坑：同名不同证书是合法且常见的，按名字比会误判"已信任"，
+/// 跳过导入后客户端报 TRUST_E_CERT_SIGNATURE / 0x80096004。
 fn ca_is_trusted(ca_pem: &Path) -> bool {
-    let script = format!(
-        "$t = (Get-PfxCertificate -FilePath '{}').Thumbprint; \
-         if (Get-ChildItem Cert:\\CurrentUser\\Root | Where-Object {{ $_.Thumbprint -eq $t }}) {{ 'TRUSTED' }} else {{ 'MISSING' }}",
-        ca_pem.display()
-    );
-    let out = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .stderr(Stdio::null())
-        .output();
-    match out {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).contains("TRUSTED"),
-        Err(_) => false,
+    match crate::certinfo::read_ca_der(ca_pem) {
+        Some(der) => crate::certinfo::is_trusted(&der),
+        None => false,
     }
 }
-
 /// 不在就导入。certutil 会弹一次确认框；无桌面会话下它**不报错而是永久阻塞**，
 /// 所以必须轮询 + 超时，超时后给出可手工执行的命令。
 fn ensure_ca_trusted(ca_pem: &Path) -> Result<()> {

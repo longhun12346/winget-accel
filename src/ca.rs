@@ -275,38 +275,10 @@ fn restrict_permissions(dir: &Path) {
 /// 提前多少天开始轮换。留一点余量，避免"今天能用明天突然坏"。
 const RENEW_BEFORE_DAYS: i32 = 7;
 
-/// 读证书指纹与剩余天数。取不到返回 None（不阻塞流程）。
+/// 读证书指纹与剩余天数（走 Win32 API，不依赖 PowerShell）。
 fn expiry_info(ca_pem: &Path) -> Option<(String, i32)> {
-    let path = ca_pem.display().to_string().replace('\'', "''");
-    // 用 .NET 的 X509Certificate2 直接读 PEM：Get-PfxCertificate 在部分环境
-    // （含 -NonInteractive）下不返回结果，实测导致整个到期检查静默失效。
-    let script = format!(
-        "$c = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new('{path}'); \
-         'WGT=' + $c.Thumbprint; \
-         'WGU=' + [int64]([datetimeoffset]$c.NotAfter).ToUnixTimeSeconds()"
-    );
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let thumb = text
-        .lines()
-        .find_map(|line| line.strip_prefix("WGT="))
-        .map(|s| s.trim().to_string());
-    let expires_at = text
-        .lines()
-        .find_map(|line| line.strip_prefix("WGU="))
-        .and_then(|s| s.trim().parse::<i64>().ok())?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let days = ((expires_at - now) / 86_400) as i32;
-    thumb.map(|t| (t, days))
+    crate::certinfo::info(ca_pem).map(|info| (info.thumbprint, info.days_left as i32))
 }
-
 /// 从用户根存储移除指定指纹的证书。
 ///
 /// 用注册表键而非 `certutil -delstore`：后者在部分机器上返回
