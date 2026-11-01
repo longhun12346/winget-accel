@@ -200,6 +200,35 @@ docs/
   rewinged-reference.md / reference-log.md   历史记录
 ```
 
+## 系统要求与兼容性
+
+**实测环境**：Windows 10.0.26100（2 台机器，Win11 24H2/25H2）、winget v1.29.380、PowerShell 5.1、x64。
+
+PE 头：机器类型 `x64`、子系统 `Windows CUI`、子系统版本 `6.00`（仅为链接器默认值，
+不代表能在 Vista 上运行——实际下限由 Rust std 与依赖决定）。
+
+### 支持情况
+
+| 范围 | 状态 | 说明 |
+|---|---|---|
+| Windows 10 / 11 **x64 桌面版** | ✅ 支持 | 依赖仅 `kernel32`/`advapi32`/`ws2_32`/`bcrypt`/`ntdll`/`api-ms-win-core-synch-l1-2-0`，全部系统自带 |
+| 不需要管理员 | ✅ | PAC 在 HKCU，CA 在 `CurrentUser\Root` |
+| Windows 10 早期版本（1809–22H2） | 🟡 理论支持，未验证 | Rust 1.99 的 std 已不支持 Win7/8，Win10 是事实下限 |
+| Windows Server 2019 / 2022 | 🟡 未验证 | Server Core 无 GUI，CA 确认弹窗无法交互 |
+| ARM64 | ❌ 不支持 | 只有 x86_64 产物 |
+| Windows 7 / 8 / 8.1 | ❌ 不支持 | Rust 1.99 已停止支持 |
+| 非 Windows | ❌ 不支持 | 大量 Win32 FFI |
+
+### 三个隐性依赖
+
+| 依赖 | 用途 | 缺失后果 |
+|---|---|---|
+| `powershell.exe` | 用 `Get-PfxCertificate` 取 CA 指纹做信任比对 | 无法判断是否已信任 → 零参数模式失败（非降级） |
+| `certutil.exe` | 导入 CA 到根存储 | 无法安装 CA |
+| winget 的下载器行为 | 本方案假设 winget 走 WinINet 且尊重系统 PAC | **v1.29.380 实测有效**；若将来改为 WinHTTP 或忽略 PAC，加速会静默失效（roadmap H5） |
+
+判断是否仍生效：看 `proxy.log` 里有没有 `REWRITE` 行。
+
 ## 已知限制
 
 | 限制 | 说明 |
