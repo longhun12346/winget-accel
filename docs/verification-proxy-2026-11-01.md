@@ -281,3 +281,51 @@ Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Setti
 
 两条路径的表现不同，原因在客户端超时策略而不是网络完全不通。
 对外表述应统一为"慢到不可用"，而不是"不通"——前者可复现、可量化，后者是当时的误判。
+
+## 12. 加速器候选实测（2026-11-01 晚）
+
+标准比"能访问"严：必须**支持 Range（206）**且**整包 SHA256 与官方一致**。
+
+测试资源固定为 `fd v10.5.0`（1,535,063 B，`a227701b…d57cd7`）。
+
+### 可用（3 个）
+
+| 候选 | Range | 整包 | 速率 |
+|---|---|---|---|
+| `gh-proxy.com` | 206 | 哈希一致 | **765 KB/s** |
+| `ghproxy.imciel.com` | 206 | 哈希一致 | 222 KB/s |
+| `ghfast.top` | 206 | 哈希一致 | 190 KB/s |
+
+### 不可用（11 个）
+
+| 候选 | 现象 |
+|---|---|
+| `ghproxy.net` | 超时（curl 28） |
+| `gh.llkk.cc` | 超时 |
+| `github.moeyy.xyz` | 超时 |
+| `ghproxy.cfd` | 连接超时 |
+| `ghproxy.cc` / `ghp.ci` | TLS 连接被重置（35） |
+| `gh-proxy.top` / `cf.gh-proxy.com` / `hub.gitmirror.com` / `gh-proxy.xyz` | DNS 解析失败（6） |
+| `gh-proxy.net` | 可达但返回 200/302 的 HTML，不是文件（不支持 Range） |
+| `ghps.cc` | 404 |
+| `ghproxy.cn` | 200 但返回 6,990 B 的网页，不是文件 |
+| `ghproxy.1888866.xyz` | 525（源站握手失败） |
+| `gh.h233.eu.org` | 403 |
+| `gh-proxy.cc` | 301 重定向，未跟随后非文件 |
+| `gh.api.99988866.xyz` / `gh.xxooo.cf` | TLS 握手失败（`SEC_E_ILLEGAL_MESSAGE`） |
+
+### 一个重要观察
+
+`ghfast.top` 在**当天早些时候**测是 `000` / 12 s（记为"已失效"），晚上复测却完全可用。
+说明这类公共服务存活状态**会在小时级别变化**。这有两个直接推论：
+
+1. 健康探测不是锦上添花，是必需品——不探就会用到一个已经死掉的候选。
+2. 配置里的候选必须定期复核，文档里的"可用/失效"都只是**某一时刻的快照**，要带日期读。
+
+### 切换实测
+
+配置 `[死端口(priority 1), ghfast.top(priority 2)]` 启动：
+
+- 探测结果：`127.0.0.1 -> unhealthy`、`ghfast.top -> healthy`、`status = ok`
+- 下载：200 / 1,535,063 B / 12.02 s，**哈希一致**
+- 说明 `current()` 确实跳过了判死的候选，用的第二个

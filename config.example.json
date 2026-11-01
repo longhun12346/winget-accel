@@ -14,7 +14,7 @@
   ],
 
   "$comment_accelerators": "按 priority 升序取第一个健康的；{url} 替换为原始完整 URL。健康探测打各自 origin 的根路径",
-  "$comment_accelerators_verified": "2026-11-01 实测：仅 gh-proxy.com 可用（支持 Range 与 206），ghfast.top 已失效（000 / 12s）。保留第二条仅用于演示回退链与配置形状，实际只有一条可用",
+  "$comment_accelerators_verified": "2026-11-01 实测（同一资源，Range 206 + 整包 SHA256 均校验通过）：gh-proxy.com 765 KB/s、ghproxy.imciel.com 222 KB/s、ghfast.top 190 KB/s。按实测速度排 priority。注意 ghfast.top 在当天早些时候还是不可达（000/12s），说明这类公共服务存活状态会变——health 探测存在意义就在这里，配置里的候选也要定期复核",
   "accelerators": [
     {
       "name": "gh-proxy",
@@ -22,9 +22,14 @@
       "priority": 1
     },
     {
+      "name": "imciel",
+      "template": "https://ghproxy.imciel.com/{url}",
+      "priority": 2
+    },
+    {
       "name": "ghfast",
       "template": "https://ghfast.top/{url}",
-      "priority": 2
+      "priority": 3
     }
   ],
 
