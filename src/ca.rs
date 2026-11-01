@@ -20,7 +20,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
 /// CA 有效期（天）。短一些是为了降低私钥泄露后的窗口期。
-const CA_VALIDITY_DAYS: i64 = 3650; // 10 年：本地 CA 的惯例（mkcert 同级），轮换成本高于收益
+const CA_VALIDITY_DAYS: i64 = 365; // 1 年：与 Charles Proxy 的本地 CA 保持一致
 /// 叶证书有效期（天）。只在内存里，重启即重建。
 const LEAF_VALIDITY_DAYS: i64 = 30;
 
@@ -50,6 +50,25 @@ impl CertAuthority {
         let key_path = dir.join(CA_KEY_FILE);
         let meta_path = dir.join(CA_META_FILE);
 
+        // 到期前自动轮换：清掉旧证书与旧文件，随后走"创建新 CA"分支
+        if cert_path.exists() {
+            let info = expiry_info(&cert_path);
+            if info.is_none() {
+                println!("⚠ 无法读取 CA 有效期（Get-PfxCertificate 未返回结果），跳过到期检查。");
+            }
+            if let Some((thumb, days)) = info {
+                if days <= RENEW_BEFORE_DAYS {
+                    println!(
+                        "本机 CA 有效期剩余 {days} 天（阈值 {RENEW_BEFORE_DAYS} 天），自动轮换：\
+                         移除旧证书并重新生成，需要重新信任一次。"
+                    );
+                    remove_trusted_ca(&thumb);
+                    let _ = std::fs::remove_file(&cert_path);
+                    let _ = std::fs::remove_file(&key_path);
+                    let _ = std::fs::remove_file(&meta_path);
+                }
+            }
+        }
         if cert_path.exists() && key_path.exists() {
             let ca_pem = std::fs::read_to_string(&cert_path)
                 .with_context(|| format!("读不到 {}", cert_path.display()))?;
@@ -241,6 +260,63 @@ fn restrict_permissions(dir: &Path) {
     }
     cmd.arg("/grant:r").arg("SYSTEM:(OI)(CI)F");
     let _ = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+// ---------------------------------------------------------------- 自动轮换
+//
+// CA 有效期 1 年。到期后叶证书会验签失败，而 WinINet 报的是
+// TRUST_E_CERT_SIGNATURE（0x96004）——完全指不到"证书过期"，用户无从下手。
+// 所以到期前主动轮换：自动移除旧证书、删掉旧文件、重新生成。
+// 唯一无法自动化的是导入时的确认框（Windows 装根证书必然交互）。
+
+/// 提前多少天开始轮换。留一点余量，避免"今天能用明天突然坏"。
+const RENEW_BEFORE_DAYS: i32 = 7;
+
+/// 读证书指纹与剩余天数。取不到返回 None（不阻塞流程）。
+fn expiry_info(ca_pem: &Path) -> Option<(String, i32)> {
+    let path = ca_pem.display().to_string().replace('\'', "''");
+    // 用 .NET 的 X509Certificate2 直接读 PEM：Get-PfxCertificate 在部分环境
+    // （含 -NonInteractive）下不返回结果，实测导致整个到期检查静默失效。
+    let script = format!(
+        "$c = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new('{path}'); \
+         'WGT=' + $c.Thumbprint; \
+         'WGU=' + [int64]([datetimeoffset]$c.NotAfter).ToUnixTimeSeconds()"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let thumb = text
+        .lines()
+        .find_map(|line| line.strip_prefix("WGT="))
+        .map(|s| s.trim().to_string());
+    let expires_at = text
+        .lines()
+        .find_map(|line| line.strip_prefix("WGU="))
+        .and_then(|s| s.trim().parse::<i64>().ok())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = ((expires_at - now) / 86_400) as i32;
+    thumb.map(|t| (t, days))
+}
+
+/// 从用户根存储移除指定指纹的证书。
+///
+/// 用注册表键而非 `certutil -delstore`：后者在部分机器上返回
+/// ERROR_NOT_SUPPORTED（实测过，见 README 卸载章节）。
+fn remove_trusted_ca(thumbprint: &str) {
+    let key = format!(
+        "HKCU\\Software\\Microsoft\\SystemCertificates\\Root\\Certificates\\{thumbprint}"
+    );
+    let _ = std::process::Command::new("reg")
+        .args(["delete", &key, "/f"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();

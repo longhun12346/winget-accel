@@ -68,7 +68,7 @@ MITM 影响的只是"谁能看到你在下载什么"（都是公开安装包）�
 
 ## 安全边界（请读完再决定是否使用）
 
-- **会往「当前用户受信任根」装一张 CA**，有效期 **10 年**（3650 天）（`ca.rs` 的 `CA_VALIDITY_DAYS`）。
+- **会往「当前用户受信任根」装一张 CA**，有效期 **1 年**（与 Charles Proxy 本地 CA 一致）（`ca.rs` 的 `CA_VALIDITY_DAYS`）。
   这张 CA 的私钥以**明文**存放在 `certs\ca-key.pem`。
 - 该 CA 带 Name Constraints，**只能签这 4 个域名**：`github.com`、
   `objects.githubusercontent.com`、`codeload.github.com`、`release-assets.githubusercontent.com`。
