@@ -251,9 +251,11 @@ fn restore_now() {
 }
 
 unsafe extern "system" fn on_console_event(_event: u32) -> i32 {
+    // 先同步还原（reg.exe 是阻塞调用，能保证在进程被杀前完成）
     restore_now();
-    // 返回 1 = 不处理，交回默认动作让进程正常终止（只在终止前做完还原）
-    1
+    // 返回 FALSE(0) = "未处理"，交回默认处理器终止进程。
+    // 注意：若返回 TRUE(1) 会阻止默认终止行为，导致按 Ctrl+C 后进程赖着不走。
+    0
 }
 
 /// 注册控制台事件处理：Ctrl+C、关窗口、注销、关机都会触发还原。
