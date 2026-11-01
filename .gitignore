@@ -1,0 +1,32 @@
+# 二进制/构建产物
+/bin/
+/dist/
+*.exe
+*.dll
+*.pdb
+
+# 运行时数据（清单体量大，不入库）
+/data/manifests/
+/data/index.json
+/data/state.json
+
+# 证书与私钥（绝不入库）
+/certs/
+*.crt
+*.key
+*.pfx
+*.pem
+
+# 本地配置
+/config.json
+config.local.json
+*.local.json
+
+# 日志
+*.log
+/logs/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
