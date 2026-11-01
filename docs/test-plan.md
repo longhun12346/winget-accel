@@ -139,9 +139,9 @@ winget 的多段下载会退化为整段重下。
 
 | ID | 用例 | 为什么手工 | 判定标准 |
 |---|---|---|---|
-| SYS-01 | `setup.ps1` 装 CA + 设 PAC | 装根证书**必须交互确认**，无 UI 会话会阻塞（§10） | 弹一次确认；`ProxyEnable/ AutoConfigURL` 写入；`state.json` 记录原值 |
+| SYS-01 | 零参数启动：装 CA + 设 PAC（原 `installer/setup.ps1` 已删除） | 装根证书**必须交互确认**，无 UI 会话会阻塞（§10） | 弹一次确认；`ProxyEnable/ AutoConfigURL` 写入；`state.json` 记录原值 |
 | SYS-02 | `winget download` 端到端 | 需真实 winget + 真实网络 | 退出码 0，输出"已成功验证安装程序哈希" |
-| SYS-03 | `teardown.ps1` 还原 | 同上 | `AutoConfigURL` 恢复原值、CA 不在、进程不在，自检 exit 0 |
+| SYS-03 | 退出还原（Ctrl+C / 硬杀 / 看门狗） | 同上 | `AutoConfigURL` 恢复原值、CA 不在、进程不在，自检 exit 0 |
 | SYS-04 | 重复 setup 幂等 | 同上 | 第二次不重复装 CA，不叠加 PAC |
 | SYS-05 | 无 UI 会话下 setup 行为 | 需构造无桌面会话 | **不能无限挂**：45 s 内提示手动命令并 `exit 1` |
 | SYS-06 | `winget install` 真实安装 | 受本机策略/已有版本影响 | 能下到包并进入安装阶段 |
@@ -153,7 +153,7 @@ SYS-01/02/03/05 已在 2026-11-01 用 **Rust 二进制**实跑一遍：
 | SYS-01 | `setup.ps1` 退出 0；CA 导入成功、`AutoConfigURL` 写入、`state.json` 记录指纹 |
 | SYS-02 | `winget download --id junegunn.fzf` **退出码 0 / 13 s / 2,544,236 B / "已成功验证安装程序哈希"** |
 | SYS-03 | `teardown.ps1` 退出 0，独立核对：PAC 空、`ProxyEnable=0`、根存储 0 张 CA、0 进程、安装目录已删 |
-| SYS-05 | 首次跑 `setup.ps1` 时本会话允许导入；**无 UI 会阻塞**这条仍按 §10 记录，未再复现 |
+| SYS-05 | 首次零参数启动时本会话允许导入；**无 UI 会阻塞**这条仍按 §10 记录，未再复现 |
 
 它们**仍不适合放进自动回归**：会让测试机留下受信任根证书。
 
