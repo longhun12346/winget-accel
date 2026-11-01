@@ -33,6 +33,17 @@ public static extern bool InternetSetOption(System.IntPtr hInternet, int dwOptio
     [void][WinInet.Native]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)
 }
 
+function Get-PacUrl {
+    # StrictMode 下不能直接 (Get-ItemProperty ...).AutoConfigURL：
+    # 属性不存在时取属性会抛错而不是给 $null。
+    if (-not (Test-Path $inetKey)) { return $null }
+    $item = Get-ItemProperty -Path $inetKey -Name AutoConfigURL -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return $null }
+    $prop = $item.PSObject.Properties['AutoConfigURL']
+    if ($null -eq $prop) { return $null }
+    return [string]$prop.Value
+}
+
 $state = $null
 if (Test-Path $stateFile) {
     $state = Get-Content $stateFile -Raw | ConvertFrom-Json
@@ -93,30 +104,40 @@ if ($thumb) {
         Write-Warn2 "certutil 返回 $LASTEXITCODE（可能本就不在存储里）"
     }
 } else {
-    Write-Warn2 '拿不到指纹，跳过（需要时可手工 certutil -user -delstore Root <指纹>）'
+    # 安装记录丢失、证书目录也没了：退回按主题扫描，否则会留下一张受信任的 CA
+    $found = @(Get-ChildItem Cert:\CurrentUser\Root -ErrorAction SilentlyContinue |
+        Where-Object { $_.Subject -like '*winget-accel local CA*' })
+    if ($found.Count -eq 0) {
+        Write-Ok '存储里没有本工具的 CA'
+    } else {
+        foreach ($cert in $found) {
+            & certutil.exe -user -delstore Root $cert.Thumbprint 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "按主题移除 $($cert.Thumbprint)"
+            } else {
+                Write-Warn2 "移除 $($cert.Thumbprint) 失败（$LASTEXITCODE）"
+            }
+        }
+    }
 }
 
 # --------------------------------------------------------------- 清安装目录
 Write-Step '清理安装目录'
 if (Test-Path $stateFile) { Remove-Item $stateFile -Force }
 if (Test-Path $stateDir) {
-    if (Test-Path $certDir) {
-        # 证书目录里是私钥，直接删；但先提示一句，避免误以为还能恢复
-        Remove-Item $certDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    $rest = Get-ChildItem $stateDir -Force -ErrorAction SilentlyContinue
-    if ($rest.Count -eq 0) {
-        Remove-Item $stateDir -Force -ErrorAction SilentlyContinue
-        Write-Ok '已删除安装目录'
+    # 整个目录都删：证书（私钥）、状态、日志。日志如需保留请先自行拷走。
+    Remove-Item $stateDir -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path $stateDir) {
+        Write-Warn2 "目录未能完全删除: $stateDir"
     } else {
-        Write-Warn2 "目录里还有 $($rest.Count) 个文件，保留 $stateDir"
+        Write-Ok '已删除安装目录'
     }
 }
 
 # ------------------------------------------------------------------- 自检
 Write-Step '自检残留'
 $residue = 0
-$pac = if (Test-Path $inetKey) { (Get-ItemProperty -Path $inetKey -Name AutoConfigURL -ErrorAction SilentlyContinue).AutoConfigURL } else { $null }
+$pac = Get-PacUrl
 if ($pac -and $pac -like 'http://127.0.0.1:*') { Write-Warn2 "AutoConfigURL 仍指向本机: $pac"; $residue++ }
 if ($thumb -and (Get-ChildItem Cert:\CurrentUser\Root | Where-Object { $_.Thumbprint -eq $thumb })) {
     Write-Warn2 "根证书仍在存储里: $thumb"; $residue++

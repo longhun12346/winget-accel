@@ -131,8 +131,11 @@ REST 源时期的编号在此逐条交代去向，避免"文档里提到但没�
 ## 阶段 4：安装器 / 卸载器 / 自检
 
 > 状态（2026-11-01）：**`--doctor` 已跑通**（实测：CA 缺失判 FAIL、加速器探测 660 ms 可达、
-> 单候选告警）。`installer/setup.ps1`、`installer/teardown.ps1` 通过 PowerShell 语法解析，
-> **但还没与二进制联调**——它们需要一次交互点击才能验证根证书导入。
+> 单候选告警）。`setup.ps1` / `teardown.ps1` **已用 Rust 二进制实跑**：
+> `winget download --id junegunn.fzf` 经本代理 **退出码 0 / 13 s / 2,544,236 B / 哈希校验通过**，
+> 日志为 4 段 Range（2B + 447,084 + 1,048,576 + 1,048,576，全 206）；
+> 卸载后独立核对无残留（PAC 空、0 张 CA、0 进程）。
+> 实跑中修掉两个 `Set-StrictMode` 下的空属性/空数组取值问题。
 > 已继承原型踩过的两个坑：装根证书必须放子进程 + 超时（无 UI 会话会永久阻塞）、
 > 删根证书必须用 `certutil -user -delstore`（`Remove-Item` 会报"不允许使用 UI"）。
 

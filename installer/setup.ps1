@@ -49,6 +49,17 @@ public static extern bool InternetSetOption(System.IntPtr hInternet, int dwOptio
     [void][WinInet.Native]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)  # REFRESH
 }
 
+function Get-PacUrl {
+    # StrictMode 下不能直接 (Get-ItemProperty ...).AutoConfigURL：
+    # 属性不存在时返回 $null，取属性会抛错而不是给 $null。
+    if (-not (Test-Path $inetKey)) { return $null }
+    $item = Get-ItemProperty -Path $inetKey -Name AutoConfigURL -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return $null }
+    $prop = $item.PSObject.Properties['AutoConfigURL']
+    if ($null -eq $prop) { return $null }
+    return [string]$prop.Value
+}
+
 # ------------------------------------------------------------------ 前置检查
 if ($Uninstall -and (Test-Path $stateFile)) {
     Write-Step '先卸载已有安装'
@@ -73,7 +84,7 @@ Write-Ok "端口 $Port 可用"
 
 # 记录原状，供卸载还原
 $hadKey = Test-Path $inetKey
-$priorPac = if ($hadKey) { (Get-ItemProperty -Path $inetKey -Name AutoConfigURL -ErrorAction SilentlyContinue).AutoConfigURL } else { $null }
+$priorPac = Get-PacUrl
 
 New-Item -ItemType Directory -Force -Path $stateDir, $certDir | Out-Null
 
@@ -155,7 +166,7 @@ $pacUrl = "http://127.0.0.1:$Port/proxy.pac"
 Set-ItemProperty -Path $inetKey -Name AutoConfigURL -Value $pacUrl
 Update-WinInet
 
-$check = (Get-ItemProperty -Path $inetKey -Name AutoConfigURL).AutoConfigURL
+$check = Get-PacUrl
 if ($check -ne $pacUrl) { & $rollback; throw "PAC 写入后读回不一致：$check" }
 Write-Ok "AutoConfigURL = $pacUrl"
 
