@@ -1,4 +1,4 @@
-# winget-local-source
+# winget-accel
 
 在本机运行一个 **winget REST 源**，把清单里的 `InstallerUrl` 动态改写到 GitHub 加速服务，
 让 `winget install / search / upgrade` 在国内网络下也能正常工作。
@@ -56,13 +56,13 @@ winget 把**所有能绕开官方源的机制都做成了管理员门禁**，实
 ```powershell
 # 1) 生成仅用于 localhost 的自签证书并加入本机信任库
 # 2) 注册源（HTTPS 端口，具体端口见配置）
-winget source add -n winget-local -a https://localhost:8443/api -t "Microsoft.Rest"
+winget source add -n winget-accel -a https://localhost:8443/api -t "Microsoft.Rest"
 ```
 
 卸载/回滚：
 
 ```powershell
-winget source remove -n winget-local
+winget source remove -n winget-accel
 ```
 
 ## 仓库结构

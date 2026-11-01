@@ -6,7 +6,7 @@
                     ┌──────────────────────────────────────────┐
                     │           本机（127.0.0.1）              │
                     │                                          │
-  winget CLI ──────▶│  winget-local-source  (HTTPS :8443)      │
+  winget CLI ──────▶│  winget-accel  (HTTPS :8443)             │
    (REST client)    │    ├── /information                      │
                     │    ├── /manifestSearch                   │
                     │    └── /packageManifests/{id}            │
@@ -44,11 +44,11 @@
 CLI 形态建议（子命令）：
 
 ```
-winget-local-source serve   --config config.json
-winget-local-source sync    --config config.json [--full]
-winget-local-source cert    --out ./certs [--install]
-winget-local-source setup   [--remove]        # 内部调用 winget source add/remove
-winget-local-source doctor                    # 自检：证书、端口、源、清单、加速器
+winget-accel serve   --config config.json
+winget-accel sync    --config config.json [--full]
+winget-accel cert    --out ./certs [--install]
+winget-accel setup   [--remove]        # 内部调用 winget source add/remove
+winget-accel doctor                    # 自检：证书、端口、源、清单、加速器
 ```
 
 ---
@@ -230,23 +230,23 @@ Import-Certificate -FilePath .\certs\localhost.crt -CertStoreLocation Cert:\Loca
 
 ```powershell
 # 1. 生成并信任证书（管理员）
-winget-local-source cert --install
+winget-accel cert --install
 
 # 2. 注册源（管理员，内部执行 winget source add）
-winget-local-source setup
+winget-accel setup
 
 # 3. 同步清单（可普通权限）
-winget-local-source sync
+winget-accel sync
 
 # 4. 启动服务（可普通权限，建议做成登录自启）
-winget-local-source serve
+winget-accel serve
 ```
 
 卸载：
 
 ```powershell
-winget-local-source setup --remove
-winget-local-source cert --remove
+winget-accel setup --remove
+winget-accel cert --remove
 ```
 
 ---
