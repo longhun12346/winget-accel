@@ -251,9 +251,16 @@ impl Tracker {
             .map(|&i| {
                 let s = &states[i];
                 let base = if s.samples >= MIN_SAMPLES && s.ema_kbps > 0.0 {
+                    // 有数据：用自己的速度
                     s.ema_kbps
+                } else if s.samples == 0 {
+                    // 探测就失败/没测到：**不能给最高权重**。
+                    // 实测教训：给乐观值会让"探测失败但仍有 unknown 状态"的候选
+                    // 和最快的候选同权，结果流量全落到它身上、下载直接失败。
+                    max_ema * WEIGHT_FLOOR_RATIO
                 } else {
-                    max_ema
+                    // 有样本但不足 MIN_SAMPLES：轻微乐观
+                    max_ema * 0.5
                 };
                 base.max(max_ema * WEIGHT_FLOOR_RATIO).max(1.0)
             })
@@ -422,6 +429,7 @@ mod tests {
         assert_eq!(got.0, 0, "应跳过不健康的候选");
     }
 }
+
 
 
 

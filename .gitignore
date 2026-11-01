@@ -38,3 +38,6 @@ __pycache__/
 /prototype/*.out
 /prototype/*.err
 /prototype/wg-*.txt
+
+# DSH 工具自己的暂存目录
+/.dsh/

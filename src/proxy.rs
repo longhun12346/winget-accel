@@ -214,7 +214,25 @@ impl Proxy {
             };
 
             match outcome {
-                Ok(Fwd::Done(status, size)) => break (plan, accel_idx, accel, status, size),
+                Ok(Fwd::Done(status, size)) => {
+                    // 加速器对某个资产返回 403/404，往往意味着"它不支持这个路径"，
+                    // 而不是资产真的不存在——换一个候选重试更可能成功。
+                    // 实测：fzf 和 ripgrep 各失败过一次，就是因为第一个候选返回 404
+                    // 而响应被直接透给了 winget。
+                    // 403/404：该加速器可能不支持这个路径
+                    // 5xx：加速器自身出错（实测 imciel 会返回 502）
+                    // 两类都换候选，都不该直接透给 winget —— 透过去就是下载失败。
+                    let bad_status = matches!(status, 403 | 404) || status >= 500;
+                    if plan.rewritten && bad_status && retryable && tried.len() + 1 < self.health.accels().len() {
+                        self.log.warn(&format!(
+                            "ACCEL-BAD-STATUS {} 返回 {status}，换下一个候选重试",
+                            accel.host
+                        ));
+                        tried.push(accel_idx);
+                        continue;
+                    }
+                    break (plan, accel_idx, accel, status, size);
+                }
                 Ok(Fwd::RateLimited(status)) => {
                     // 上游明确让我们退避：立即标记该候选不可用并换下一个。
                     // 用 mark(false) 而不是计入失败次数——这是服务端的确定信号。
@@ -256,10 +274,19 @@ impl Proxy {
 
         if plan.rewritten {
             Stats::bump(&self.stats.rewrites);
-            // 真实下载样本：这是唯一的可靠速度来源（探测只用于粗筛）
-            self.health
-                .record_sample(accel_idx, size, started.elapsed().as_secs_f64());
-            self.pin(host, &req.target, accel_idx);
+            // 只有 2xx 才算"这次候选真的服务成功"。
+            // 实测教训：把 404 也当成功去 pin 和记样本，会让同一文件的后续分片
+            // 全部钉在这个坏候选上，整个下载直接失败（fzf/ripgrep 各失败一次）。
+            if (200..300).contains(&status) {
+                self.health
+                    .record_sample(accel_idx, size, started.elapsed().as_secs_f64());
+                self.pin(host, &req.target, accel_idx);
+            } else {
+                self.log.warn(&format!(
+                    "ACCEL-BAD-STATUS {} 返回 {status}（{host}），不计样本、不绑定",
+                    accel.host
+                ));
+            }
         }
 
         {
@@ -327,7 +354,20 @@ impl Proxy {
                 }
             }
         }
-        self.health.pick_excluding(tried)
+        let picked = self.health.pick_excluding(tried);
+        if let Some((idx, a)) = &picked {
+            let weights: Vec<String> = self
+                .health
+                .speed_snapshot()
+                .iter()
+                .map(|(h, kbps, n)| format!("{h}={:.0}KB/s/{}", kbps, n))
+                .collect();
+            self.log.log(
+                Level::Debug,
+                &format!("PICK idx={idx} host={} | {}", a.host, weights.join(" ")),
+            );
+        }
+        picked
     }
     /// 记一次加速器失败；跨过阈值时打一条告警（便于用户从日志判断是否被切换）。
     fn note_accel_failure(&self, idx: usize, accel: &rewrite::Accel, why: &str) {
@@ -749,6 +789,10 @@ mod tests {
         assert_eq!(truncate("abc", 10), "abc");
     }
 }
+
+
+
+
 
 
 
