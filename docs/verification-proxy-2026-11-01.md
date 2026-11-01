@@ -329,3 +329,21 @@ Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Setti
 - 探测结果：`127.0.0.1 -> unhealthy`、`ghfast.top -> healthy`、`status = ok`
 - 下载：200 / 1,535,063 B / 12.02 s，**哈希一致**
 - 说明 `current()` 确实跳过了判死的候选，用的第二个
+
+### 复测与速度稳定性（2026-11-01 19:12–19:20）
+
+一小时后按同一标准复测全部 26 个候选：**可用仍是同样 3 个，没有发生状态翻转**
+（上一轮记录的 `ghfast.top` "失效→可用" 是单次观察，不能据此推断小时级churn）。
+
+速度有明显抖动，所以单次测量不足以定优先级。每候选连测 3 次：
+
+| 候选 | 三次 | 中位 | 判断 |
+|---|---|---|---|
+| `gh-proxy.com` | 769 / 766 / 778 KB/s | **769** | 很稳，保持 priority 1 |
+| `ghfast.top` | 357 / 339 / 219 KB/s | 339 | 中位高于 imciel → priority 2 |
+| `ghproxy.imciel.com` | 375 / 159 / 238 KB/s | 238 | 抖动最大，priority 3 |
+
+三次整包 SHA256 **全部一致**，三个候选的完整性都稳定。
+
+配置已按中位数重排（ghfast 与 imciel 互换）。这也说明：**候选排序应该看多次中位数，
+而不是一次快照**——否则会得到一个随机的顺序。

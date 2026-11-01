@@ -24,12 +24,12 @@
     {
       "name": "imciel",
       "template": "https://ghproxy.imciel.com/{url}",
-      "priority": 2
+      "priority": 3
     },
     {
       "name": "ghfast",
       "template": "https://ghfast.top/{url}",
-      "priority": 3
+      "priority": 2
     }
   ],
 
