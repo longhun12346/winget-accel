@@ -39,6 +39,16 @@ struct Args {
 
 fn main() -> Result<()> {
     // rustls 0.23 要求先安装加密后端；用 ring 以避开 aws-lc-rs 的 cmake/NASM 依赖
+    // 内部参数：看门狗子进程（由程序自己拉起，不需要用户传）
+    if std::env::args().nth(1).as_deref() == Some("--watchdog") {
+        let pid = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let state = std::env::args().nth(3).unwrap_or_default();
+        autoenv::run_watchdog(pid, std::path::Path::new(&state));
+    }
+
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // 中文 Windows 控制台默认 936(GBK)，而本程序输出 UTF-8。

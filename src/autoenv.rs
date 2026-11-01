@@ -69,6 +69,9 @@ impl EnvGuard {
 
         write_pac(&format!("http://127.0.0.1:{port}/proxy.pac"))?;
 
+        // 拉起看门狗：进程无论怎么死，PAC 都会被还原
+        spawn_watchdog(&state_path);
+
         Ok(Self {
             state_path,
             prior_pac: prior,
@@ -276,4 +279,67 @@ pub fn install_exit_handler() {
     unsafe {
         SetConsoleCtrlHandler(Some(on_console_event), 1);
     }
+}
+
+// ---------------------------------------------------------------- 看门狗
+//
+// 进程内部无法保证「一定」还原：被任务管理器结束、崩溃、强杀时
+// Drop 和控制台事件处理都不会执行。所以额外起一个常驻子进程盯着父进程，
+// 父进程一消失就还原 PAC —— 这是唯一能覆盖「任何死法」的方案。
+//
+// 子进程通过内部参数 --watchdog <父PID> <state.json 路径> 启动，
+// 是程序自己拉起自己的，不需要用户传参。
+
+const SYNCHRONIZE: u32 = 0x0010_0000;
+const INFINITE: u32 = 0xFFFF_FFFF;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+    fn WaitForSingleObject(handle: *mut std::ffi::c_void, millis: u32) -> u32;
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+}
+
+/// 启动看门狗（父进程调用）。
+pub fn spawn_watchdog(state_path: &Path) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let pid = std::process::id();
+    let _ = Command::new(exe)
+        .arg("--watchdog")
+        .arg(pid.to_string())
+        .arg(state_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// 看门狗主循环（子进程调用）：等父进程退出，然后兜底还原。
+pub fn run_watchdog(parent_pid: u32, state_path: &Path) -> ! {
+    if parent_pid != 0 {
+        // SAFETY: OpenProcess 只读取 pid；句柄用完即关
+        unsafe {
+            let handle = OpenProcess(SYNCHRONIZE, 0, parent_pid);
+            if !handle.is_null() {
+                WaitForSingleObject(handle, INFINITE);
+                CloseHandle(handle);
+            }
+        }
+    }
+    // 父进程已结束。state.json 若还在，说明它没走正常还原流程。
+    if state_path.exists() {
+        let prior = std::fs::read_to_string(state_path).unwrap_or_default();
+        let prior = prior.trim();
+        let result = if prior.is_empty() {
+            delete_pac()
+        } else {
+            write_pac(prior)
+        };
+        if result.is_ok() {
+            let _ = std::fs::remove_file(state_path);
+        }
+    }
+    std::process::exit(0);
 }
