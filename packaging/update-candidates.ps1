@@ -258,7 +258,7 @@ foreach ($c in @($existing.candidates)) {
                 name     = $c.name
                 template = $c.template
                 builtin  = $false
-                verified = [ordered]@{ date = $today; kbps = $r.kbps; note = "实测 $($r.kbps) KB/s" }
+                verified = [ordered]@{ date = $today; kbps = $r.kbps; note = "CI 侧实测 $($r.kbps) KB/s（Azure 美国，不代表用户网络）" }
             })
     }
     else {
@@ -300,7 +300,7 @@ foreach ($r in $ok) {
                 name     = $name
                 template = $tpl
                 builtin  = $false
-                verified = [ordered]@{ date = $today; kbps = $r.kbps; note = "实测通过，已启用（$($r.kbps) KB/s）" }
+                verified = [ordered]@{ date = $today; kbps = $r.kbps; note = "实测通过（CI 侧 $($r.kbps) KB/s，不代表用户网络）" }
             })
     }
 }
@@ -362,6 +362,7 @@ if ($env:GITHUB_OUTPUT) {
     "watchlist=$($newWatchlist.Count)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
     "mismatch=$($mismatch.Count)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 }
+
 
 
 
