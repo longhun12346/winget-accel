@@ -84,6 +84,10 @@ pub fn warn(msg: &str) {
     emit(Level::Warn, msg);
 }
 
+pub fn error(msg: &str) {
+    emit(Level::Error, msg);
+}
+
 fn emit(level: Level, msg: &str) {
     let Some(state) = GLOBAL.get() else {
         println!("{msg}");

@@ -6,6 +6,7 @@
 
 mod autoenv;
 mod ca;
+mod candidates;
 mod certinfo;
 mod config;
 mod console;

@@ -50,14 +50,7 @@ impl Default for FileConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            accelerators: DEFAULT_ACCELERATORS
-                .iter()
-                .map(|(name, template, priority)| AcceleratorCfg {
-                    name: (*name).to_string(),
-                    template: (*template).to_string(),
-                    priority: *priority,
-                })
-                .collect(),
+            accelerators: default_accelerators(),
             health: HealthCfg::default(),
             log_level: "info".into(),
         }
@@ -103,6 +96,7 @@ pub struct App {
     pub rewrite_hosts: Vec<String>,
     /// 按 priority 升序排列的加速器候选（回退链）。
     pub accels: Vec<Accel>,
+
     pub cert_dir: PathBuf,
     pub log_path: PathBuf,
     /// 额外拦截但不改写的 host（只用于验证 Name Constraints 与排障）。
@@ -158,6 +152,7 @@ impl App {
             listen,
             rewrite_hosts,
             accels,
+
             cert_dir: cli.cert_dir.unwrap_or_else(|| PathBuf::from("certs")),
             log_path: cli.log.unwrap_or_else(|| PathBuf::from("proxy.log")),
             mitm_extra: cli.mitm_extra,
@@ -198,6 +193,70 @@ pub fn load(path: Option<&PathBuf>) -> Result<FileConfig> {
     // 示例配置里带 $comment 键，serde 默认忽略未知键，无需额外处理
     serde_json::from_str(&text)
         .with_context(|| format!("配置文件不是合法 JSON: {}", path.display()))
+}
+
+
+/// 默认候选：仓库清单（`candidates.json`）+ 编译期内置，按 host 去重。
+///
+/// 为什么两者都要：清单是"可维护、可被 CI 更新"的那份，内置是"清单被写坏/删掉
+/// 也还能启动"的兜底。合并顺序保持清单在前，这样优先级沿用清单顺序。
+fn default_accelerators() -> Vec<AcceleratorCfg> {
+    let mut out: Vec<AcceleratorCfg> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+
+    let push = |name: &str,
+                template: &str,
+                priority: u32,
+                out: &mut Vec<AcceleratorCfg>,
+                seen: &mut Vec<String>| {
+        // 按 host 去重：同一站点用不同路径前缀没必要占两个名额
+        let probe = crate::candidates::Candidate {
+            name: name.to_string(),
+            template: template.to_string(),
+            builtin: false,
+        };
+        let host = probe.host().unwrap_or(template).to_string();
+        if seen.iter().any(|h| h == &host) {
+            return;
+        }
+        seen.push(host);
+        out.push(AcceleratorCfg {
+            name: name.to_string(),
+            template: template.to_string(),
+            priority,
+        });
+    };
+
+    let (from_file, source) = crate::candidates::load(&exe_dir());
+    let mut priority = 1u32;
+    for c in &from_file {
+        push(&c.name, &c.template, priority, &mut out, &mut seen);
+        priority += 1;
+    }
+    for (name, template, _) in DEFAULT_ACCELERATORS.iter() {
+        push(name, template, priority, &mut out, &mut seen);
+        priority += 1;
+    }
+
+    if from_file.is_empty() {
+        // 清单空（损坏）时只靠内置，日志里已经报过
+        crate::log::warn("候选清单为空，仅使用内置 5 个候选");
+    } else {
+        crate::log::info(&format!(
+            "候选清单来源: {source}（{} 条，合并内置后共 {} 个候选）",
+            from_file.len(),
+            out.len()
+        ));
+    }
+    out
+}
+
+/// exe 所在目录。清单与 certs/log 一样按"绿色版"约定放在 exe 旁边。
+fn exe_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 #[cfg(test)]

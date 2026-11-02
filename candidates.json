@@ -1,0 +1,65 @@
+{
+  "_comment": [
+    "候选加速器清单。仓库内维护，由 .github/workflows/candidates.yml 定期实测后自动更新。",
+    "本文件的 verified 字段是「实测记录」，不是推荐排序：kbps 会随时变化，",
+    "真实排序由运行时按实测速度加权随机决定，不读这个字段。",
+    "注意：社区清单页不可靠（实测过两个源，一个文件被删、一个变成推广页），",
+    "所以这里不放任何『抓第三方 README』的逻辑，只维护确定性的人工增删 + 自动实测。"
+  ],
+  "version": 1,
+  "updated": "2026-11-02",
+  "candidates": [
+    {
+      "name": "gh-proxy",
+      "template": "https://gh-proxy.com/{url}",
+      "builtin": true,
+      "verified": { "date": "2026-11-02", "kbps": 521, "note": "多次实测最快的一个，偶发降速" }
+    },
+    {
+      "name": "geekertao",
+      "template": "https://gh.geekertao.top/{url}",
+      "builtin": true,
+      "verified": { "date": "2026-11-02", "kbps": 126, "note": "曾测到 703 KB/s，波动极大" }
+    },
+    {
+      "name": "ghfast",
+      "template": "https://ghfast.top/{url}",
+      "builtin": true,
+      "verified": { "date": "2026-11-02", "kbps": 179, "note": "曾经历过失效→恢复" }
+    },
+    {
+      "name": "ghproxy-site",
+      "template": "https://ghproxy.site/{url}",
+      "builtin": true,
+      "verified": { "date": "2026-11-02", "kbps": 113, "note": "" }
+    },
+    {
+      "name": "imciel",
+      "template": "https://ghproxy.imciel.com/{url}",
+      "builtin": true,
+      "verified": { "date": "2026-11-02", "kbps": 227, "note": "会返回 502，靠换候选重试兜住" }
+    }
+  ],
+  "watchlist": [
+    {
+      "name": "ddlc",
+      "template": "https://gh.ddlc.top/{url}",
+      "reason": "实测返回 429（活着但限流）。不排除，交由定期实测决定是否晋升。"
+    },
+    {
+      "name": "geekertao-file",
+      "template": "https://ghfile.geekertao.top/{url}",
+      "reason": "实测返回 429；与 gh.geekertao.top 同源"
+    },
+    {
+      "name": "dpik",
+      "template": "https://github.dpik.top/{url}",
+      "reason": "实测返回 429"
+    },
+    {
+      "name": "felicity",
+      "template": "https://gh.felicity.ac.cn/{url}",
+      "reason": "实测返回 429"
+    }
+  ]
+}

@@ -175,7 +175,23 @@ def make_upstream_handler(requests: list[dict]):
             # 内部探测不属于被测流量，不能进 requests，否则会挤掉真实请求的断言位置：
             # - winget-accel-health：定期探 origin 根路径（判可达）
             # - winget-accel-probe：启动粗筛取固定资产的量（测吞吐）
+            #
+            # 必须**正确响应**而不是返回一个空 200：
+            # 生产代码要求探测拿到 206 + 足够字节，否则判定该候选未通过实测并排除。
+            # 早先这里回 200，导致探测必然失败，我当时的"修复"是把生产判据改弱
+            # （探测失败也保留可用）——方向错了。夹具应该模拟真实上游。
             if "winget-accel-" in headers.get("user-agent", ""):
+                rang = headers.get("range", "")
+                total = 60 * 1024 * 1024  # 假装是个 60 MB 的资产
+                if rang.startswith("bytes=0-"):
+                    want = int(rang.split("-", 1)[1]) + 1
+                    body = b"P" * want
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes 0-{want - 1}/{total}")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
                 self.end_headers()

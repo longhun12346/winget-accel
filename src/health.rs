@@ -428,4 +428,33 @@ mod tests {
         let got = t.pick_excluding(&[]).unwrap();
         assert_eq!(got.0, 0, "应跳过不健康的候选");
     }
+
+    #[test]
+    fn candidate_that_failed_probe_is_never_selected() {
+        // 这条规则曾经被放宽过（"内置候选探测失败仍可用"），
+        // 当时是为了让协议用例通过而改弱生产逻辑——方向错了。
+        // 现在用单测钉住：没通过实测就不能进下载路径。
+        let t = tracker(2);
+        t.mark(0, true);
+        t.mark(1, false);
+        for _ in 0..50 {
+            let picked = t.pick_excluding(&[]).expect("至少有 0 号可用");
+            assert_eq!(picked.0, 0, "1 号未通过实测，不应被选中");
+        }
+    }
+
+    #[test]
+    fn all_failed_probe_yields_no_candidate() {
+        let t = tracker(2);
+        t.mark(0, false);
+        t.mark(1, false);
+        assert!(
+            t.pick_excluding(&[]).is_none(),
+            "全部未通过实测时应返回 None（由调用方回 502），不能拿坏候选凑数"
+        );
+        assert!(t.all_unhealthy());
+    }
+
+
 }
+
