@@ -1,65 +1,94 @@
 {
   "_comment": [
-    "候选加速器清单。仓库内维护，由 .github/workflows/candidates.yml 定期实测后自动更新。",
-    "本文件的 verified 字段是「实测记录」，不是推荐排序：kbps 会随时变化，",
-    "真实排序由运行时按实测速度加权随机决定，不读这个字段。",
-    "注意：社区清单页不可靠（实测过两个源，一个文件被删、一个变成推广页），",
-    "所以这里不放任何『抓第三方 README』的逻辑，只维护确定性的人工增删 + 自动实测。"
+    "候选加速器清单。由 .github/workflows/candidates.yml 每周实测后自动更新（开 PR，人工合并）。",
+    "",
+    "字段含义：",
+    "  builtin  true  = 编译进二进制，离线/上游消失时仍可用。标准很严：必须是长期存在、",
+    "                   被多个独立项目引用、且我们实测通过的。宁可少，不可滥。",
+    "  builtin  false = 由 CI 从上游发现并实测通过，随发布更新，不进离线兜底。",
+    "  verified        = 实测记录（日期 + KB/s）。**不是排序依据**，真实排序由运行时",
+    "                    按实测速度加权随机决定。",
+    "",
+    "上游发现源：https://hubp.tbedu.top/nodes.json（标准 JSON）。",
+    "只取域名，不采信上游的任何推荐结论或顺序。",
+    "社区现状：加速器列表事实上由 hubporg 一家维护（nodes.json 与 ghproxy-next 的",
+    "nodes.ts 是同一批数据），没有第二个独立且活跃的源。所以这里接受单点上游，",
+    "用「内嵌兜底 + 实测验证」两层把它的失效影响限制在『候选池不再增长』。"
   ],
-  "version": 1,
+  "version": 2,
   "updated": "2026-11-02",
   "candidates": [
     {
       "name": "gh-proxy",
       "template": "https://gh-proxy.com/{url}",
       "builtin": true,
-      "verified": { "date": "2026-11-02", "kbps": 521, "note": "多次实测最快的一个，偶发降速" }
-    },
-    {
-      "name": "geekertao",
-      "template": "https://gh.geekertao.top/{url}",
-      "builtin": true,
-      "verified": { "date": "2026-11-02", "kbps": 126, "note": "曾测到 703 KB/s，波动极大" }
+      "verified": {
+        "date": "2026-11-02",
+        "kbps": 521,
+        "note": "唯一够格内嵌的：独立站点、多项目引用、多次实测最快的记录"
+      }
     },
     {
       "name": "ghfast",
       "template": "https://ghfast.top/{url}",
       "builtin": true,
-      "verified": { "date": "2026-11-02", "kbps": 179, "note": "曾经历过失效→恢复" }
+      "verified": {
+        "date": "2026-11-02",
+        "kbps": 179,
+        "note": "实测可用作备份；曾经历失效→恢复，不足以当唯一依赖"
+      }
     },
     {
       "name": "ghproxy-site",
       "template": "https://ghproxy.site/{url}",
       "builtin": true,
-      "verified": { "date": "2026-11-02", "kbps": 113, "note": "" }
+      "verified": {
+        "date": "2026-11-02",
+        "kbps": 113,
+        "note": "实测可用作备份；多次测量中偏慢"
+      }
     },
     {
       "name": "imciel",
       "template": "https://ghproxy.imciel.com/{url}",
       "builtin": true,
-      "verified": { "date": "2026-11-02", "kbps": 227, "note": "会返回 502，靠换候选重试兜住" }
+      "verified": {
+        "date": "2026-11-02",
+        "kbps": 227,
+        "note": "实测可用作备份；但会返回 502，靠换候选重试兜住"
+      }
     }
   ],
   "watchlist": [
     {
-      "name": "ddlc",
-      "template": "https://gh.ddlc.top/{url}",
-      "reason": "实测返回 429（活着但限流）。不排除，交由定期实测决定是否晋升。"
+      "name": "geekertao",
+      "template": "https://gh.geekertao.top/{url}",
+      "reason": "速度波动极大（同日 703 → 104 KB/s），且与下面 3 个同属一个运营方，同时失效风险高。降为观察项。"
     },
     {
       "name": "geekertao-file",
       "template": "https://ghfile.geekertao.top/{url}",
-      "reason": "实测返回 429；与 gh.geekertao.top 同源"
+      "reason": "与 gh.geekertao.top 同源；实测 429"
     },
     {
       "name": "dpik",
       "template": "https://github.dpik.top/{url}",
-      "reason": "实测返回 429"
+      "reason": "实测 429"
     },
     {
       "name": "felicity",
       "template": "https://gh.felicity.ac.cn/{url}",
-      "reason": "实测返回 429"
+      "reason": "实测 429"
+    },
+    {
+      "name": "ddlc",
+      "template": "https://gh.ddlc.top/{url}",
+      "reason": "实测 429（活着但限流）。不排除，交 CI 定期实测决定是否晋升。"
+    },
+    {
+      "name": "ghproxy-net",
+      "template": "https://ghproxy.net/{url}",
+      "reason": "magicnet 文档列为候选，我们尚未实测"
     }
   ]
 }

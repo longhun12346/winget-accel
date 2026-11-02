@@ -287,11 +287,16 @@ mod tests {
     }
 
     #[test]
-    fn default_config_ships_five_candidates() {
-        // 内置候选不能只有一个：单点一挂功能就整体不可用（ADR-016）
+    fn default_config_has_multiple_candidates() {
+        // 内置候选不能只有一个：单点一挂功能就整体不可用（ADR-016）。
+        // 不写死数量——清单会随实测调整（2026-11-02 从 5 降到 4）。
         let app = app();
-        assert_eq!(app.accels.len(), 5);
-        assert_eq!(check_chain(&app, 5).verdict, Verdict::Pass);
+        assert!(
+            app.accels.len() >= 2,
+            "至少要有 2 个候选，否则没有回退链；实际 {}",
+            app.accels.len()
+        );
+        assert_eq!(check_chain(&app, app.accels.len()).verdict, Verdict::Pass);
     }
 
     #[test]

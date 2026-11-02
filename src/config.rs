@@ -24,14 +24,6 @@ const DEFAULT_ACCEL: &str = "https://gh-proxy.com";
 ///
 /// 刻意内置多个：即使不写配置文件，也不能只有一个候选——
 /// 那个单点一挂，功能就整体不可用（不回退直连，ADR-016）。
-const DEFAULT_ACCELERATORS: [(&str, &str, u32); 5] = [
-    ("gh-proxy", "https://gh-proxy.com/{url}", 1),
-    ("geekertao", "https://gh.geekertao.top/{url}", 2),
-    ("ghfast", "https://ghfast.top/{url}", 3),
-    ("ghproxy-site", "https://ghproxy.site/{url}", 4),
-    ("imciel", "https://ghproxy.imciel.com/{url}", 5),
-];
-
 #[derive(Debug, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct FileConfig {
@@ -227,19 +219,21 @@ fn default_accelerators() -> Vec<AcceleratorCfg> {
     };
 
     let (from_file, source) = crate::candidates::load(&exe_dir());
-    let mut priority = 1u32;
-    for c in &from_file {
-        push(&c.name, &c.template, priority, &mut out, &mut seen);
-        priority += 1;
-    }
-    for (name, template, _) in DEFAULT_ACCELERATORS.iter() {
-        push(name, template, priority, &mut out, &mut seen);
-        priority += 1;
+    for (i, c) in from_file.iter().enumerate() {
+        push(&c.name, &c.template, i as u32 + 1, &mut out, &mut seen);
     }
 
     if from_file.is_empty() {
-        // 清单空（损坏）时只靠内置，日志里已经报过
-        crate::log::warn("候选清单为空，仅使用内置 5 个候选");
+        // 清单损坏/为空：至少保证有一个候选能启动。
+        // 此时不再有"内置 5 个"可退——候选清单就是唯一来源。
+        crate::log::warn(&format!(
+            "候选清单为空，回退到单一默认候选: {DEFAULT_ACCEL}"
+        ));
+        out.push(AcceleratorCfg {
+            name: "fallback".to_string(),
+            template: DEFAULT_ACCEL.to_string(),
+            priority: 1,
+        });
     } else {
         crate::log::info(&format!(
             "候选清单来源: {source}（{} 条，合并内置后共 {} 个候选）",

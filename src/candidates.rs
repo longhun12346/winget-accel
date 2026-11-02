@@ -151,8 +151,17 @@ mod tests {
     #[test]
     fn embedded_list_parses_and_has_entries() {
         let list = parse(EMBEDDED).expect("嵌入清单必须可解析");
-        assert!(list.len() >= 5, "至少应包含内置的 5 个候选");
-        assert!(list.iter().all(|c| c.builtin), "当前嵌入清单全部是内置候选");
+        // 不断言具体数量：清单会随实测调整（2026-11-02 按"必须权威可靠"降到 4 个）。
+        // 断言的是不变量：必须有内置条目，否则离线/上游消失时没有兜底。
+        assert!(!list.is_empty(), "嵌入清单不能为空");
+        assert!(
+            list.iter().any(|c| c.builtin),
+            "必须至少有一个 builtin 候选作为离线兜底"
+        );
+        assert!(
+            list.iter().all(|c| c.template.contains("{url}")),
+            "每条模板都必须含 {{url}}"
+        );
     }
 
     #[test]
