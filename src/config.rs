@@ -195,7 +195,6 @@ pub fn load(path: Option<&PathBuf>) -> Result<FileConfig> {
         .with_context(|| format!("配置文件不是合法 JSON: {}", path.display()))
 }
 
-
 /// 默认候选：仓库清单（`candidates.json`）+ 编译期内置，按 host 去重。
 ///
 /// 为什么两者都要：清单是"可维护、可被 CI 更新"的那份，内置是"清单被写坏/删掉

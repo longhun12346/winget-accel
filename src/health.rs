@@ -454,7 +454,4 @@ mod tests {
         );
         assert!(t.all_unhealthy());
     }
-
-
 }
-
