@@ -33,10 +33,10 @@
 .PARAMETER Limit
     只测前 N 个域名（本地调试用，CI 不传）。
 
-.PARAMETER FullCandidates
-    把所有通过实测的域名都写进 candidates（默认只保留 builtin + 已经在
-    candidates 里的）。默认行为更保守：新发现的先留在 watchlist，
-    等下次发布时由人看过再提升。
+.PARAMETER FirstPassOnly
+    新通过的域名先留在 watchlist 观察，不直接启用。默认是**自动启用**：
+    通过实测（206 + 64 KiB + 与直连 GitHub 字节一致）即进入 candidates。
+    保留这个开关只为排障时对比行为。
 #>
 [CmdletBinding()]
 param(
@@ -44,7 +44,7 @@ param(
     [string]$Upstream = 'https://hubp.tbedu.top/nodes.json',
     [int]$Limit = 0,
     [switch]$DryRun,
-    [switch]$FullCandidates
+    [switch]$FirstPassOnly
 )
 
 function Get-HostFromTemplate([string]$template) {
@@ -76,6 +76,7 @@ $comment = $null
 $builtinTemplates = @{}
 $known = @{}
 $failures = @{}
+$passStreak = @{}
 
 if (Test-Path $outPath) {
     $raw = Get-Content $outPath -Raw | ConvertFrom-Json
@@ -91,6 +92,7 @@ if (Test-Path $outPath) {
         $h = Get-HostFromTemplate $w.template
         if (-not $known.ContainsKey($h)) { $known[$h] = $w }
         if ($w.PSObject.Properties.Name -contains 'failures') { $failures[$h] = [int]$w.failures }
+        if ($w.PSObject.Properties.Name -contains 'passes') { $passStreak[$h] = [int]$w.passes }
     }
     Write-Host "现有清单: $(@($raw.candidates).Count) 个候选 + $(@($raw.watchlist).Count) 个观察项"
 }
@@ -282,20 +284,26 @@ foreach ($r in $ok) {
     if ($alreadyListed -contains $r.host) { continue }
     $tpl = "https://$($r.host)/{url}"
     $name = $r.host -replace '\.[^.]+$', '' -replace '[^a-z0-9]+', '-'
-    if ($FullCandidates) {
+
+    # 已释放过（在 watchlist 且通过过一次）→ 直接启用；首次通过 → 先记一轮。
+    # 这不是"人工判断"：判据是机械的（连续两次通过实测），目的是过滤掉
+    # 只在某一瞬间侥幸通过的域名。下一轮仍然通过就自动进调度池。
+    $priorPasses = $passStreak[$r.host]
+    if ($FirstPassOnly -or $priorPasses -lt 1) {
+        $newWatchlist.Add([ordered]@{
+                name     = $name
+                template = $tpl
+                reason   = "新发现且实测通过（$($r.kbps) KB/s）；下一轮仍通过则自动启用"
+                failures = 0
+                passes   = 1
+            })
+    }
+    else {
         $newCandidates.Add([ordered]@{
                 name     = $name
                 template = $tpl
                 builtin  = $false
-                verified = [ordered]@{ date = $today; kbps = $r.kbps; note = "新发现，实测 $($r.kbps) KB/s" }
-            })
-    }
-    else {
-        $newWatchlist.Add([ordered]@{
-                name     = $name
-                template = $tpl
-                reason   = "新发现且实测通过（$($r.kbps) KB/s），默认留在观察项；确认后移入 candidates"
-                failures = 0
+                verified = [ordered]@{ date = $today; kbps = $r.kbps; note = "自动启用，实测 $($r.kbps) KB/s" }
             })
     }
 }
@@ -357,6 +365,7 @@ if ($env:GITHUB_OUTPUT) {
     "watchlist=$($newWatchlist.Count)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
     "mismatch=$($mismatch.Count)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 }
+
 
 
 
