@@ -46,7 +46,10 @@ impl Default for FileConfig {
     fn default() -> Self {
         Self {
             listen: DEFAULT_LISTEN.to_string(),
-            rewrite_hosts: DEFAULT_REWRITE_HOSTS.iter().map(|s| s.to_string()).collect(),
+            rewrite_hosts: DEFAULT_REWRITE_HOSTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             accelerators: DEFAULT_ACCELERATORS
                 .iter()
                 .map(|(name, template, priority)| AcceleratorCfg {
@@ -124,7 +127,10 @@ impl App {
         }
 
         let rewrite_hosts = if file.rewrite_hosts.is_empty() {
-            DEFAULT_REWRITE_HOSTS.iter().map(|s| s.to_string()).collect()
+            DEFAULT_REWRITE_HOSTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
         } else {
             file.rewrite_hosts
         };
@@ -190,7 +196,8 @@ pub fn load(path: Option<&PathBuf>) -> Result<FileConfig> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("读不到配置文件: {}", path.display()))?;
     // 示例配置里带 $comment 键，serde 默认忽略未知键，无需额外处理
-    serde_json::from_str(&text).with_context(|| format!("配置文件不是合法 JSON: {}", path.display()))
+    serde_json::from_str(&text)
+        .with_context(|| format!("配置文件不是合法 JSON: {}", path.display()))
 }
 
 #[cfg(test)]
@@ -248,8 +255,16 @@ mod tests {
     fn picks_lowest_priority_accelerator() {
         let file = FileConfig {
             accelerators: vec![
-                AcceleratorCfg { name: "b".into(), template: "https://second.example".into(), priority: 2 },
-                AcceleratorCfg { name: "a".into(), template: "https://first.example".into(), priority: 1 },
+                AcceleratorCfg {
+                    name: "b".into(),
+                    template: "https://second.example".into(),
+                    priority: 2,
+                },
+                AcceleratorCfg {
+                    name: "a".into(),
+                    template: "https://first.example".into(),
+                    priority: 1,
+                },
             ],
             ..Default::default()
         };
@@ -266,7 +281,10 @@ mod tests {
         };
         let app = App::new(file, cli).unwrap();
         assert_eq!(app.accels.len(), 1, "--accel 应覆盖成单候选");
-        assert_eq!((app.accels[0].host.as_str(), app.accels[0].port), ("127.0.0.1", 9000));
+        assert_eq!(
+            (app.accels[0].host.as_str(), app.accels[0].port),
+            ("127.0.0.1", 9000)
+        );
     }
 
     #[test]

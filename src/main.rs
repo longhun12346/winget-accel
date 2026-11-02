@@ -112,7 +112,10 @@ fn main() -> Result<()> {
     let logger = Arc::new(Logger::new(Level::parse(&log_level), app.log_path.clone()));
     let stats = Arc::new(Stats::default());
 
-    let ca = Arc::new(CertAuthority::load_or_create(&app.cert_dir, &app.rewrite_hosts)?);
+    let ca = Arc::new(CertAuthority::load_or_create(
+        &app.cert_dir,
+        &app.rewrite_hosts,
+    )?);
 
     // 零参数启动 = 绿色版模式：自动信任 CA、设置 PAC，退出时还原。
     // 带任何参数时保持纯代理（测试与高级用法不能被改系统状态）。
@@ -124,12 +127,11 @@ fn main() -> Result<()> {
     };
 
     // 启动信息排成对齐的一列，比一堵 "key = value" 好扫。
-    let chain: Vec<String> = app
-        .accels
-        .iter()
-        .map(|a| a.host.clone())
-        .collect();
-    logger.info(&format!("winget-accel {} 已就绪", env!("CARGO_PKG_VERSION")));
+    let chain: Vec<String> = app.accels.iter().map(|a| a.host.clone()).collect();
+    logger.info(&format!(
+        "winget-accel {} 已就绪",
+        env!("CARGO_PKG_VERSION")
+    ));
     logger.info(&format!(
         "  CA       {}",
         CertAuthority::ca_pem_path(&app.cert_dir).display()
@@ -147,10 +149,7 @@ fn main() -> Result<()> {
     if app.accels.len() == 1 {
         logger.warn("  只有 1 个加速器候选：事实上没有回退链");
     }
-    logger.info(&format!(
-        "  rewrite  {}",
-        app.rewrite_hosts.join(", ")
-    ));
+    logger.info(&format!("  rewrite  {}", app.rewrite_hosts.join(", ")));
     if !auto_env {
         logger.info("  env      未接管系统设置（--no-env），如需 winget 走代理请去掉该参数");
     }
@@ -259,9 +258,3 @@ fn print_help() {
         env!("CARGO_PKG_VERSION")
     );
 }
-
-
-
-
-
-

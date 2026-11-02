@@ -134,10 +134,6 @@ pub fn content_length(head: &[u8]) -> Option<u64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
-
-
-
-
 /// 按响应头决定如何转发正文，返回正文字节数。
 ///
 /// 单独拆出来是为了让调用方**先看状态码再决定要不要转发**——
@@ -256,7 +252,8 @@ mod tests {
 
     #[test]
     fn parses_request_line_and_headers() {
-        let head = parse_head(b"CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n").unwrap();
+        let head =
+            parse_head(b"CONNECT github.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n").unwrap();
         assert_eq!(head.method, "CONNECT");
         assert_eq!(head.target, "github.com:443");
         assert_eq!(head.version, "HTTP/1.1");
@@ -313,7 +310,8 @@ mod tests {
 
     #[test]
     fn relay_preserves_chunked_framing_verbatim() {
-        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n".to_vec();
+        let response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n".to_vec();
         let mut up = Cursor::new(response.clone());
         let mut out = Vec::new();
 
@@ -362,8 +360,3 @@ mod tests {
         assert_eq!(out, b"body", "只应包含正文");
     }
 }
-
-
-
-
-

@@ -227,10 +227,6 @@ fn set_validity(params: &mut CertificateParams, days: i64) {
     params.not_after = now + time::Duration::days(days);
 }
 
-
-
-
-
 /// 收紧证书目录权限：去掉继承，只保留当前用户与 SYSTEM。
 ///
 /// CA 私钥是明文存放的，默认从父目录继承的 ACL 可能允许同机其他用户读取。
@@ -300,8 +296,6 @@ fn remove_trusted_ca(thumbprint: &str) {
 mod tests {
     use super::*;
 
-    
-
     #[test]
     fn reuses_existing_ca_across_loads() {
         let dir = std::env::temp_dir().join(format!("wgaccel-ca-{}", std::process::id()));
@@ -324,14 +318,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
-
-
-
-
-
-
-
-
-
-

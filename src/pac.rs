@@ -46,7 +46,10 @@ pub fn build(port: u16, rewrite_hosts: &[String]) -> String {
 /// 默认端口下生成 PAC（给 `--print-pac` 之类的便捷场景用）。
 #[allow(dead_code)]
 pub fn build_default(port: u16) -> String {
-    let hosts: Vec<String> = DEFAULT_REWRITE_HOSTS.iter().map(|s| s.to_string()).collect();
+    let hosts: Vec<String> = DEFAULT_REWRITE_HOSTS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     build(port, &hosts)
 }
 
@@ -55,10 +58,15 @@ mod tests {
     use super::*;
 
     fn hosts() -> Vec<String> {
-        ["github.com", "objects.githubusercontent.com", "codeload.github.com", "release-assets.githubusercontent.com"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
+        [
+            "github.com",
+            "objects.githubusercontent.com",
+            "codeload.github.com",
+            "release-assets.githubusercontent.com",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
     // PAC-01

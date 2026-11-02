@@ -48,8 +48,7 @@ impl EnvGuard {
 
     /// 装好 CA、设好 PAC，返回守卫。
     pub fn enable(dir: &Path, port: u16) -> Result<Self> {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("建不了目录: {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("建不了目录: {}", dir.display()))?;
 
         let ca_pem = dir.join("certs").join("ca-cert.pem");
         if !ca_pem.exists() {
@@ -123,13 +122,24 @@ fn read_pac() -> Option<String> {
 fn write_pac(value: &str) -> Result<()> {
     let status = Command::new("reg")
         .args([
-            "add", INET_KEY, "/v", "AutoConfigURL", "/t", "REG_SZ", "/d", value, "/f",
+            "add",
+            INET_KEY,
+            "/v",
+            "AutoConfigURL",
+            "/t",
+            "REG_SZ",
+            "/d",
+            value,
+            "/f",
         ])
         .stderr(Stdio::null())
         .status()
         .context("调用 reg.exe 失败")?;
     if !status.success() {
-        bail!("写注册表失败（reg add 退出码 {}）", describe_status(status.code().unwrap_or(-1)));
+        bail!(
+            "写注册表失败（reg add 退出码 {}）",
+            describe_status(status.code().unwrap_or(-1))
+        );
     }
     Ok(())
 }
@@ -180,7 +190,10 @@ fn ensure_ca_trusted(ca_pem: &Path) -> Result<()> {
                     println!("CA 已加入受信任的根证书。");
                     return Ok(());
                 }
-                bail!("导入 CA 失败（certutil 退出码 {}）", describe_status(status.code().unwrap_or(-1)));
+                bail!(
+                    "导入 CA 失败（certutil 退出码 {}）",
+                    describe_status(status.code().unwrap_or(-1))
+                );
             }
             Ok(None) => {
                 if Instant::now() >= deadline {

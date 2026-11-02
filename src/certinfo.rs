@@ -15,9 +15,6 @@ use std::path::Path;
 
 use windows_sys::Win32::Security::Cryptography as C;
 
-
-
-
 pub struct CertInfo {
     /// 大写十六进制 SHA-1，与 Windows 里显示的"指纹"一致。
     pub thumbprint: String,
@@ -236,8 +233,3 @@ fn subject_of(ctx: *const C::CERT_CONTEXT) -> Option<String> {
         Some(String::from_utf16_lossy(&buf))
     }
 }
-
-
-
-
-

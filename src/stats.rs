@@ -137,6 +137,3 @@ mod tests {
         assert!(json.contains("\"health\":\"unhealthy\""), "{json}");
     }
 }
-
-
-

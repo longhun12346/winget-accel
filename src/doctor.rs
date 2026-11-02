@@ -67,7 +67,11 @@ pub fn run(app: &App) -> (Vec<Check>, bool) {
 
 fn check_listen(app: &App) -> Check {
     if !app.listen.ip().is_loopback() {
-        return Check::new("listen", Verdict::Fail, format!("{} 不是回环地址", app.listen));
+        return Check::new(
+            "listen",
+            Verdict::Fail,
+            format!("{} 不是回环地址", app.listen),
+        );
     }
     match std::net::TcpListener::bind(app.listen) {
         Ok(listener) => {
@@ -88,14 +92,21 @@ fn check_ca(app: &App) -> Check {
         return Check::new(
             "ca",
             Verdict::Fail,
-            format!("{} 不存在：先启动一次代理生成，再按文档信任它", path.display()),
+            format!(
+                "{} 不存在：先启动一次代理生成，再按文档信任它",
+                path.display()
+            ),
         );
     }
     let Ok(pem) = std::fs::read_to_string(&path) else {
         return Check::new("ca", Verdict::Fail, format!("{} 读不出来", path.display()));
     };
     if !pem.contains("BEGIN CERTIFICATE") {
-        return Check::new("ca", Verdict::Fail, format!("{} 不是 PEM 证书", path.display()));
+        return Check::new(
+            "ca",
+            Verdict::Fail,
+            format!("{} 不是 PEM 证书", path.display()),
+        );
     }
 
     // 授权域名记录必须与当前配置一致，否则新 host 签不出证书
@@ -105,7 +116,11 @@ fn check_ca(app: &App) -> Check {
             Ok(recorded) if recorded == app.rewrite_hosts => Check::new(
                 "ca",
                 Verdict::Pass,
-                format!("{} 存在，授权域名与配置一致（{} 个）", path.display(), recorded.len()),
+                format!(
+                    "{} 存在，授权域名与配置一致（{} 个）",
+                    path.display(),
+                    recorded.len()
+                ),
             ),
             Ok(recorded) => Check::new(
                 "ca",
@@ -120,7 +135,10 @@ fn check_ca(app: &App) -> Check {
         Err(_) => Check::new(
             "ca",
             Verdict::Warn,
-            format!("{} 缺少 ca-meta.json，无法核对授权域名", app.cert_dir.display()),
+            format!(
+                "{} 缺少 ca-meta.json，无法核对授权域名",
+                app.cert_dir.display()
+            ),
         ),
     }
 }
@@ -203,7 +221,12 @@ pub fn print(checks: &[Check]) -> bool {
     println!("{:<10} {:<5} 详情", "检查项", "结论");
     println!("{}", "-".repeat(78));
     for check in checks {
-        println!("{:<10} {:<5} {}", check.name, check.verdict.tag(), check.detail);
+        println!(
+            "{:<10} {:<5} {}",
+            check.name,
+            check.verdict.tag(),
+            check.detail
+        );
     }
     println!();
     let mut failed = false;
@@ -283,8 +306,16 @@ mod tests {
     fn multi_candidate_all_reachable_passes() {
         let file = FileConfig {
             accelerators: vec![
-                AcceleratorCfg { name: "a".into(), template: "https://a.example".into(), priority: 1 },
-                AcceleratorCfg { name: "b".into(), template: "https://b.example".into(), priority: 2 },
+                AcceleratorCfg {
+                    name: "a".into(),
+                    template: "https://a.example".into(),
+                    priority: 1,
+                },
+                AcceleratorCfg {
+                    name: "b".into(),
+                    template: "https://b.example".into(),
+                    priority: 2,
+                },
             ],
             ..Default::default()
         };
@@ -300,5 +331,3 @@ mod tests {
         assert_eq!(Verdict::Fail.tag().len(), 4);
     }
 }
-
-

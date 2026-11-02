@@ -139,8 +139,6 @@ impl Tracker {
         None
     }
 
-
-
     pub fn snapshot(&self) -> Vec<(String, Health)> {
         let states = self.states.lock().expect("健康状态锁中毒");
         self.accels
@@ -191,8 +189,7 @@ impl Tracker {
         // "太慢"要同时看绝对与相对：绝对下限挡掉基本没用的链路，
         // 相对门槛挡掉"比同期最快的差一个数量级"的链路。
         // 只用绝对门槛会在整体网络变差时把所有候选一起判死。
-        let too_slow =
-            kbps < SLOW_FLOOR_KBPS || (best > 0.0 && kbps < best * SLOW_RELATIVE_RATIO);
+        let too_slow = kbps < SLOW_FLOOR_KBPS || (best > 0.0 && kbps < best * SLOW_RELATIVE_RATIO);
 
         if too_slow {
             state.consecutive_slow = state.consecutive_slow.saturating_add(1);
@@ -311,7 +308,10 @@ mod tests {
     }
 
     fn tracker(threshold: u32) -> Tracker {
-        Tracker::new(vec![accel("a.example", 443), accel("b.example", 443)], threshold)
+        Tracker::new(
+            vec![accel("a.example", 443), accel("b.example", 443)],
+            threshold,
+        )
     }
 
     #[test]
@@ -429,11 +429,3 @@ mod tests {
         assert_eq!(got.0, 0, "应跳过不健康的候选");
     }
 }
-
-
-
-
-
-
-
-

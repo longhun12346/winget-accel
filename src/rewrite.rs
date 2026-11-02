@@ -175,7 +175,10 @@ pub fn plan(
     let mut head = String::with_capacity(256);
     head.push_str(&format!("{method} {up_path} HTTP/1.1\r\n"));
     if rewritten {
-        head.push_str(&format!("Host: {}\r\n", host_header(scheme, &up_host, up_port)));
+        head.push_str(&format!(
+            "Host: {}\r\n",
+            host_header(scheme, &up_host, up_port)
+        ));
     }
 
     for line in header_lines {
@@ -333,7 +336,10 @@ mod tests {
             &accel(),
         );
         assert!(plan.rewritten);
-        assert_eq!((plan.scheme, plan.host.as_str(), plan.port), (Scheme::Https, "gh-proxy.com", 443));
+        assert_eq!(
+            (plan.scheme, plan.host.as_str(), plan.port),
+            (Scheme::Https, "gh-proxy.com", 443)
+        );
         assert_eq!(plan.path, "/https://github.com/a.zip");
         let head = head_of(&plan);
         assert!(head.starts_with("GET /https://github.com/a.zip HTTP/1.1\r\n"));
@@ -349,7 +355,15 @@ mod tests {
             port: 9000,
             prefix: String::new(),
         };
-        let plan = plan("GET", "github.com", 443, "/x", &headers(&["Host: github.com"]), &whitelist(), &accel);
+        let plan = plan(
+            "GET",
+            "github.com",
+            443,
+            "/x",
+            &headers(&["Host: github.com"]),
+            &whitelist(),
+            &accel,
+        );
         assert!(head_of(&plan).contains("Host: 127.0.0.1:9000\r\n"));
     }
 
@@ -378,7 +392,13 @@ mod tests {
         let head = head_of(&plan).to_ascii_lowercase();
         assert!(head.contains("range: bytes=0-1023"));
         assert!(head.contains("accept: */*"));
-        for gone in ["proxy-connection", "keep-alive:", "te:", "trailer:", "upgrade:"] {
+        for gone in [
+            "proxy-connection",
+            "keep-alive:",
+            "te:",
+            "trailer:",
+            "upgrade:",
+        ] {
             assert!(!head.contains(gone), "未剥离 {gone}");
         }
         assert!(head.contains("connection: close"));
@@ -397,7 +417,10 @@ mod tests {
             &accel(),
         );
         assert!(!plan.rewritten);
-        assert_eq!((plan.scheme, plan.host.as_str(), plan.port), (Scheme::Https, "example.com", 443));
+        assert_eq!(
+            (plan.scheme, plan.host.as_str(), plan.port),
+            (Scheme::Https, "example.com", 443)
+        );
         assert_eq!(plan.path, "/index.html");
         let head = head_of(&plan);
         assert!(head.contains("Host: example.com\r\n"));
@@ -474,5 +497,3 @@ mod tests {
         assert!(err.to_string().contains("端口"), "实际: {err}");
     }
 }
-
-

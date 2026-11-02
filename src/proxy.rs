@@ -184,7 +184,8 @@ impl Proxy {
         // 换下一个再试。不把 429 直接透给客户端——winget 收到就失败了，
         // 而我们还有别的候选可用。
         let (plan, accel_idx, accel, status, size, pin_hit) = loop {
-            let Some((accel_idx, accel, from_pin)) = self.pick_for(host, &req.target, &tried) else {
+            let Some((accel_idx, accel, from_pin)) = self.pick_for(host, &req.target, &tried)
+            else {
                 // 没有可用候选（或都已试过）
                 Stats::bump(&self.stats.errors);
                 self.log.warn(&format!(
@@ -222,7 +223,11 @@ impl Proxy {
                     // 5xx：加速器自身出错（实测 imciel 会返回 502）
                     // 两类都换候选，都不该直接透给 winget —— 透过去就是下载失败。
                     let bad_status = matches!(status, 403 | 404) || status >= 500;
-                    if plan.rewritten && bad_status && retryable && tried.len() + 1 < self.health.accels().len() {
+                    if plan.rewritten
+                        && bad_status
+                        && retryable
+                        && tried.len() + 1 < self.health.accels().len()
+                    {
                         self.log.warn(&format!(
                             "ACCEL-BAD-STATUS {} 返回 {status}，换下一个候选重试",
                             accel.host
@@ -303,7 +308,11 @@ impl Proxy {
                 }
                 let tag = if plan.rewritten { "REWRITE" } else { "PASS" };
                 // 带上实际使用的加速器：否则日志无法回答"这次是哪个候选在服务"
-                let via = if plan.rewritten { accel.host.as_str() } else { "-" };
+                let via = if plan.rewritten {
+                    accel.host.as_str()
+                } else {
+                    "-"
+                };
                 let pin = if pin_hit { "bind" } else { "pick" };
                 // 只打改写后的路径（它自带目标 host），不再另外拼一遍 host ——
                 // 之前会出现 `github.com/https://github.com/...` 这种重复。
@@ -443,16 +452,19 @@ impl Proxy {
                 let ok = probe(accel, proxy.app.health_timeout);
                 proxy.health.mark(idx, ok);
                 if !ok {
-                    proxy.log.log(Level::Debug, &format!("HEALTH {} -> fail", accel.host));
+                    proxy
+                        .log
+                        .log(Level::Debug, &format!("HEALTH {} -> fail", accel.host));
                     continue;
                 }
                 // 只判"明显不可用/太慢"，不做排序（排序靠真实下载样本）
                 match probe_speed(accel, Duration::from_secs(15)) {
                     Some(kbps) => {
                         proxy.health.seed_speed(idx, kbps);
-                        proxy
-                            .log
-                            .log(Level::Debug, &format!("SPEED {} -> {:.0} KB/s", accel.host, kbps));
+                        proxy.log.log(
+                            Level::Debug,
+                            &format!("SPEED {} -> {:.0} KB/s", accel.host, kbps),
+                        );
                     }
                     None => {
                         // 拿不到探测资产**不等于服务不可用**：可能它不支持这个资产、
@@ -492,7 +504,10 @@ impl Proxy {
             Err(err) => return Ok(self.bad_gateway(plan, tls, err)),
         };
 
-        if let Err(err) = upstream.write_all(&plan.head).and_then(|()| upstream.flush()) {
+        if let Err(err) = upstream
+            .write_all(&plan.head)
+            .and_then(|()| upstream.flush())
+        {
             return Ok(self.bad_gateway(plan, tls, err.into()));
         }
 
@@ -512,7 +527,10 @@ impl Proxy {
             Err(err) => return Ok(self.bad_gateway(plan, tls, err)),
         };
 
-        if let Err(err) = upstream.write_all(&plan.head).and_then(|()| upstream.flush()) {
+        if let Err(err) = upstream
+            .write_all(&plan.head)
+            .and_then(|()| upstream.flush())
+        {
             return Ok(self.bad_gateway(plan, tls, err.into()));
         }
 
@@ -589,10 +607,8 @@ impl Proxy {
                     .iter()
                     .enumerate()
                     .map(|(i, (host, health))| {
-                        let (_, kbps, samples) = speeds
-                            .get(i)
-                            .cloned()
-                            .unwrap_or((host.clone(), 0.0, 0));
+                        let (_, kbps, samples) =
+                            speeds.get(i).cloned().unwrap_or((host.clone(), 0.0, 0));
                         crate::stats::AccelHealth {
                             host: host.clone(),
                             health: health.as_str(),
@@ -609,7 +625,12 @@ impl Proxy {
                 let body = self.stats.health_json(status, accelerators);
                 write_response(&mut stream, 200, "application/json", &body)
             }
-            _ => write_response(&mut stream, 405, "text/plain; charset=utf-8", "只支持 GET /winget-accel.pac 与 /health"),
+            _ => write_response(
+                &mut stream,
+                405,
+                "text/plain; charset=utf-8",
+                "只支持 GET /winget-accel.pac 与 /health",
+            ),
         }
     }
 }
@@ -673,9 +694,12 @@ fn probe_speed(accel: &rewrite::Accel, timeout: Duration) -> Option<f64> {
         rewrite::Scheme::Http => connect_tcp_timeout(&accel.host, accel.port, timeout).ok()?,
         rewrite::Scheme::Https => {
             let cfg = upstream_client_config();
-            let name: Result<rustls::pki_types::ServerName<'static>, _> = accel.host.clone().try_into();
+            let name: Result<rustls::pki_types::ServerName<'static>, _> =
+                accel.host.clone().try_into();
             let Ok(name) = name else { return None };
-            let Ok(conn) = ClientConnection::new(cfg, name) else { return None };
+            let Ok(conn) = ClientConnection::new(cfg, name) else {
+                return None;
+            };
             let stream = connect_tcp_timeout(&accel.host, accel.port, timeout).ok()?;
             let s = StreamOwned::new(conn, stream);
             // 用 Box 统一类型太绕，这里直接分支处理
@@ -782,15 +806,16 @@ fn split_host_port(target: &str) -> Result<(String, u16)> {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn splits_host_port() {
-        assert_eq!(split_host_port("github.com:443").unwrap(), ("github.com".into(), 443));
+        assert_eq!(
+            split_host_port("github.com:443").unwrap(),
+            ("github.com".into(), 443)
+        );
         assert_eq!(split_host_port("[::1]:8443").unwrap(), ("::1".into(), 8443));
     }
 
@@ -799,7 +824,4 @@ mod tests {
         assert!(split_host_port("github.com").is_err());
         assert!(split_host_port(":443").is_err());
     }
-
-
 }
-
