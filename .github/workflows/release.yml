@@ -40,25 +40,31 @@ jobs:
       - name: clippy（警告即失败）
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: 组装发布包
+        id: pack
+        shell: pwsh
+        run: ./packaging/make-release.ps1
+
       # 兜底校验：二进制里烧进去的版本必须等于 tag。
       # env!("CARGO_PKG_VERSION") 是编译期常量，若某处缓存导致没重新编译，
       # 这一步能立刻发现（宁可失败，也不要发出一个版本号错误的包）。
+      #
+      # 注意顺序：必须放在"组装发布包"之后 —— release 构建发生在
+      # make-release.ps1 里面，此前 target\release 下的 exe 并不存在。
+      # （v0.1.3 首次尝试就因为把这一步放在构建前而失败。）
       - name: 校验产物版本与 tag 一致
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
           $expected = $env:GITHUB_REF_NAME -replace '^v', ''
-          $actual = (& .\target\release\winget-accel.exe --version) -replace '^winget-accel\s+', ''
+          $exe = "target\release\winget-accel.exe"
+          if (-not (Test-Path $exe)) { throw "找不到构建产物: $exe" }
+          $actual = (& $exe --version) -replace '^winget-accel\s+', ''
           $actual = $actual.Trim()
           Write-Host "tag=$expected  二进制=$actual"
           if ($actual -ne $expected) {
             throw "产物版本与 tag 不一致：二进制=$actual，tag=$expected"
           }
-
-      - name: 组装发布包
-        id: pack
-        shell: pwsh
-        run: ./packaging/make-release.ps1
 
       # 冒烟：产出的 exe 必须能跑，且不依赖 VC++ 运行库
       - name: 冒烟测试产物
