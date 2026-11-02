@@ -132,6 +132,10 @@ fn write_pac(value: &str) -> Result<()> {
             value,
             "/f",
         ])
+        // stdout 也必须重定向：`reg add ... /f` 成功时会往 stdout 打
+        // "The operation completed successfully."，继承下来就会混进我们的
+        // 控制台输出（而 logger 只写自己那行，所以日志文件里反而找不到）。
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .context("调用 reg.exe 失败")?;
@@ -148,6 +152,8 @@ fn delete_pac() -> Result<()> {
     // 不存在时 reg 会返回非零，这不是错误
     let _ = Command::new("reg")
         .args(["delete", INET_KEY, "/v", "AutoConfigURL", "/f"])
+        // 同样要吞掉 stdout，理由见 write_pac
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
     Ok(())
