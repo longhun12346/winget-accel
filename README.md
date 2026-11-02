@@ -215,6 +215,22 @@ cd prototype
 
 契约与判定标准见 [docs/test-plan.md](docs/test-plan.md)。
 
+### 提交前钩子（强烈建议启用）
+
+仓库自带 `.githooks/pre-commit`，在提交前跑 `cargo fmt --check` 与 `cargo test`，
+任一失败就**拒绝提交**。启用一次即可：
+
+```powershell
+git config core.hooksPath .githooks
+```
+
+为什么需要它：我在开发中两次在没有 `test result: ok` 的情况下提交——
+一次把 `candidates.json` 写出裸换行、3 个单测挂掉仍然 push；
+一次为了让测试通过而改弱了生产判据。这类失败靠"下次注意"防不住，
+得让它在提交时**物理上通不过**。
+
+钩子只做快的两项；`clippy` 与协议用例交给 CI（它们慢，且 CI 本来就强制）。
+
 ## 仓库结构
 
 ```
