@@ -39,12 +39,23 @@ pub const CACHE_FILE_NAME: &str = "candidates.cache.json";
 /// 所以第 2、3 条现在必然失败——只有在仓库转公开、或清单另存到公开位置后才有效。
 /// 保留它们是因为那是最可能的后续形态，失败时只是回退下一条。
 /// 可用环境变量 `WINGET_ACCEL_CANDIDATES_URL` 覆盖（自建镜像、或本地验证用）。
-const UPSTREAM_URLS: [&str; 4] = [
+const UPSTREAM_URLS: [&str; 2] = [
+    // 权威源。直连不通时靠下面的加速器。
     "https://raw.githubusercontent.com/longhun12346/winget-accel/main/candidates.json",
-    "https://cdn.jsdelivr.net/gh/longhun12346/winget-accel@main/candidates.json",
-    "https://fastly.jsdelivr.net/gh/longhun12346/winget-accel@main/candidates.json",
+    // 加速器路径：内容与权威源一致（实测两者都是 43 条），只是多一跳。
     "https://gh-proxy.com/https://raw.githubusercontent.com/longhun12346/winget-accel/main/candidates.json",
 ];
+
+/// **不要**把 jsDelivr 的 `@main` 端点当成数据源。
+///
+/// 实测踩过：jsDelivr 对 `@branch` 有约 12 小时缓存。我们刚把清单从 4 条
+/// 更新到 43 条，`cdn.jsdelivr.net` 与 `fastly.jsdelivr.net` 仍返回旧的 4 条，
+/// 而 `raw.githubusercontent.com` 与加速器已是 43 条。
+/// 由于 `fetch_best` 取"最快成功"的那个，而 jsDelivr 响应更快，
+/// 结果就是**拿到了过期数据**。
+///
+/// 教训："最快"不等于"最新"。宁可多等 300 ms 拿权威源，也不要秒回旧数据。
+/// 若将来要用 jsDelivr，必须用 tag 或 commit hash 的 URL（不可变），不能用分支。
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -188,19 +199,35 @@ fn fetch_best() -> Result<(String, Vec<Candidate>)> {
     }
     drop(tx);
 
+    // 取**内容最完整**的那份，而不是"最先返回"的那份。
+    //
+    // 原因：实测中 jsDelivr 的旧缓存比权威源快，按"最快"取会拿到过期数据。
+    // 现在的做法是：等所有端点（最多 6 秒），选候选数最多的有效结果。
     let deadline = Instant::now() + Duration::from_secs(6);
     let mut errors: Vec<String> = Vec::new();
+    let mut best: Option<(String, Vec<Candidate>)> = None;
     loop {
         let remaining = match deadline.checked_duration_since(Instant::now()) {
             Some(d) if !d.is_zero() => d,
             _ => break,
         };
         match rx.recv_timeout(remaining) {
-            Ok((_url, Ok((body, list)))) if !list.is_empty() => return Ok((body, list)),
+            Ok((_url, Ok((body, list)))) if !list.is_empty() => {
+                let better = match &best {
+                    Some((_, cur)) => list.len() > cur.len(),
+                    None => true,
+                };
+                if better {
+                    best = Some((body, list));
+                }
+            }
             Ok((url, Ok(_))) => errors.push(format!("{url}: 内容为空")),
             Ok((url, Err(err))) => errors.push(format!("{url}: {err:#}")),
             Err(_) => break,
         }
+    }
+    if let Some(found) = best {
+        return Ok(found);
     }
     if errors.is_empty() {
         anyhow::bail!("所有上游都在 6 秒内没有响应");

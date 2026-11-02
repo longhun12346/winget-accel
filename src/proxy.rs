@@ -26,6 +26,22 @@ const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
 /// 同一文件的候选绑定有效期。winget 下载一个包通常几十秒到几分钟。
 const PIN_TTL: Duration = Duration::from_secs(600);
+
+/// 一轮探测的并发数。6 是折中：43 个候选串行要 120 秒，全开对第三方不礼貌。
+const PROBE_CONCURRENCY: usize = 6;
+
+/// 单个候选的测速超时。
+///
+/// 从 15 秒降到 5 秒：候选池有 43 个后，15 秒意味着个别挂住的域名
+/// 能拖垮整轮探测。5 秒足够拿到 64 KiB（实测最快 30 ms、最慢约 3 秒）。
+const PROBE_SPEED_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 单个请求最多换几次候选。
+///
+/// 之前是"试到候选用尽"，池子只有 4 个时没问题；涨到 43 个后，
+/// 一个请求最坏会依次试 43 个（每个都可能等连接超时），用户会以为卡死。
+/// 3 次足够避开个别坏候选，又不会把单个请求拖成分钟级。
+const MAX_ACCEL_RETRIES: usize = 3;
 /// 一次上游尝试的结果。
 ///
 /// 拆成三态是为了支持"换候选重试"：
@@ -247,7 +263,7 @@ impl Proxy {
                         accel.host
                     ));
                     tried.push(accel_idx);
-                    if !retryable || tried.len() >= self.health.accels().len() {
+                    if !retryable || tried.len() >= self.max_retries() {
                         Stats::bump(&self.stats.errors);
                         let _ = tls.write_all(BAD_GATEWAY);
                         tls.conn.send_close_notify();
@@ -265,7 +281,7 @@ impl Proxy {
                         self.note_accel_failure(accel_idx, &accel, &format!("{err:#}"));
                     }
                     tried.push(accel_idx);
-                    if !retryable || tried.len() >= self.health.accels().len() {
+                    if !retryable || tried.len() >= self.max_retries() {
                         let _ = tls.write_all(BAD_GATEWAY);
                         tls.conn.send_close_notify();
                         let _ = tls.flush();
@@ -448,41 +464,7 @@ impl Proxy {
         let proxy = Arc::clone(self);
 
         std::thread::spawn(move || loop {
-            for (idx, accel) in proxy.health.accels().iter().enumerate() {
-                let ok = probe(accel, proxy.app.health_timeout);
-                proxy.health.mark(idx, ok);
-                if !ok {
-                    proxy
-                        .log
-                        .log(Level::Debug, &format!("HEALTH {} -> fail", accel.host));
-                    continue;
-                }
-                // 只判"明显不可用/太慢"，不做排序（排序靠真实下载样本）
-                match probe_speed(accel, Duration::from_secs(15)) {
-                    Some(kbps) => {
-                        proxy.health.seed_speed(idx, kbps);
-                        proxy.log.log(
-                            Level::Debug,
-                            &format!("SPEED {} -> {:.0} KB/s", accel.host, kbps),
-                        );
-                    }
-                    None => {
-                        // 拿不到探测资产就是"没通过实测"，一律排除，内置的也一样。
-                        //
-                        // 这里曾经写成"内置候选保留可用"，理由是"探测资产不可达
-                        // 不代表服务不可用"。那个理由是错的，而且动机更错：
-                        // 当时是为了让协议用例通过才把生产逻辑改弱（夹具对探测请求
-                        // 返回 200 而不是 206，导致探测必然失败）。
-                        // 正确做法是让夹具正确响应，而不是放宽生产判据——
-                        // 没通过实测的候选不该进下载路径，内置的也一样。
-                        proxy.health.mark(idx, false);
-                        proxy.log.warn(&format!(
-                            "SPEED {} -> 实测失败（非 206 或数据不足），已排除",
-                            accel.host
-                        ));
-                    }
-                }
-            }
+            proxy.probe_round();
             proxy.report_health_state();
 
             // 全挂时缩短重试间隔，让恢复更快被发现
@@ -493,6 +475,74 @@ impl Proxy {
             };
             std::thread::sleep(wait);
         });
+    }
+
+    /// 一轮完整探测：**分批并发**，每批 [`PROBE_CONCURRENCY`] 个。
+    ///
+    /// 为什么要并发：候选池从 4 个涨到 43 个后，串行一轮要 120 秒
+    /// （实测 5 个 14 秒）。这段时间内大部分候选是 `Unknown`，
+    /// 权重只能按乐观值给，前几分钟的下载可能反复打到死候选。
+    ///
+    /// 为什么限 6 路而不是全开：
+    /// - 这些是第三方免费服务，43 个一起打过去不礼貌，也容易触发 429；
+    /// - 6 路 × 64 KiB 的瞬时流量对用户网络负担可忽略。
+    ///
+    /// 用分块 + `thread::scope` 而不是线程池：块内线程在 scope 结束时自动 join，
+    /// 不需要额外的池实现，也不会泄漏线程。
+    /// 实际重试上限：取常量与候选数中较小者（候选只有 2 个时不该允许试 3 次）。
+    fn max_retries(&self) -> usize {
+        MAX_ACCEL_RETRIES.min(self.health.accels().len().max(1))
+    }
+
+    fn probe_round(&self) {
+        // 快照一份候选，避免持有锁跨线程
+        let list: Vec<(usize, rewrite::Accel)> =
+            self.health.accels().iter().cloned().enumerate().collect();
+
+        for chunk in list.chunks(PROBE_CONCURRENCY) {
+            std::thread::scope(|scope| {
+                for (idx, accel) in chunk {
+                    scope.spawn(move || self.probe_one(*idx, accel));
+                }
+            });
+        }
+    }
+
+    /// 探测单个候选：先判可达，再量吞吐。
+    fn probe_one(&self, idx: usize, accel: &rewrite::Accel) {
+        let ok = probe(accel, self.app.health_timeout);
+        self.health.mark(idx, ok);
+        if !ok {
+            self.log
+                .log(Level::Debug, &format!("HEALTH {} -> fail", accel.host));
+            return;
+        }
+
+        // 只判"明显不可用/太慢"，不做排序（排序靠真实下载样本）
+        match probe_speed(accel, PROBE_SPEED_TIMEOUT) {
+            Some(kbps) => {
+                self.health.seed_speed(idx, kbps);
+                self.log.log(
+                    Level::Debug,
+                    &format!("SPEED {} -> {:.0} KB/s", accel.host, kbps),
+                );
+            }
+            None => {
+                // 拿不到探测资产就是"没通过实测"，一律排除，内置的也一样。
+                //
+                // 这里曾经写成"内置候选保留可用"，理由是"探测资产不可达
+                // 不代表服务不可用"。那个理由是错的，而且动机更错：
+                // 当时是为了让协议用例通过才把生产逻辑改弱（夹具对探测请求
+                // 返回 200 而不是 206，导致探测必然失败）。
+                // 正确做法是让夹具正确响应，而不是放宽生产判据——
+                // 没通过实测的候选不该进下载路径，内置的也一样。
+                self.health.mark(idx, false);
+                self.log.warn(&format!(
+                    "SPEED {} -> 实测失败（非 206 或数据不足），已排除",
+                    accel.host
+                ));
+            }
+        }
     }
 
     fn forward_tls(
