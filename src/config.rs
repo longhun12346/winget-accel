@@ -218,7 +218,7 @@ fn default_accelerators() -> Vec<AcceleratorCfg> {
         });
     };
 
-    let (from_file, source) = crate::candidates::load(&exe_dir());
+    let (from_file, source) = crate::candidates::load(&exe_dir(), true);
     for (i, c) in from_file.iter().enumerate() {
         push(&c.name, &c.template, i as u32 + 1, &mut out, &mut seen);
     }
