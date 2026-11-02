@@ -207,3 +207,4 @@ curl.exe -sL --max-time 60 -o WingetRest.yaml `
 ```
 
 > 提醒：以上每条只取 ≤768 KB，不要在此基础上加并发——`research.md` §4 的教训仍然有效。
+
