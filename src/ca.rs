@@ -54,14 +54,14 @@ impl CertAuthority {
         if cert_path.exists() {
             let info = expiry_info(&cert_path);
             if info.is_none() {
-                println!("⚠ 无法读取 CA 有效期（Win32 证书 API 未返回结果），跳过到期检查。");
+                crate::log::warn("无法读取 CA 有效期（Win32 证书 API 未返回结果），跳过到期检查。");
             }
             if let Some((thumb, days)) = info {
                 if days <= RENEW_BEFORE_DAYS {
-                    println!(
+                    crate::log::warn(&format!(
                         "本机 CA 有效期剩余 {days} 天（阈值 {RENEW_BEFORE_DAYS} 天），自动轮换：\
                          移除旧证书并重新生成，需要重新信任一次。"
-                    );
+                    ));
                     remove_trusted_ca(&thumb);
                     let _ = std::fs::remove_file(&cert_path);
                     let _ = std::fs::remove_file(&key_path);
@@ -285,9 +285,9 @@ fn remove_trusted_ca(thumbprint: &str) {
         .map(|s| s.success())
         .unwrap_or(false);
     if !ok {
-        println!(
-            "⚠ 移除旧 CA 失败（certutil -delstore 返回非零）。\
-             若该环境不支持，请用 certmgr.msc 手工删除后再启动。"
+        crate::log::warn(
+            "移除旧 CA 失败（certutil -delstore 返回非零）。\
+             若该环境不支持，请用 certmgr.msc 手工删除后再启动。",
         );
     }
 }

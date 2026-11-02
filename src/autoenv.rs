@@ -94,9 +94,9 @@ impl Drop for EnvGuard {
         };
         if result.is_ok() {
             let _ = std::fs::remove_file(&self.state_path);
-            println!("\n已还原系统 PAC 设置。");
+            crate::log::info("已还原系统 PAC 设置。");
         } else {
-            println!("\n⚠ 还原 PAC 失败，请手动检查 Internet Settings 的 AutoConfigURL。");
+            crate::log::warn("还原 PAC 失败，请手动检查 Internet Settings 的 AutoConfigURL。");
         }
     }
 }
@@ -175,11 +175,11 @@ fn ca_is_trusted(ca_pem: &Path) -> bool {
 /// 所以必须轮询 + 超时，超时后给出可手工执行的命令。
 fn ensure_ca_trusted(ca_pem: &Path) -> Result<()> {
     if ca_is_trusted(ca_pem) {
-        println!("本机 CA 已被信任，跳过导入。");
+        crate::log::info("本机 CA 已被信任，跳过导入。");
         return Ok(());
     }
 
-    println!("需要把本机 CA 加入「受信任的根证书」。稍后会弹一次确认框，请点「是」。");
+    crate::log::info("需要把本机 CA 加入「受信任的根证书」。稍后会弹一次确认框，请点「是」。");
     let mut child = Command::new("certutil")
         .args(["-user", "-addstore", "Root"])
         .arg(ca_pem)
@@ -193,7 +193,7 @@ fn ensure_ca_trusted(ca_pem: &Path) -> Result<()> {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if status.success() {
-                    println!("CA 已加入受信任的根证书。");
+                    crate::log::info("CA 已加入受信任的根证书。");
                     return Ok(());
                 }
                 bail!(

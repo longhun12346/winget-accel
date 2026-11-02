@@ -61,12 +61,67 @@ pub struct Logger {
     lock: Mutex<()>,
 }
 
+/// 全局 logger。
+///
+/// 为什么需要：`autoenv`（装 CA / 设 PAC / 退出还原）与 `ca`（到期轮换）
+/// 里的都是**运行时事件**，必须进日志；但这两个模块拿不到 `Arc<Logger>`。
+/// 它们原先用裸 `println!`，导致这些最关键的行既没有级别/颜色，
+/// 也**不写进日志文件**——用户回头排查时恰恰看不到它们。
+static GLOBAL: std::sync::OnceLock<Mutex<GlobalState>> = std::sync::OnceLock::new();
+
+struct GlobalState {
+    level: Level,
+    path: PathBuf,
+    color: bool,
+}
+
+/// 用全局 logger 输出；未初始化时退化为纯文本 println（保持可用）。
+pub fn info(msg: &str) {
+    emit(Level::Info, msg);
+}
+
+pub fn warn(msg: &str) {
+    emit(Level::Warn, msg);
+}
+
+fn emit(level: Level, msg: &str) {
+    let Some(state) = GLOBAL.get() else {
+        println!("{msg}");
+        return;
+    };
+    let guard = state.lock().expect("日志锁中毒");
+    if level > guard.level {
+        return;
+    }
+    let plain = format!("{} {} {msg}", timestamp(), level.tag());
+    if guard.color {
+        println!("{}{plain}{RESET}", level.color());
+    } else {
+        println!("{plain}");
+    }
+    write_file(&guard.path, &plain);
+}
+
+/// 追加一行到日志文件。失败静默 —— 日志不该影响主流程。
+fn write_file(path: &std::path::Path, line: &str) {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 impl Logger {
     pub fn new(level: Level, path: PathBuf) -> Self {
+        let color = crate::console::enable_ansi();
+        // 首次创建时登记为全局，供 autoenv / ca 使用
+        let _ = GLOBAL.set(Mutex::new(GlobalState {
+            level,
+            path: path.clone(),
+            color,
+        }));
         Self {
             level,
             path,
-            color: crate::console::enable_ansi(),
+            color,
             lock: Mutex::new(()),
         }
     }
