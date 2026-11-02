@@ -76,7 +76,6 @@ $comment = $null
 $builtinTemplates = @{}
 $known = @{}
 $failures = @{}
-$passStreak = @{}
 
 if (Test-Path $outPath) {
     $raw = Get-Content $outPath -Raw | ConvertFrom-Json
@@ -92,7 +91,6 @@ if (Test-Path $outPath) {
         $h = Get-HostFromTemplate $w.template
         if (-not $known.ContainsKey($h)) { $known[$h] = $w }
         if ($w.PSObject.Properties.Name -contains 'failures') { $failures[$h] = [int]$w.failures }
-        if ($w.PSObject.Properties.Name -contains 'passes') { $passStreak[$h] = [int]$w.passes }
     }
     Write-Host "现有清单: $(@($raw.candidates).Count) 个候选 + $(@($raw.watchlist).Count) 个观察项"
 }
@@ -285,17 +283,16 @@ foreach ($r in $ok) {
     $tpl = "https://$($r.host)/{url}"
     $name = $r.host -replace '\.[^.]+$', '' -replace '[^a-z0-9]+', '-'
 
-    # 已释放过（在 watchlist 且通过过一次）→ 直接启用；首次通过 → 先记一轮。
-    # 这不是"人工判断"：判据是机械的（连续两次通过实测），目的是过滤掉
-    # 只在某一瞬间侥幸通过的域名。下一轮仍然通过就自动进调度池。
-    $priorPasses = $passStreak[$r.host]
-    if ($FirstPassOnly -or $priorPasses -lt 1) {
+    # 通过实测即启用。不加任何"观察期/第二轮"之类的额外门槛：
+    # 判据本身已经够严（206 + 64 KiB + 与直连 GitHub 字节一致），
+    # 且运行时会再探测一次，失败会被换候选重试兜住。
+    # 早先我擅自加过"连续两轮通过才启用"，那等于把"自动启用"变成延迟一天，是错的。
+    if ($FirstPassOnly) {
         $newWatchlist.Add([ordered]@{
                 name     = $name
                 template = $tpl
-                reason   = "新发现且实测通过（$($r.kbps) KB/s）；下一轮仍通过则自动启用"
+                reason   = "实测通过（$($r.kbps) KB/s）；-FirstPassOnly 下仅观察不启用"
                 failures = 0
-                passes   = 1
             })
     }
     else {
@@ -303,7 +300,7 @@ foreach ($r in $ok) {
                 name     = $name
                 template = $tpl
                 builtin  = $false
-                verified = [ordered]@{ date = $today; kbps = $r.kbps; note = "自动启用，实测 $($r.kbps) KB/s" }
+                verified = [ordered]@{ date = $today; kbps = $r.kbps; note = "实测通过，已启用（$($r.kbps) KB/s）" }
             })
     }
 }
@@ -365,6 +362,9 @@ if ($env:GITHUB_OUTPUT) {
     "watchlist=$($newWatchlist.Count)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
     "mismatch=$($mismatch.Count)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 }
+
+
+
 
 
 
