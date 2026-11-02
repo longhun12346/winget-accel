@@ -1,0 +1,48 @@
+#!/bin/sh
+# 提交前检查：格式化与单测。任一失败即拒绝提交。
+#
+# 为什么要有这个钩子：我连着两次在没有 "test result: ok" 的情况下提交
+# （一次把 candidates.json 写坏、3 个单测挂掉仍然 commit && push；
+#  一次把生产判据改弱去迁就测试）。靠"下次注意"不管用，得让失败物理上提交不了。
+#
+# 启用方式（仓库已配置 core.hooksPath）：
+#   git config core.hooksPath .githooks
+#
+# 只做两件快的事；clippy 与协议用例交给 CI（它们慢，且 CI 本来就强制）。
+
+set -u
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$REPO_ROOT" || exit 0
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "[pre-commit] 警告：找不到 cargo，跳过检查（请在装好 Rust 的环境提交）" >&2
+    exit 0
+fi
+
+echo "[pre-commit] cargo fmt --check ..."
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+    echo "" >&2
+    echo "[pre-commit] 格式不符合 rustfmt。已拒绝提交。" >&2
+    echo "            执行 cargo fmt --all 后重新提交。" >&2
+    echo "            （CI 的 rustfmt 步骤会因此失败，本地先拦住）" >&2
+    exit 1
+fi
+
+echo "[pre-commit] cargo test ..."
+# 用 --quiet 但保留失败信息；输出捕获到临时文件，失败时才打印，
+# 避免每次提交都刷一屏测试输出。
+OUT=$(mktemp 2>/dev/null || echo /tmp/precommit.$$)
+if ! cargo test --quiet >"$OUT" 2>&1; then
+    echo "" >&2
+    echo "[pre-commit] 单测失败。已拒绝提交。" >&2
+    echo "------------ 测试输出 ------------" >&2
+    tail -n 40 "$OUT" >&2
+    echo "----------------------------------" >&2
+    rm -f "$OUT"
+    exit 1
+fi
+rm -f "$OUT"
+
+echo "[pre-commit] 通过。"
+exit 0
