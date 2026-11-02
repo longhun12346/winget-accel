@@ -24,8 +24,8 @@
       "builtin": true,
       "verified": {
         "date": "2026-11-02",
-        "kbps": 521,
-        "note": "唯一够格内嵌的：独立站点、多项目引用、多次实测最快的记录"
+        "kbps": 128,
+        "note": "实测 128 KB/s"
       }
     },
     {
@@ -34,18 +34,8 @@
       "builtin": true,
       "verified": {
         "date": "2026-11-02",
-        "kbps": 179,
-        "note": "实测可用作备份；曾经历失效→恢复，不足以当唯一依赖"
-      }
-    },
-    {
-      "name": "ghproxy-site",
-      "template": "https://ghproxy.site/{url}",
-      "builtin": true,
-      "verified": {
-        "date": "2026-11-02",
-        "kbps": 113,
-        "note": "实测可用作备份；多次测量中偏慢"
+        "kbps": 87,
+        "note": "实测 87 KB/s"
       }
     },
     {
@@ -54,41 +44,535 @@
       "builtin": true,
       "verified": {
         "date": "2026-11-02",
-        "kbps": 227,
-        "note": "实测可用作备份；但会返回 502，靠换候选重试兜住"
+        "kbps": 320,
+        "note": "实测 320 KB/s"
+      }
+    },
+    {
+      "name": "ghproxy-site",
+      "template": "https://ghproxy.site/{url}",
+      "builtin": true,
+      "verified": {
+        "date": "2026-11-02",
+        "kbps": 357,
+        "note": "实测 357 KB/s"
       }
     }
   ],
   "watchlist": [
     {
-      "name": "geekertao",
+      "name": "ghproxy",
+      "template": "https://ghproxy.icu/{url}",
+      "reason": "新发现且实测通过（393 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "ghp-keleyaa",
+      "template": "https://ghp.keleyaa.com/{url}",
+      "reason": "新发现且实测通过（286 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "fastgit",
+      "template": "https://fastgit.cc/{url}",
+      "reason": "新发现且实测通过（285 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "github-mxw-qzz",
+      "template": "https://github.mxw.qzz.io/{url}",
+      "reason": "新发现且实测通过（246 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gh-chjina",
+      "template": "https://gh.chjina.com/{url}",
+      "reason": "新发现且实测通过（239 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "tvv",
+      "template": "https://tvv.tw/{url}",
+      "reason": "新发现且实测通过（237 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "ghgo-de5",
+      "template": "https://ghgo.de5.net/{url}",
+      "reason": "新发现且实测通过（235 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gh-geekertao",
       "template": "https://gh.geekertao.top/{url}",
-      "reason": "速度波动极大（同日 703 → 104 KB/s），且与下面 3 个同属一个运营方，同时失效风险高。降为观察项。"
+      "reason": "新发现且实测通过（146 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
     },
     {
-      "name": "geekertao-file",
+      "name": "gh-my-website-ccwu",
+      "template": "https://gh.my-website.ccwu.cc/{url}",
+      "reason": "新发现且实测通过（137 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gh-07150721",
+      "template": "https://gh.07150721.xyz/{url}",
+      "reason": "新发现且实测通过（135 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "cdn-gh-proxy",
+      "template": "https://cdn.gh-proxy.com/{url}",
+      "reason": "新发现且实测通过（128 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gh-noki",
+      "template": "https://gh.noki.icu/{url}",
+      "reason": "新发现且实测通过（127 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gh-acmsz",
+      "template": "https://gh.acmsz.top/{url}",
+      "reason": "新发现且实测通过（99 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "github-ednovas",
+      "template": "https://github.ednovas.xyz/{url}",
+      "reason": "新发现且实测通过（94 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "g-z321-cc",
+      "template": "https://g.z321.cc.cd/{url}",
+      "reason": "新发现且实测通过（93 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "down-mxw-xx",
+      "template": "https://down.mxw.xx.kg/{url}",
+      "reason": "新发现且实测通过（89 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "down-mxw-qzz",
+      "template": "https://down.mxw.qzz.io/{url}",
+      "reason": "新发现且实测通过（88 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "jiashu-1win-eu",
+      "template": "https://jiashu.1win.eu.org/{url}",
+      "reason": "新发现且实测通过（88 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gh-monlor",
+      "template": "https://gh.monlor.com/{url}",
+      "reason": "新发现且实测通过（85 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "git-yylx",
+      "template": "https://git.yylx.win/{url}",
+      "reason": "新发现且实测通过（84 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gg-z321-cc",
+      "template": "https://gg.z321.cc.cd/{url}",
+      "reason": "新发现且实测通过（81 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gh-dpik",
+      "template": "https://gh.dpik.top/{url}",
+      "reason": "新发现且实测通过（79 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gh-jjj-gv",
+      "template": "https://gh.jjj.gv.uy/{url}",
+      "reason": "新发现且实测通过（71 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "github-tbap",
+      "template": "https://github.tbap.top/{url}",
+      "reason": "新发现且实测通过（63 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "ghfile-geekertao",
       "template": "https://ghfile.geekertao.top/{url}",
-      "reason": "与 gh.geekertao.top 同源；实测 429"
+      "reason": "新发现且实测通过（62 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
     },
     {
-      "name": "dpik",
-      "template": "https://github.dpik.top/{url}",
-      "reason": "实测 429"
+      "name": "ghm-078465",
+      "template": "https://ghm.078465.xyz/{url}",
+      "reason": "新发现且实测通过（55 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
     },
     {
-      "name": "felicity",
-      "template": "https://gh.felicity.ac.cn/{url}",
-      "reason": "实测 429"
+      "name": "github-xxlab",
+      "template": "https://github.xxlab.tech/{url}",
+      "reason": "新发现且实测通过（52 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
     },
     {
-      "name": "ddlc",
-      "template": "https://gh.ddlc.top/{url}",
-      "reason": "实测 429（活着但限流）。不排除，交 CI 定期实测决定是否晋升。"
+      "name": "cdn-akaere",
+      "template": "https://cdn.akaere.online/{url}",
+      "reason": "新发现且实测通过（43 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
     },
     {
-      "name": "ghproxy-net",
+      "name": "g-blfrp",
+      "template": "https://g.blfrp.cn/{url}",
+      "reason": "新发现且实测通过（42 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "git-669966",
+      "template": "https://git.669966.xyz/{url}",
+      "reason": "新发现且实测通过（41 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "github-chenc",
+      "template": "https://github.chenc.dev/{url}",
+      "reason": "新发现且实测通过（40 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gh-inkchills",
+      "template": "https://gh.inkchills.cn/{url}",
+      "reason": "新发现且实测通过（36 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gh-beimengvv",
+      "template": "https://gh.beimengvv.xyz/{url}",
+      "reason": "新发现且实测通过（35 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gh-qfmc0721-cc",
+      "template": "https://gh.qfmc0721.cc.cd/{url}",
+      "reason": "新发现且实测通过（32 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "free-cn-eu",
+      "template": "https://free.cn.eu.org/{url}",
+      "reason": "新发现且实测通过（31 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "ghproxy-felicity",
+      "template": "https://ghproxy.felicity.land/{url}",
+      "reason": "新发现且实测通过（26 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "xsadwsd-kdns",
+      "template": "https://xsadwsd.kdns.fr/{url}",
+      "reason": "新发现且实测通过（24 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "gh-sixyin",
+      "template": "https://gh.sixyin.com/{url}",
+      "reason": "新发现且实测通过（21 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "ghproxy",
       "template": "https://ghproxy.net/{url}",
-      "reason": "magicnet 文档列为候选，我们尚未实测"
+      "reason": "新发现且实测通过（8 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "proxy-yaoyaoling",
+      "template": "https://proxy.yaoyaoling.net/{url}",
+      "reason": "新发现且实测通过（4 KB/s）；下一轮仍通过则自动启用",
+      "failures": 0,
+      "passes": 1
+    },
+    {
+      "name": "github-dpik",
+      "template": "https://github.dpik.top/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 1 次",
+      "failures": 1
+    },
+    {
+      "name": "github-proxy-memory-echoes",
+      "template": "https://github-proxy.memory-echoes.cn/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 1 次",
+      "failures": 1
+    },
+    {
+      "name": "gh-felicity-ac",
+      "template": "https://gh.felicity.ac.cn/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 1 次",
+      "failures": 1
+    },
+    {
+      "name": "gitproxy-mrhjx",
+      "template": "https://gitproxy.mrhjx.cn/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 1 次",
+      "failures": 1
+    },
+    {
+      "name": "gh-ddlc",
+      "template": "https://gh.ddlc.top/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 1 次",
+      "failures": 1
+    },
+    {
+      "name": "ghproxy-cxkpro",
+      "template": "https://ghproxy.cxkpro.top/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 1 次",
+      "failures": 1
+    },
+    {
+      "name": "gh-idayer",
+      "template": "https://gh.idayer.com/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 1 次",
+      "failures": 1
+    },
+    {
+      "name": "github-starrlzy",
+      "template": "https://github.starrlzy.cn/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "j-1lin-dpdns",
+      "template": "https://j.1lin.dpdns.org/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "gh-bugdey-us",
+      "template": "https://gh.bugdey.us.kg/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "j-1win-ggff",
+      "template": "https://j.1win.ggff.net/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "gitproxy-127731",
+      "template": "https://gitproxy.127731.xyz/{url}",
+      "reason": "实测不可用（状态 521）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "gh-catmak",
+      "template": "https://gh.catmak.name/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "github-tmby",
+      "template": "https://github.tmby.shop/{url}",
+      "reason": "实测不可用（状态 401）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "ghpr",
+      "template": "https://ghpr.cc/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "slink",
+      "template": "https://slink.ltd/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "gh-tryxd",
+      "template": "https://gh.tryxd.cn/{url}",
+      "reason": "实测不可用（状态 206）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "gitproxy",
+      "template": "https://gitproxy.click/{url}",
+      "reason": "实测不可用（状态 200）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "ghpxy-hwinzniej",
+      "template": "https://ghpxy.hwinzniej.top/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "gh-jasonzeng",
+      "template": "https://gh.jasonzeng.dev/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "github-geekery",
+      "template": "https://github.geekery.cn/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "gp-zkitefly-eu",
+      "template": "https://gp.zkitefly.eu.org/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "ghproxy-1888866",
+      "template": "https://ghproxy.1888866.xyz/{url}",
+      "reason": "实测不可用（状态 525）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "ghp-arslantu",
+      "template": "https://ghp.arslantu.xyz/{url}",
+      "reason": "实测不可用（状态 525）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "githubdog",
+      "template": "https://githubdog.com/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "gh-meali",
+      "template": "https://gh.meali.top/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "ghproxy-monkeyray",
+      "template": "https://ghproxy.monkeyray.net/{url}",
+      "reason": "实测不可用（状态 404）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "js-jiangss",
+      "template": "https://js.jiangss.shop/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "gap-andyjin",
+      "template": "https://gap.andyjin.website/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "777-z321-cc",
+      "template": "https://777.z321.cc.cd/{url}",
+      "reason": "实测不可用（状态 200）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "github-ikgy",
+      "template": "https://github.ikgy.top/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "cfgh-ikgy",
+      "template": "https://cfgh.ikgy.top/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "github-cf-947563",
+      "template": "https://github-cf.947563.xyz/{url}",
+      "reason": "实测不可用（状态 521）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "github-gohj99",
+      "template": "https://github.gohj99.site/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "githubproxy-gohj99",
+      "template": "https://githubproxy.gohj99.site/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "gh-927223",
+      "template": "https://gh.927223.xyz/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "gh-ruan-dpdns",
+      "template": "https://gh.ruan.dpdns.org/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "github-nswrz",
+      "template": "https://github.nswrz.cn/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "gh-zhai-edu",
+      "template": "https://gh.zhai.edu.pl/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
     }
   ]
 }
