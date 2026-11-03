@@ -5,6 +5,13 @@ winget-accel — 让 winget 在国内网络下能下得动
 再由它把请求转给 GitHub 加速服务。winget 的命令、源、清单都不变，
 只有"下载安装包"这一段被加速。
 
+
+不支持 git clone
+----------------
+本工具只针对 winget 安装包下载，不是 GitHub 通用代理。
+git clone / git-upload-pack 等路径会被 PAC 默认设为 DIRECT，
+本工具不保证也不承诺 git clone 的兼容性或速度。
+
 下载速度实测：从 21 KB/s（直连，winget 会 37 秒超时失败）
 提升到 300–700 KB/s（经本代理）。
 

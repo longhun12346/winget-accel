@@ -139,6 +139,10 @@ impl Tracker {
         None
     }
 
+    pub fn is_healthy(&self, idx: usize) -> bool {
+        let states = self.states.lock().expect("健康状态锁中毒");
+        matches!(states.get(idx), Some(state) if state.health == Health::Healthy)
+    }
     pub fn snapshot(&self) -> Vec<(String, Health)> {
         let states = self.states.lock().expect("健康状态锁中毒");
         self.accels
@@ -223,10 +227,10 @@ impl Tracker {
     ///
     /// 用加权随机而非"永远选最快"：流量全压一个更容易把它打到限流。
     /// 样本不足的候选按当前最大值（乐观）参与，避免"还没数据"被永久压掉。
-    pub fn pick_excluding(&self, exclude: &[usize]) -> Option<(usize, Accel)> {
+    pub fn pick_verified_excluding(&self, exclude: &[usize]) -> Option<(usize, Accel)> {
         let states = self.states.lock().expect("健康状态锁中毒");
         let cands: Vec<usize> = (0..states.len())
-            .filter(|&i| !exclude.contains(&i) && states[i].health != Health::Unhealthy)
+            .filter(|&i| !exclude.contains(&i) && states[i].health == Health::Healthy)
             .collect();
         if cands.is_empty() {
             return None;
@@ -411,21 +415,24 @@ mod tests {
     #[test]
     fn pick_excluding_respects_exclusions() {
         let t = tracker(2);
+        t.mark(0, true);
+        t.mark(1, true);
         // 加权随机下不假定选中谁，只验证"落在允许集合里"
-        let first = t.pick_excluding(&[]).unwrap();
+        let first = t.pick_verified_excluding(&[]).unwrap();
         assert!(first.0 < 2, "索引必须有效");
         // 排除 0 之后只能给 1
-        let second = t.pick_excluding(&[0]).unwrap();
+        let second = t.pick_verified_excluding(&[0]).unwrap();
         assert_eq!(second.0, 1, "排除 0 后只能是 1");
         // 都排除则没有可用
-        assert!(t.pick_excluding(&[0, 1]).is_none());
+        assert!(t.pick_verified_excluding(&[0, 1]).is_none());
     }
 
     #[test]
     fn pick_excluding_skips_unhealthy() {
         let t = tracker(1);
+        t.mark(0, true);
         t.mark(1, false);
-        let got = t.pick_excluding(&[]).unwrap();
+        let got = t.pick_verified_excluding(&[]).unwrap();
         assert_eq!(got.0, 0, "应跳过不健康的候选");
     }
 
@@ -438,7 +445,7 @@ mod tests {
         t.mark(0, true);
         t.mark(1, false);
         for _ in 0..50 {
-            let picked = t.pick_excluding(&[]).expect("至少有 0 号可用");
+            let picked = t.pick_verified_excluding(&[]).expect("至少有 0 号可用");
             assert_eq!(picked.0, 0, "1 号未通过实测，不应被选中");
         }
     }
@@ -449,9 +456,26 @@ mod tests {
         t.mark(0, false);
         t.mark(1, false);
         assert!(
-            t.pick_excluding(&[]).is_none(),
+            t.pick_verified_excluding(&[]).is_none(),
             "全部未通过实测时应返回 None（由调用方回 502），不能拿坏候选凑数"
         );
         assert!(t.all_unhealthy());
+    }
+    #[test]
+    fn verified_picker_never_returns_unknown() {
+        let t = tracker(2);
+        assert!(t.pick_verified_excluding(&[]).is_none());
+        t.mark(0, true);
+        assert_eq!(t.pick_verified_excluding(&[]).unwrap().0, 0);
+    }
+
+    #[test]
+    fn unhealthy_is_not_healthy() {
+        let t = tracker(1);
+        assert!(!t.is_healthy(0));
+        t.mark(0, false);
+        assert!(!t.is_healthy(0));
+        t.mark(0, true);
+        assert!(t.is_healthy(0));
     }
 }

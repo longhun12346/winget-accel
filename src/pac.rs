@@ -7,8 +7,6 @@
 //! 例外：`github.com` 本身按**路径**细分，只把下载类路径交给代理——
 //! 详见 [`build`] 的说明（`git clone` 依赖 POST 请求体，本代理不转发）。
 
-use crate::config::DEFAULT_REWRITE_HOSTS;
-
 /// 主站域名。它的 PAC 规则按路径细分，其它 host 整站代理。
 const GITHUB: &str = "github.com";
 /// 生成 PAC 脚本。
@@ -70,16 +68,6 @@ const PATH_CHECKS: &str = concat!(
     " || shExpMatch(url, \"*/raw/*\")",
     " || shExpMatch(url, \"*/blob/*\")"
 );
-
-/// 默认端口下生成 PAC（给 `--print-pac` 之类的便捷场景用）。
-#[allow(dead_code)]
-pub fn build_default(port: u16) -> String {
-    let hosts: Vec<String> = DEFAULT_REWRITE_HOSTS
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    build(port, &hosts)
-}
 
 #[cfg(test)]
 mod tests {

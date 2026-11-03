@@ -15,7 +15,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 /// 编译期嵌入的清单（来自仓库根的 candidates.json）。
@@ -126,17 +126,18 @@ pub fn load(dir: &Path, allow_fetch: bool) -> (Vec<Candidate>, String) {
     if allow_fetch {
         let started = std::time::Instant::now();
         match fetch_best() {
-            Ok((body, list)) => {
+            Ok((body, list, url)) => {
                 // 缓存是给"下次离线"用的兜底，写失败不影响本次
                 if let Err(err) = std::fs::write(&cache, &body) {
                     crate::log::warn(&format!("候选清单缓存写入失败（{err}）"));
                 }
                 crate::log::info(&format!(
-                    "已从上游获取候选清单：{} 条，耗时 {} ms",
+                    "已从上游获取候选清单：{} 条，来源={}，耗时 {} ms",
                     list.len(),
+                    url,
                     started.elapsed().as_millis()
                 ));
-                return (list, "上游获取".to_string());
+                return (list, format!("上游获取: {url}"));
             }
             Err(err) => {
                 crate::log::warn(&format!(
@@ -175,7 +176,7 @@ pub fn load(dir: &Path, allow_fetch: bool) -> (Vec<Candidate>, String) {
 /// 并发后总耗时约等于最快那个端点的响应时间（实测 351 ms – 1.7 s）。
 ///
 /// 总预算 6 秒；超时或全部失败则报错，由调用方回退缓存/内置清单。
-fn fetch_best() -> Result<(String, Vec<Candidate>)> {
+fn fetch_best() -> Result<(String, Vec<Candidate>, String)> {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -185,6 +186,9 @@ fn fetch_best() -> Result<(String, Vec<Candidate>)> {
         Some(u) if !u.trim().is_empty() => vec![u.trim().to_string()],
         _ => UPSTREAM_URLS.iter().map(|u| (*u).to_string()).collect(),
     };
+
+    let known_urls = urls.clone();
+    let mut seen: Vec<String> = Vec::new();
 
     let (tx, rx) = mpsc::channel();
     for url in urls {
@@ -205,25 +209,41 @@ fn fetch_best() -> Result<(String, Vec<Candidate>)> {
     // 现在的做法是：等所有端点（最多 6 秒），选候选数最多的有效结果。
     let deadline = Instant::now() + Duration::from_secs(6);
     let mut errors: Vec<String> = Vec::new();
-    let mut best: Option<(String, Vec<Candidate>)> = None;
+    let mut best: Option<(String, Vec<Candidate>, String)> = None;
     loop {
         let remaining = match deadline.checked_duration_since(Instant::now()) {
             Some(d) if !d.is_zero() => d,
             _ => break,
         };
         match rx.recv_timeout(remaining) {
-            Ok((_url, Ok((body, list)))) if !list.is_empty() => {
+            Ok((url, Ok((body, list)))) if !list.is_empty() => {
+                seen.push(url.clone());
+                crate::log::info(&format!("候选源成功: {url} -> {} 条", list.len()));
                 let better = match &best {
-                    Some((_, cur)) => list.len() > cur.len(),
+                    Some((_, cur, _)) => list.len() > cur.len(),
                     None => true,
                 };
                 if better {
-                    best = Some((body, list));
+                    best = Some((body, list, url));
                 }
             }
-            Ok((url, Ok(_))) => errors.push(format!("{url}: 内容为空")),
-            Ok((url, Err(err))) => errors.push(format!("{url}: {err:#}")),
+            Ok((url, Ok(_))) => {
+                seen.push(url.clone());
+                crate::log::warn(&format!("候选源返回空内容: {url}"));
+                errors.push(format!("{url}: 内容为空"));
+            }
+            Ok((url, Err(err))) => {
+                seen.push(url.clone());
+                crate::log::warn(&format!("候选源失败: {url}: {err:#}"));
+                errors.push(format!("{url}: {err:#}"));
+            }
             Err(_) => break,
+        }
+    }
+    for url in known_urls {
+        if !seen.contains(&url) {
+            crate::log::warn(&format!("候选源超时: {url}: 6 秒内未返回"));
+            errors.push(format!("{url}: 6 秒内未返回"));
         }
     }
     if let Some(found) = best {
@@ -359,20 +379,29 @@ fn split_http_response(raw: &[u8]) -> Result<(String, Vec<u8>)> {
     {
         let mut out = Vec::new();
         let mut rest = body;
+        let mut saw_last = false;
         while let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") {
-            let size_str = String::from_utf8_lossy(&rest[..line_end]);
-            let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
+            let size_text = String::from_utf8_lossy(&rest[..line_end]);
+            let size_str = size_text.split(';').next().unwrap_or("").trim();
+            let size = usize::from_str_radix(size_str, 16)
+                .with_context(|| format!("非法 chunk 大小: {size_str:?}"))?;
             if size == 0 {
+                saw_last = true;
                 break;
             }
             let start = line_end + 2;
-            let end = start + size;
-            if end > rest.len() {
-                out.extend_from_slice(&rest[start..]);
-                break;
+            let end = start.checked_add(size).context("chunk 大小溢出")?;
+            if end + 2 > rest.len() {
+                bail!("chunked 响应中的 chunk 数据不完整");
             }
             out.extend_from_slice(&rest[start..end]);
-            rest = &rest[(end + 2).min(rest.len())..];
+            if &rest[end..end + 2] != b"\r\n" {
+                bail!("chunk 数据后缺少 CRLF");
+            }
+            rest = &rest[end + 2..];
+        }
+        if !saw_last {
+            bail!("chunked 响应缺少终止块");
         }
         return Ok((head, out));
     }
@@ -570,5 +599,30 @@ mod tests {
     #[test]
     fn split_response_without_blank_line_is_error() {
         assert!(split_http_response(b"HTTP/1.1 200 OK").is_err());
+    }
+    #[test]
+    fn split_response_handles_chunk_extensions() {
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;foo=bar\r\nhello\r\n0\r\n\r\n";
+        let (_, body) = split_http_response(raw).unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn split_response_rejects_invalid_chunk_size() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n";
+        assert!(split_http_response(raw).is_err());
+    }
+
+    #[test]
+    fn split_response_rejects_truncated_chunk() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel";
+        assert!(split_http_response(raw).is_err());
+    }
+
+    #[test]
+    fn split_response_rejects_missing_terminal_chunk() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+        assert!(split_http_response(raw).is_err());
     }
 }

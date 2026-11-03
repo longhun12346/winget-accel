@@ -1,6 +1,6 @@
 # 测试用例（行为契约）
 
-> 状态：**可执行**。`prototype/tests/` 下 52 个用例，2026-11-01 在本机全绿。
+> 状态：**可执行**。`prototype/tests/` 下 55 个用例，2026-11-01 在本机全绿。
 > 本文是这些用例的索引与判定标准，也是 Rust 版必须对齐的契约。
 > 运行方式见 §6。
 
@@ -106,6 +106,9 @@ PAC 是 JScript，这里不做 JS 求值，只锁定生成文本的结构；真�
 | ERR-01 | 上游 502 原样透传，不改写状态码 | `test_upstream_error_status_is_passed_through` |
 | ERR-02 | 加速器不可达时**快速**返回 502（不挂到超时），`errors` 计数 +1 | `test_unreachable_accel_returns_502_quickly` |
 | ERR-03 | 同端口第二个实例启动即失败（防 `SO_REUSEADDR` 静默抢占） | `test_second_instance_on_same_port_fails_fast` |
+| ERR-04 | 非白名单隧道连接失败返回 502 | `test_unreachable_tunnel_returns_502` |
+| ERR-05 | 上游中途截断时客户端失败、日志记录 `RELAY-ERR` 且解除 pin | `test_truncated_upstream_body_closes_client_and_clears_pin` |
+| ERR-06 | Range 请求被上游忽略并返回 200 时，代理返回 502，不把 2B 当完整文件 | `test_range_request_upstream_200_is_rejected` |
 
 ### 隧道 `TUN`
 
@@ -161,7 +164,7 @@ SYS-01/02/03/05 已在 2026-11-01 用 **Rust 二进制**实跑一遍：
 
 ```powershell
 cd prototype
-.\.venv\Scripts\python.exe -m pytest              # 49 个，无网无副作用
+.\.venv\Scripts\python.exe -m pytest              # 55 个，无网无副作用
 .\.venv\Scripts\python.exe -m pytest --network    # 加 3 个真实链路
 ```
 
@@ -183,8 +186,9 @@ cd prototype
 ```
 
 该模式下 `test_units.py` 自动跳过（它测的是 Python 内部实现，Rust 侧有自己的单测）。
-Rust 二进制刻意沿用同一套 CLI 参数（`--port` / `--cert-dir` / `--log` / `--accel` / `--mitm-extra`），
-所以协议层的 17 个用例可以原样复用。这是刻意设计：**行为契约不随语言迁移而重写**。
+Rust 二进制只保留必要 CLI（`--config` / `--no-env` 等）；测试夹具会为 Rust
+二进制生成临时配置（`listen` / `accelerators` / `certDir` / `logPath` / `mitmExtra`），
+而 Python 原型仍走旧的开发参数。协议层的用例因此可以复用同一套断言。
 
 ## 8. 已知未覆盖
 

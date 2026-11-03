@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use crate::ca::CertAuthority;
+use crate::certinfo;
 use crate::config::App;
 use crate::pac;
 use crate::proxy::probe;
@@ -73,15 +74,29 @@ fn check_listen(app: &App) -> Check {
             format!("{} 不是回环地址", app.listen),
         );
     }
+    if std::net::TcpStream::connect_timeout(&app.listen, Duration::from_millis(300)).is_ok() {
+        return Check::new(
+            "listen",
+            Verdict::Pass,
+            format!("{} 已有进程在监听", app.listen),
+        );
+    }
     match std::net::TcpListener::bind(app.listen) {
         Ok(listener) => {
             drop(listener);
-            Check::new("listen", Verdict::Pass, format!("{} 可绑定", app.listen))
+            Check::new(
+                "listen",
+                Verdict::Warn,
+                format!(
+                    "{} 可绑定，但当前没有代理监听；先启动 winget-accel",
+                    app.listen
+                ),
+            )
         }
         Err(err) => Check::new(
             "listen",
-            Verdict::Warn,
-            format!("{} 绑定失败（可能已有实例在跑）: {err}", app.listen),
+            Verdict::Fail,
+            format!("{} 被占用且代理 health 不可达: {err}", app.listen),
         ),
     }
 }
@@ -109,41 +124,76 @@ fn check_ca(app: &App) -> Check {
         );
     }
 
-    // 授权域名记录必须与当前配置一致，否则新 host 签不出证书
     let meta_path = app.cert_dir.join("ca-meta.json");
-    match std::fs::read_to_string(&meta_path) {
+    let meta_note = match std::fs::read_to_string(&meta_path) {
         Ok(meta) => match serde_json::from_str::<Vec<String>>(&meta) {
-            Ok(recorded) if recorded == app.rewrite_hosts => Check::new(
-                "ca",
-                Verdict::Pass,
-                format!(
-                    "{} 存在，授权域名与配置一致（{} 个）",
-                    path.display(),
-                    recorded.len()
-                ),
-            ),
-            Ok(recorded) => Check::new(
-                "ca",
-                Verdict::Fail,
-                format!(
-                    "授权域名与配置不一致：旧 {recorded:?} / 新 {:?}；需删除证书目录重新生成",
-                    app.rewrite_hosts
-                ),
-            ),
-            Err(err) => Check::new("ca", Verdict::Fail, format!("ca-meta.json 解析失败: {err}")),
+            Ok(recorded) if recorded == app.rewrite_hosts => None,
+            Ok(recorded) => {
+                return Check::new(
+                    "ca",
+                    Verdict::Fail,
+                    format!(
+                        "授权域名与配置不一致：旧 {recorded:?} / 新 {:?}；需删除证书目录重新生成",
+                        app.rewrite_hosts
+                    ),
+                )
+            }
+            Err(err) => {
+                return Check::new("ca", Verdict::Fail, format!("ca-meta.json 解析失败: {err}"))
+            }
         },
-        Err(_) => Check::new(
+        Err(_) => Some(format!("缺少 ca-meta.json（{}）", app.cert_dir.display())),
+    };
+
+    let Some(der) = certinfo::read_ca_der(&path) else {
+        return Check::new(
             "ca",
-            Verdict::Warn,
+            Verdict::Fail,
+            format!("{} 无法解析为证书", path.display()),
+        );
+    };
+    if !certinfo::is_trusted(&der) {
+        return Check::new(
+            "ca",
+            Verdict::Fail,
             format!(
-                "{} 缺少 ca-meta.json，无法核对授权域名",
-                app.cert_dir.display()
+                "{} 已生成，但不在 CurrentUser\\Root；启动一次代理完成导入，或手动信任",
+                path.display()
             ),
+        );
+    }
+
+    match certinfo::info(&path) {
+        Some(info) if info.days_left < 0 => Check::new(
+            "ca",
+            Verdict::Fail,
+            format!(
+                "CA 已过期 {} 天；删除证书目录后重新启动代理",
+                -info.days_left
+            ),
+        ),
+        Some(info) => {
+            let mut detail = format!(
+                "{} 已受信任，剩余 {} 天（{:?}）",
+                path.display(),
+                info.days_left,
+                info.thumbprint
+            );
+            if let Some(note) = meta_note {
+                detail.push('；');
+                detail.push_str(&note);
+            }
+            Check::new("ca", Verdict::Pass, detail)
+        }
+        None => Check::new(
+            "ca",
+            Verdict::Pass,
+            format!("{} 已受信任（无法读取有效期）", path.display()),
         ),
     }
 }
 
-fn check_pac(app: &App) -> Check {
+fn pac_text_issue(app: &App) -> Option<String> {
     let text = pac::build(app.listen.port(), &app.rewrite_hosts);
     let missing: Vec<&str> = app
         .rewrite_hosts
@@ -152,39 +202,79 @@ fn check_pac(app: &App) -> Check {
         .map(|s| s.as_str())
         .collect();
     if missing.is_empty() {
-        Check::new(
-            "pac",
-            Verdict::Pass,
-            format!("含 {} 个 host，入口函数正常", app.rewrite_hosts.len()),
-        )
+        None
     } else {
-        Check::new("pac", Verdict::Fail, format!("PAC 缺少 host: {missing:?}"))
+        Some(format!("PAC 文本缺少 host: {missing:?}"))
     }
 }
 
+fn pac_registry_detail(expected: &str, actual: Option<&str>) -> (Verdict, String) {
+    match actual {
+        Some(value) if value.trim() == expected => {
+            (Verdict::Pass, format!("AutoConfigURL 已指向 {expected}"))
+        }
+        Some(value) => (
+            Verdict::Fail,
+            format!(
+                "AutoConfigURL = {value:?}，期望 {expected:?}；请重新启动代理或检查系统代理设置"
+            ),
+        ),
+        None => (
+            Verdict::Fail,
+            format!("AutoConfigURL 未设置，期望 {expected:?}；请去掉 --no-env 后启动代理"),
+        ),
+    }
+}
+
+fn check_pac(app: &App) -> Check {
+    if let Some(issue) = pac_text_issue(app) {
+        return Check::new("pac", Verdict::Fail, issue);
+    }
+    let expected = format!("http://127.0.0.1:{}/winget-accel.pac", app.listen.port());
+    let actual = crate::autoenv::current_pac();
+    let (verdict, detail) = pac_registry_detail(&expected, actual.as_deref());
+    Check::new("pac", verdict, detail)
+}
+
+const DOCTOR_PROBE_CONCURRENCY: usize = 6;
+
 fn check_accels(accels: &[Accel], timeout: Duration) -> Vec<Check> {
-    accels
-        .iter()
-        .map(|accel| {
-            let started = std::time::Instant::now();
-            let ok = probe(accel, timeout);
-            let ms = started.elapsed().as_millis();
-            // doctor 只做可达性探测（不改系统状态、也不产生速度样本），
-            // 速度优选的数据来自运行期真实下载，见 /health 的 kbps 字段。
-            let detail = format!(
-                "{}://{}:{} 探测 {}（{ms} ms）",
-                accel.scheme.as_str(),
-                accel.host,
-                accel.port,
-                if ok { "可达" } else { "不可达" }
-            );
-            Check::new(
-                "accel",
-                if ok { Verdict::Pass } else { Verdict::Fail },
-                detail,
-            )
-        })
-        .collect()
+    let mut checks = Vec::with_capacity(accels.len());
+    for chunk in accels.chunks(DOCTOR_PROBE_CONCURRENCY) {
+        let mut batch = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|accel| {
+                    let accel = accel.clone();
+                    scope.spawn(move || check_one_accel(&accel, timeout))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("doctor probe thread panicked"))
+                .collect::<Vec<_>>()
+        });
+        checks.append(&mut batch);
+    }
+    checks
+}
+
+fn check_one_accel(accel: &Accel, timeout: Duration) -> Check {
+    let started = std::time::Instant::now();
+    let ok = probe(accel, timeout);
+    let ms = started.elapsed().as_millis();
+    let detail = format!(
+        "{}://{}:{} 探测 {}（{ms} ms）",
+        accel.scheme.as_str(),
+        accel.host,
+        accel.port,
+        if ok { "可达" } else { "不可达" }
+    );
+    Check::new(
+        "accel",
+        if ok { Verdict::Pass } else { Verdict::Warn },
+        detail,
+    )
 }
 
 /// 候选整体可用性。
@@ -239,8 +329,7 @@ pub fn print(checks: &[Check]) -> bool {
     if !failed {
         println!("全部通过。");
         println!();
-        println!("根证书是否已被信任需要你自己确认（这里不读系统存储）：");
-        println!("  certutil -user -store Root | findstr /i winget-accel");
+        println!("提示：若 PAC/CA 检查失败，先启动一次代理完成初始化。");
     }
     failed
 }
@@ -249,15 +338,42 @@ pub fn print(checks: &[Check]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AcceleratorCfg, App, CliOverrides, FileConfig};
+    use crate::config::{AcceleratorCfg, App, FileConfig};
 
     fn app() -> App {
-        App::new(FileConfig::default(), CliOverrides::default()).unwrap()
+        let file = FileConfig {
+            accelerators: vec![AcceleratorCfg {
+                name: "test".into(),
+                template: "https://test.example".into(),
+                priority: 1,
+            }],
+            cert_dir: Some(std::path::PathBuf::from("doctor-test-certs")),
+            log_path: Some(std::path::PathBuf::from("doctor-test.log")),
+            ..Default::default()
+        };
+        App::new(file).unwrap()
     }
 
     #[test]
-    fn pac_check_passes_for_default_config() {
-        assert_eq!(check_pac(&app()).verdict, Verdict::Pass);
+    fn pac_text_contains_configured_hosts() {
+        assert!(pac_text_issue(&app()).is_none());
+    }
+
+    #[test]
+    fn pac_registry_match_is_pass() {
+        let expected = "http://127.0.0.1:8443/winget-accel.pac";
+        let (verdict, _) = pac_registry_detail(expected, Some(expected));
+        assert_eq!(verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn pac_registry_missing_or_different_is_fail() {
+        let expected = "http://127.0.0.1:8443/winget-accel.pac";
+        assert_eq!(pac_registry_detail(expected, None).0, Verdict::Fail);
+        assert_eq!(
+            pac_registry_detail(expected, Some("http://127.0.0.1:9999/x.pac")).0,
+            Verdict::Fail
+        );
     }
 
     #[test]
@@ -279,7 +395,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let app = App::new(file, CliOverrides::default()).unwrap();
+        let app = App::new(file).unwrap();
         assert_eq!(app.accels.len(), 1);
         let check = check_chain(&app, 1);
         assert_eq!(check.verdict, Verdict::Warn);
@@ -287,15 +403,24 @@ mod tests {
     }
 
     #[test]
-    fn default_config_has_multiple_candidates() {
-        // 内置候选不能只有一个：单点一挂功能就整体不可用（ADR-016）。
-        // 不写死数量——清单会随实测调整（2026-11-02 从 5 降到 4）。
-        let app = app();
-        assert!(
-            app.accels.len() >= 2,
-            "至少要有 2 个候选，否则没有回退链；实际 {}",
-            app.accels.len()
-        );
+    fn multiple_candidates_have_a_fallback_chain() {
+        let file = FileConfig {
+            accelerators: vec![
+                AcceleratorCfg {
+                    name: "a".into(),
+                    template: "https://a.example".into(),
+                    priority: 1,
+                },
+                AcceleratorCfg {
+                    name: "b".into(),
+                    template: "https://b.example".into(),
+                    priority: 2,
+                },
+            ],
+            ..Default::default()
+        };
+        let app = App::new(file).unwrap();
+        assert_eq!(app.accels.len(), 2);
         assert_eq!(check_chain(&app, app.accels.len()).verdict, Verdict::Pass);
     }
 
@@ -324,7 +449,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let app = App::new(file, CliOverrides::default()).unwrap();
+        let app = App::new(file).unwrap();
         let check = check_chain(&app, 2);
         assert_eq!(check.verdict, Verdict::Pass);
         assert!(check.detail.contains("2/2"));

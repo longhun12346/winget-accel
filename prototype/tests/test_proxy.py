@@ -10,6 +10,7 @@ import hashlib
 import socket
 import subprocess
 import sys
+import time
 import urllib.request
 
 import pytest
@@ -162,6 +163,53 @@ def test_upstream_error_status_is_passed_through(start_proxy, fake_upstream):
     assert body == b""
 
 
+def test_range_request_upstream_200_is_rejected(request, start_proxy, fake_upstream):
+    if not request.config.getoption("--target-binary"):
+        pytest.skip("Rust 二进制的 Range 契约")
+
+    up = fake_upstream()
+    proxy = start_proxy(accel=up.accel)
+    proc, body, status = call(
+        proxy, "https://github.com/range-ignored", extra=("-r", "0-1")
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert status == 502
+    assert body == b""
+
+def test_truncated_upstream_body_closes_client_and_clears_pin(
+    request, start_proxy, fake_upstream
+):
+    if not request.config.getoption("--target-binary"):
+        pytest.skip("Rust 二进制的中途失败契约")
+
+    up = fake_upstream(truncate=True)
+    proxy = start_proxy(accel=up.accel)
+    proc = curl(
+        proxy.port,
+        "https://github.com/truncated",
+        ca_path=proxy.ca_path,
+        extra=("-r", "0-99"),
+        timeout=20,
+    )
+
+    assert proc.returncode != 0
+    time.sleep(0.2)
+    log = proxy.log_text()
+    assert "RELAY-ERR" in log
+    assert "pin_cleared=true" in log
+
+def test_unreachable_tunnel_returns_502(request, start_proxy):
+    if not request.config.getoption("--target-binary"):
+        pytest.skip("Rust 二进制的隧道失败契约")
+
+    closed = free_port()
+    proxy = start_proxy(accel="gh-proxy.com")
+    proc = curl(proxy.port, f"https://127.0.0.1:{closed}/", timeout=10)
+
+    assert proc.returncode != 0
+    assert b"response 502" in proc.stderr.lower()
+
 def test_unreachable_accel_returns_502_quickly(start_proxy):
     closed = free_port()  # 拿到就释放，保证没人监听
     proxy = start_proxy(accel=f"http://127.0.0.1:{closed}")
@@ -192,7 +240,9 @@ def test_non_whitelisted_host_is_tunneled_not_rewritten(start_proxy, tls_upstrea
 # ------------------------------------------------------------- 本地端点
 
 
-def test_pac_is_served_on_own_port(start_proxy):
+def test_pac_is_served_on_own_port(request, start_proxy):
+    if not request.config.getoption("--target-binary"):
+        pytest.skip("Python 原型未实现 PAC 本地端点")
     proxy = start_proxy(accel="gh-proxy.com")
 
     with urllib.request.urlopen(f"http://127.0.0.1:{proxy.port}/winget-accel.pac", timeout=10) as r:
@@ -246,7 +296,7 @@ def test_second_instance_on_same_port_fails_fast(start_proxy, build_command, tmp
 
 def test_name_constraints_reject_host_outside_whitelist(start_proxy):
     """同一张 CA 签 example.com 必须被客户端拒绝（H1 的回归用例）。"""
-    proxy = start_proxy(accel="gh-proxy.com", extra=("--mitm-extra", "example.com"))
+    proxy = start_proxy(accel="gh-proxy.com", mitm_extra=("example.com",))
 
     proc = curl(proxy.port, "https://example.com/", ca_path=proxy.ca_path, timeout=20)
 

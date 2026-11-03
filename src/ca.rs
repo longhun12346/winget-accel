@@ -171,6 +171,18 @@ impl CertAuthority {
             return Ok(Arc::clone(cfg));
         }
 
+        let (cert_der, key_der) = self.build_leaf(host)?;
+        let cfg = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .context("构造 TLS 服务端配置失败")?;
+        let cfg = Arc::new(cfg);
+        cache.insert(host.to_string(), Arc::clone(&cfg));
+        Ok(cfg)
+    }
+
+    /// 签发一张 host 对应的叶证书；抽出来便于单测检查 SAN/EKU。
+    fn build_leaf(&self, host: &str) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
         let mut params = CertificateParams::new(vec![host.to_string()])
             .with_context(|| format!("叶证书 SAN 非法: {host}"))?;
         params.distinguished_name.push(DnType::CommonName, host);
@@ -187,17 +199,9 @@ impl CertAuthority {
         let cert = params
             .signed_by(&leaf_key, &self.issuer)
             .with_context(|| format!("签发叶证书失败: {host}"))?;
-
-        let cert_der: CertificateDer<'static> = cert.der().clone();
+        let cert_der = cert.der().clone();
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
-
-        let cfg = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der)
-            .context("构造 TLS 服务端配置失败")?;
-        let cfg = Arc::new(cfg);
-        cache.insert(host.to_string(), Arc::clone(&cfg));
-        Ok(cfg)
+        Ok((cert_der, key_der))
     }
 }
 
@@ -315,6 +319,102 @@ mod tests {
             .err()
             .expect("应当报错");
         assert!(err.to_string().contains("不一致"), "实际错误: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn leaf_config_is_cached_per_host() {
+        let dir = std::env::temp_dir().join(format!("wgaccel-ca-cache-{}", std::process::id()));
+        let hosts = vec!["github.com".to_string()];
+        let ca = CertAuthority::load_or_create(&dir, &hosts).unwrap();
+        let first = ca.server_config("github.com").unwrap();
+        let second = ca.server_config("github.com").unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "同 host 应复用同一 TLS 配置");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_first_use_reuses_one_leaf_config() {
+        let dir =
+            std::env::temp_dir().join(format!("wgaccel-ca-concurrent-{}", std::process::id()));
+        let hosts = vec!["github.com".to_string()];
+        let ca = Arc::new(CertAuthority::load_or_create(&dir, &hosts).unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let ca = Arc::clone(&ca);
+            handles.push(std::thread::spawn(move || {
+                ca.server_config("github.com").unwrap()
+            }));
+        }
+        let configs: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        for cfg in &configs {
+            assert!(Arc::ptr_eq(&configs[0], cfg), "并发首连应只生成一份配置");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn leaf_certificate_has_exact_san_and_server_auth() {
+        use x509_parser::extensions::GeneralName;
+        let dir = std::env::temp_dir().join(format!("wgaccel-ca-leaf-{}", std::process::id()));
+        let hosts = vec!["github.com".to_string()];
+        let ca = CertAuthority::load_or_create(&dir, &hosts).unwrap();
+        let (cert, _) = ca.build_leaf("github.com").unwrap();
+        let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref()).unwrap();
+
+        let san = parsed.subject_alternative_name().unwrap().unwrap();
+        let mut names = Vec::new();
+        for name in &san.value.general_names {
+            if let GeneralName::DNSName(dns) = name {
+                names.push(dns.to_string());
+            }
+        }
+        assert_eq!(names, vec!["github.com".to_string()]);
+
+        let eku = parsed.extended_key_usage().unwrap().unwrap();
+        assert!(eku.value.server_auth, "叶证书必须带 serverAuth EKU");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn ca_has_basic_constraints_and_authorized_name_constraints() {
+        use x509_parser::extensions::GeneralName;
+        let dir =
+            std::env::temp_dir().join(format!("wgaccel-ca-constraints-{}", std::process::id()));
+        let hosts = vec![
+            "github.com".to_string(),
+            "objects.githubusercontent.com".to_string(),
+            "codeload.github.com".to_string(),
+            "release-assets.githubusercontent.com".to_string(),
+        ];
+        let ca = CertAuthority::load_or_create(&dir, &hosts).unwrap();
+        let (_, pem) = x509_parser::pem::parse_x509_pem(ca.ca_pem().as_bytes()).unwrap();
+        let cert = pem.parse_x509().unwrap();
+
+        let bc = cert.basic_constraints().unwrap().unwrap();
+        assert!(bc.value.ca);
+        assert_eq!(bc.value.path_len_constraint, Some(0));
+
+        let nc = cert.name_constraints().unwrap().unwrap();
+        let permitted = nc.value.permitted_subtrees.as_ref().unwrap();
+        let mut names: Vec<String> = permitted
+            .iter()
+            .filter_map(|subtree| match &subtree.base {
+                GeneralName::DNSName(name) => Some((*name).to_string()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        let mut expected = hosts.clone();
+        expected.sort();
+        assert_eq!(names, expected);
+        assert!(nc
+            .value
+            .excluded_subtrees
+            .as_ref()
+            .map(|v| v.is_empty())
+            .unwrap_or(true));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

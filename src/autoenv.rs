@@ -47,10 +47,11 @@ impl EnvGuard {
     }
 
     /// 装好 CA、设好 PAC，返回守卫。
-    pub fn enable(dir: &Path, port: u16) -> Result<Self> {
-        std::fs::create_dir_all(dir).with_context(|| format!("建不了目录: {}", dir.display()))?;
+    pub fn enable(cert_dir: &Path, state_dir: &Path, port: u16) -> Result<Self> {
+        std::fs::create_dir_all(state_dir)
+            .with_context(|| format!("建不了目录: {}", state_dir.display()))?;
 
-        let ca_pem = dir.join("certs").join("ca-cert.pem");
+        let ca_pem = cert_dir.join("ca-cert.pem");
         if !ca_pem.exists() {
             bail!(
                 "还没生成 CA（{}）。请先运行一次本程序让代理生成证书，再回来。",
@@ -61,7 +62,7 @@ impl EnvGuard {
         ensure_ca_trusted(&ca_pem)?;
 
         let prior = read_pac();
-        let state_path = dir.join(STATE_FILE);
+        let state_path = state_dir.join(STATE_FILE);
         std::fs::write(&state_path, prior.clone().unwrap_or_default())
             .with_context(|| format!("写不了 {}", state_path.display()))?;
 
@@ -69,7 +70,9 @@ impl EnvGuard {
         store_prior(prior.as_deref());
         install_exit_handler();
 
-        write_pac(&format!("http://127.0.0.1:{port}/winget-accel.pac"))?;
+        let pac_url = format!("http://127.0.0.1:{port}/winget-accel.pac");
+        write_pac(&pac_url)?;
+        crate::log::info(&format!("PAC-SET {pac_url}"));
 
         // 拉起看门狗：进程无论怎么死，PAC 都会被还原
         spawn_watchdog(&state_path);
@@ -94,7 +97,8 @@ impl Drop for EnvGuard {
         };
         if result.is_ok() {
             let _ = std::fs::remove_file(&self.state_path);
-            crate::log::info("已还原系统 PAC 设置。");
+            let prior = self.prior_pac.as_deref().unwrap_or("<不存在>");
+            crate::log::info(&format!("PAC-RESTORED 原值={prior}"));
         } else {
             crate::log::warn("还原 PAC 失败，请手动检查 Internet Settings 的 AutoConfigURL。");
         }
@@ -102,6 +106,9 @@ impl Drop for EnvGuard {
 }
 
 /// 读当前 AutoConfigURL；没有则返回 None。
+pub fn current_pac() -> Option<String> {
+    read_pac()
+}
 fn read_pac() -> Option<String> {
     let out = Command::new("reg")
         .args(["query", INET_KEY, "/v", "AutoConfigURL"])
@@ -149,13 +156,22 @@ fn write_pac(value: &str) -> Result<()> {
 }
 
 fn delete_pac() -> Result<()> {
-    // 不存在时 reg 会返回非零，这不是错误
-    let _ = Command::new("reg")
+    // 不存在时 reg 会返回非零，这不是错误。
+    if read_pac().is_none() {
+        return Ok(());
+    }
+    let status = Command::new("reg")
         .args(["delete", INET_KEY, "/v", "AutoConfigURL", "/f"])
-        // 同样要吞掉 stdout，理由见 write_pac
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .status()
+        .context("调用 reg.exe 失败")?;
+    if !status.success() {
+        bail!(
+            "删除 AutoConfigURL 失败（reg delete 退出码 {}）",
+            describe_status(status.code().unwrap_or(-1))
+        );
+    }
     Ok(())
 }
 

@@ -48,6 +48,19 @@ try {
     $exe = Join-Path $repo 'target\release\winget-accel.exe'
     if (-not (Test-Path $exe)) { throw "找不到构建产物: $exe" }
 
+    $exeVersionText = (& $exe --version).Trim()
+    if ($exeVersionText -notmatch '^winget-accel\s+(.+)$') { throw "无法读取 exe 版本: $exeVersionText" }
+    $exeVersion = $Matches[1]
+    if ($exeVersion -ne $version) {
+        throw "版本不一致：Cargo.toml=$version，exe=$exeVersion；请先执行 set-version.ps1"
+    }
+    if ($env:GITHUB_REF_NAME -match '^v(.+)$') {
+        $tagVersion = $Matches[1]
+        if ($tagVersion -ne $version) {
+            throw "版本不一致：tag=v$tagVersion，Cargo.toml=$version"
+        }
+    }
+
     $name = "winget-accel-$version-win-x64"
     $stage = Join-Path $OutDir $name
     if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }

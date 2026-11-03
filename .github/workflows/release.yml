@@ -73,8 +73,8 @@ jobs:
           $exe = "target\release\winget-accel.exe"
           & $exe --version
           if ($LASTEXITCODE -ne 0) { throw "--version 失败" }
-          & $exe --print-pac | Select-Object -First 2
-          if ($LASTEXITCODE -ne 0) { throw "--print-pac 失败" }
+          & $exe --help | Select-Object -First 2
+          if ($LASTEXITCODE -ne 0) { throw "--help 失败" }
           # 确认没有 VCRUNTIME / UCRT 依赖（静态 CRT 是否生效）
           $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($dumpbin) {

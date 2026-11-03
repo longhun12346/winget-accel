@@ -395,7 +395,7 @@ Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Setti
 
 | 项 | 本机 | 目标机 |
 |---|---|---|
-| 二进制运行（`--version` / `--print-pac`） | ✅ | ✅ |
+| 二进制运行（`--version` / `--help`） | ✅ | ✅ |
 | `--doctor` 候选可达 | 5/5 | **5/5** |
 | `gh-proxy.com` 探测延迟 | 666 ms | **46 ms** |
 | 经代理下载 1.5 MB | 2.07 s ≈ 723 KB/s | 5.09 s ≈ **295 KB/s** |

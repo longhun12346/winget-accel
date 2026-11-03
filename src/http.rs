@@ -25,7 +25,11 @@ pub fn read_head<R: Read>(stream: &mut R) -> io::Result<Vec<u8>> {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "连接在请求头结束前关闭",
+                    format!(
+                        "连接在请求头结束前关闭（已读取 {} 字节: {}）",
+                        buf.len(),
+                        bytes_preview(&buf)
+                    ),
                 ))
             }
             Ok(_) => {
@@ -34,13 +38,48 @@ pub fn read_head<R: Read>(stream: &mut R) -> io::Result<Vec<u8>> {
                     return Ok(buf);
                 }
                 if buf.len() > MAX_HEAD {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "请求头过大"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "请求头过大（已读取 {} 字节: {}）",
+                            buf.len(),
+                            bytes_preview(&buf)
+                        ),
+                    ));
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "读取请求头失败（已读取 {} 字节: {}）: {e}",
+                        buf.len(),
+                        bytes_preview(&buf)
+                    ),
+                ))
+            }
         }
     }
+}
+
+/// 给连接失败日志提供极短的前缀预览，不记录完整请求/正文。
+pub fn bytes_preview(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "空".to_string();
+    }
+    let hex = bytes
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let hint = if bytes[0] == 0x16 {
+        "，疑似 TLS ClientHello（不是 HTTP/CONNECT）"
+    } else {
+        ""
+    };
+    format!("{hex}{hint}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,5 +397,29 @@ mod tests {
         let n = forward_body(&mut up, &mut out, &head, false).unwrap();
         assert_eq!(n, 4);
         assert_eq!(out, b"body", "只应包含正文");
+    }
+    #[test]
+    fn status_code_rejects_malformed_response() {
+        assert_eq!(status_code(b"NOT HTTP\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn content_length_rejects_invalid_value() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n";
+        assert_eq!(content_length(head), None);
+    }
+
+    #[test]
+    fn read_head_rejects_lf_only_termination() {
+        let mut cursor = Cursor::new(b"GET / HTTP/1.1\n\n".to_vec());
+        assert!(read_head(&mut cursor).is_err());
+    }
+    #[test]
+    fn read_head_eof_error_reports_prefix_and_protocol_hint() {
+        let mut cursor = Cursor::new(vec![0x16, 0x03, 0x01, 0x00, 0x00]);
+        let err = read_head(&mut cursor).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("已读取 5 字节"), "{msg}");
+        assert!(msg.contains("TLS ClientHello"), "{msg}");
     }
 }

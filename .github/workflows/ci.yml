@@ -41,7 +41,7 @@ jobs:
           "大小: {0:N0} B" -f $f.Length
           "SHA256: " + (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
           & $exe --version
-          & $exe --print-pac
+          & $exe --help | Select-Object -First 2
 
   protocol:
     name: 协议用例（Python 驱动二进制）

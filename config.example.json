@@ -54,5 +54,11 @@
 
   "$comment_no_fallback": "没有 fallbackToOriginal 这一项：所有候选都不健康时直接快速返回 502，不回退直连（ADR-016）。实测直连 curl 仅 21 KB/s，而 winget 走 WinHTTP 会在 37 秒报 12002 超时、0 字节落盘——回退等于让用户多等一次失败",
 
+  "$comment_paths": "certDir/logPath 可选；默认分别使用 exe 同目录的 certs\\ 和 proxy.log。",
+  "certDir": null,
+  "logPath": null,
+  "$comment_mitm_extra": "额外终止 TLS 但不改写的 host，仅用于 Name Constraints 等排障；正常使用留空。",
+  "mitmExtra": [],
+
   "logLevel": "info"
 }

@@ -3,6 +3,10 @@
 在本机跑一个代理，用 PAC 只把 4 个 GitHub 下载域名指给它，再由它把请求改写到
 GitHub 加速服务——让 `winget install` 在国内网络下也能下得动。
 
+> 本项目的目标仅是加速 **winget 安装包下载**，不是通用 GitHub 代理。
+> **明确不支持 `git clone`**：PAC 会把 clone / git-upload-pack 等相关路径默认设为
+> `DIRECT`，不承诺在代理存在时 `git clone` 的兼容性或速度。
+
 > 状态（2026-11-01）：**Rust 实现已完成并在两台机器上实测通过**。
 > 单文件 1.6 MB、静态链接、无运行时依赖、不需要管理员。
 
@@ -153,46 +157,34 @@ PAC 指向 `http://127.0.0.1:8443/winget-accel.pac`。代理不在时，WinINet 
 
 ## 加速器候选
 
-内置 5 个，按多次实测的中位数排序（可被 `--config` 覆盖）：
+候选清单不是写死的：启动时并发请求 `raw.githubusercontent.com` 与 `gh-proxy.com` 的候选清单，最多等待 6 秒，选择有效且内容最完整的一份；两边都失败时使用本地缓存/编译期内置清单兜底。当前内置清单约 43 条，具体数量和存活状态会变化。
 
-| 优先级 | 候选 | 实测速率 |
-|---|---|---|
-| 1 | `gh-proxy.com` | 723–769 KB/s |
-| 2 | `gh.geekertao.top` | ~703 KB/s |
-| 3 | `ghfast.top` | 339 KB/s |
-| 4 | `ghproxy.site` | ~243 KB/s |
-| 5 | `ghproxy.imciel.com` | 238 KB/s |
+**候选必须通过验证才会进入下载路径。** 未探测候选（`Unknown`）不会参与请求；启动时先验证一小批候选，至少得到一个 `Healthy` 后才允许 winget 下载，后台继续验证其余候选。没有已验证候选时明确返回 502，不回退直连（ADR-016）。
 
-全部是**第三方免费公共服务**，存活状态会变（`ghfast.top` 一天之内经历过"失效→可用"）。
-后台每 5 分钟探测一次各自 origin 的根路径，连续失败达阈值就切换。
-**所有候选都不可用时直接返回 502**，不回退直连（ADR-016：直连对 winget 等于 37 秒超时失败）。
+全部是第三方公共服务，存活状态会变。**所有候选都不可用时直接返回 502**，不回退直连（直连对 winget 等于超时失败）。
 
-候选清单的自动获取是待办（[roadmap T1](docs/roadmap.md)）。
+## 命令行参数
 
-## 命令行参数（排障用，日常不需要）
+日常使用不需要参数；高级配置统一走 `--config`。
 
 ```
---doctor               体检：端口 / CA / PAC / 5 个加速器可达性，不改任何系统设置
---remove-ca            移除本工具装进「受信任的根」的证书（幂等，可重复执行）
---print-pac            打印将要使用的 PAC 后退出
---port <端口>          默认 127.0.0.1:8443
---config <路径>        用配置文件（见 config.example.json）
---accel <基地址>       临时指定单个加速器，覆盖配置
---cert-dir <目录>      CA 存放目录，默认 exe 同目录下的 certs\
---log <路径>           日志文件，默认 exe 同目录下的 proxy.log
---log-level <级别>     error | warn | info | debug
---mitm-extra <host>    额外拦截某 host 但不改写（排障用，可重复）
---version / --help
+winget-accel [--config <路径>] [--doctor] [--remove-ca] [--no-env] [--version] [--help]
 ```
 
-带**任意参数**启动时是"纯代理"模式，**不会**修改 CA 与 PAC——
-这是测试用例依赖的性质（测试不能污染系统状态）。
+- `--config`：使用配置文件（见 `config.example.json`）
+- `--doctor`：体检，不修改系统设置
+- `--remove-ca`：移除本工具安装的根证书
+- `--no-env`：不接管系统 CA/PAC，仅用于测试与无副作用调试
+- `--version` / `--help`
 
+端口、候选、日志级别、证书目录、日志路径和 `mitmExtra` 均属于配置文件字段，
+不再提供对应的重复命令行参数。配置文件可选字段包括 `certDir`、`logPath`、
+`mitmExtra`。
 ## 构建
 
 ```powershell
 cargo build --release        # 产物 target\release\winget-accel.exe
-cargo test                   # 67 个单元测试
+cargo test                   # 132 个单元测试
 cargo clippy --all-targets
 ```
 
@@ -301,7 +293,8 @@ PE 头：机器类型 `x64`、子系统 `Windows CUI`、子系统版本 `6.00`�
 | 无 CRL/OCSP | `curl`（schannel）需加 `--ssl-no-revoke`；winget 不受影响 |
 | 中文显示依赖控制台代码页 | 已在需要时自动切 UTF-8 并还原，但在 GBK 控制台上的**实际显示效果未经用户确认** |
 | 未验证断点续传 | 中断后续传未测；大文件完整下载已验（63.75 MB） |
-| 单点 | 5 个候选全是公共加速器，全挂则功能不可用 |
+| **不支持 `git clone`** | 项目只加速 winget 下载路径；PAC 将 `git clone` / `git-upload-pack` 等路径默认 `DIRECT`。本工具不是通用 GitHub 代理，也不保证 clone 的兼容性或速度 |
+| 单点 | 候选池依赖第三方公共服务，可能全部失效；此时明确返回 502 |
 | ~~无 CI / 无发布流程~~ | ✅ 已补：`.github/workflows/ci.yml`（测试）与 `release.yml`（打 tag 自动发版）。v0.1.0/0.1.1/0.1.2 均由 CI 构建并发布 |
 
 ## 与 rewinged 的关系
@@ -313,9 +306,6 @@ PE 头：机器类型 `x64`、子系统 `Windows CUI`、子系统版本 `6.00`�
 ## 许可证
 
 MIT
-
-
-
 
 
 

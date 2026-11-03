@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import http.server
 import socket
 import ssl
@@ -98,33 +99,42 @@ class ProxyHandle:
 
 @pytest.fixture
 def build_command(request):
-    """构造"启动一个代理实例"的命令行。
+    """构造启动代理实例的命令；外部二进制使用临时配置文件。"""
 
-    默认跑 Python 原型；传 `--target-binary <path>` 时改跑该可执行文件
-    （用于让同一套协议用例驱动 Rust 版）。两者的 CLI 参数刻意保持一致。
-    """
-
-    def _build(port, cert_dir, log, accel=None, extra=()):
+    def _build(port, cert_dir, log, accel=None, mitm_extra=()):
         target = request.config.getoption("--target-binary")
         if target:
             base = [target]
-        else:
-            base = [sys.executable, "-u", str(PROTO_DIR / "wgaccel.py")]
+            cfg_path = Path(log).parent / f"config-{port}.json"
+            cfg = {
+                "listen": f"127.0.0.1:{port}",
+                "accelerators": [
+                    {
+                        "name": "test",
+                        "template": accel or "gh-proxy.com",
+                        "priority": 1,
+                    }
+                ],
+                "certDir": str(cert_dir),
+                "logPath": str(log),
+                "mitmExtra": list(mitm_extra),
+            }
+            cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+            return base + ["--config", str(cfg_path), "--no-env"]
+
+        base = [sys.executable, "-u", str(PROTO_DIR / "wgaccel.py")]
         cmd = base + [
             "--port", str(port),
             "--cert-dir", str(cert_dir),
             "--log", str(log),
-            # 二进制默认会接管系统环境（装 CA / 设 PAC）。测试必须显式关掉，
-            # 否则会污染测试机——这也是 --no-env 存在的原因。
-            "--no-env",
         ]
         if accel is not None:
             cmd += ["--accel", accel]
-        cmd += list(extra)
+        for host in mitm_extra:
+            cmd += ["--mitm-extra", host]
         return cmd
 
     return _build
-
 
 @pytest.fixture
 def start_proxy(tmp_path, build_command):
@@ -135,7 +145,7 @@ def start_proxy(tmp_path, build_command):
         *,
         accel: str = "gh-proxy.com",
         cert_dir: Path | None = None,
-        extra: tuple[str, ...] = (),
+        mitm_extra=(),
     ) -> ProxyHandle:
         port = free_port()
         cd = Path(cert_dir) if cert_dir else tmp_path / f"certs-{port}"
@@ -143,7 +153,7 @@ def start_proxy(tmp_path, build_command):
         log = tmp_path / f"proxy-{port}.log"
         out = (tmp_path / f"proxy-{port}.out").open("wb")
         err = (tmp_path / f"proxy-{port}.err").open("wb")
-        cmd = build_command(port, cd, log, accel, extra)
+        cmd = build_command(port, cd, log, accel, mitm_extra)
         proc = subprocess.Popen(cmd, cwd=str(PROTO_DIR), stdout=out, stderr=err)
         procs.append((proc, out, err))
         wait_http(f"http://127.0.0.1:{port}/health")
@@ -165,7 +175,7 @@ def start_proxy(tmp_path, build_command):
 # ---------------------------------------------------------------- 假上游（HTTP）
 
 
-def make_upstream_handler(requests: list[dict]):
+def make_upstream_handler(requests: list[dict], truncate: bool = False):
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -198,6 +208,22 @@ def make_upstream_handler(requests: list[dict]):
                 return
 
             requests.append({"path": self.path, "headers": headers})
+
+            if "range-ignored" in self.path:
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ab")
+                return
+
+            if truncate:
+                self.send_response(206)
+                self.send_header("Content-Length", "100")
+                self.end_headers()
+                self.wfile.write(b"0123456789")
+                self.wfile.flush()
+                self.close_connection = True
+                return
 
             if "boom" in self.path:
                 self.send_response(502)
@@ -269,10 +295,10 @@ def fake_upstream():
     """本地明文假上游，记录收到的请求，按路径给出不同响应。"""
     servers = []
 
-    def _start() -> SimpleNamespace:
+    def _start(truncate: bool = False) -> SimpleNamespace:
         requests: list[dict] = []
         srv = http.server.ThreadingHTTPServer(
-            ("127.0.0.1", 0), make_upstream_handler(requests)
+            ("127.0.0.1", 0), make_upstream_handler(requests, truncate)
         )
         thread = threading.Thread(target=srv.serve_forever, daemon=True)
         thread.start()
@@ -339,7 +365,7 @@ def ip_address(value: str):
 def tls_upstream(tmp_path):
     """本地 TLS 假上游，用于验证"非白名单 host 走隧道"这条路径。"""
 
-    def _start() -> SimpleNamespace:
+    def _start(truncate: bool = False) -> SimpleNamespace:
         requests: list[dict] = []
         cert_path, key_path = _self_signed_for_ip("127.0.0.1", tmp_path / "fake-tls")
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -386,6 +412,5 @@ def ca(cert_dir):
 
 # 命令行选项（--network / --target-binary）与收集钩子在 prototype/conftest.py：
 # pytest 解析参数时就要注册，放这里太晚。
-
 
 

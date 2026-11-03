@@ -1,6 +1,6 @@
 [package]
 name = "winget-accel"
-version = "0.1.2"
+version = "0.1.6"
 edition = "2021"
 rust-version = "1.78"
 description = "用 PAC 把 GitHub 下载域名指到本机，再由本机改写为加速器 URL"

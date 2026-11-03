@@ -36,14 +36,16 @@ winget 的清单仍来自官方源，`InstallerSha256` 也来自官方清单—�
 | `teardown` | 删 CA、还原 `AutoConfigURL`、停进程、自校验无残留 | ❌ 一次性 |
 | `doctor` | 自检：CA 在库、PAC 生效、端口占用、加速器健康 | ❌ 按需 |
 
-Rust 交付形态的子命令：
+Rust 二进制的 CLI 只保留必要入口：
 
 ```
-winget-accel proxy      --config config.json
-winget-accel setup      [--config config.json]   # 会弹一次根证书确认
-winget-accel teardown
-winget-accel doctor
+winget-accel                     # 零参数：自动接管系统环境并启动
+winget-accel --config <文件>      # 高级配置
+winget-accel --doctor            # 体检
+winget-accel --remove-ca         # 移除本工具 CA
+winget-accel --no-env            # 测试：只启动代理，不碰 CA/PAC
 ```
+
 
 ## 3. PAC 生成与语义
 
@@ -239,16 +241,32 @@ Host: gh-proxy.com
 
 ### 8.5 当前候选
 
-| 加速器 | 状态（2026-11-01） |
-|---|---|
-| `gh-proxy.com` | ✅ 可用，支持 `Range` / `206`（§9.2） |
-| `ghproxy.imciel.com` | ✅ 可用（222 KB/s） |
+候选由启动时从 `raw.githubusercontent.com` 与 `gh-proxy.com` 并发获取；最多等待 6 秒，选有效且最完整的一份，失败时使用本地缓存/编译期内置清单。当前内置清单约 43 条，顺序和存活状态会变化。
 
-2026-11-01 复测后有 3 个可用候选（765 / 222 / 190 KB/s），回退链成立（verification-proxy §12）。
+选择策略：
+
+1. 启动时先验证一小批候选（前 6 个，分批并发）；
+2. 只有验证通过、状态为 `Healthy` 的候选可进入下载路径；
+3. `Unknown` 不参与下载选择；
+4. 后台继续探测其余候选，通过验证后才可被使用；
+5. 没有任何已验证候选时返回 `502`，不回退直连。
+
+### 8.6 首个 Range 探测
+
+winget 的 Delivery Optimization 首先发送 `Range: bytes=0-1`。代理实测确认：如果这个请求收到 502，winget 会直接失败，不会重试。因此代理把它识别为 **initial probe**，在 15 秒硬预算内尝试所有已验证的 `Healthy` 候选；每个候选连接/读头最多 5 秒，避免单个慢候选吃光总预算，只有全部失败才向客户端返回 502。
+
+日志：
+
+```text
+INITIAL-PROBE host=... range=bytes=0-1
+INITIAL-PROBE-RETRY via=... status=...
+INITIAL-PROBE-OK via=... status=206 size=2 tried=...
+FAILOVER-TIMEOUT host=... initial_probe=true tried=...
+```
 
 ## 9. 失败回退：不回退（ADR-016）
 
-所有加速器都**不健康**时，直接返回 `502` + 日志 `NO-HEALTHY-ACCEL`，**不回退直连**。
+所有加速器都**不健康**时，直接返回 `502` + 日志 `NO-VERIFIED-ACCEL`，**不回退直连**。
 
 早期设计有 `fallbackToOriginal` 开关，2026-11-01 实测后删除：
 
@@ -271,7 +289,7 @@ Host: gh-proxy.com
 | 位置 | 表现 |
 |---|---|
 | 日志 | **一条 ERROR**：`ALL-ACCEL-DOWN 所有加速器均不可用（host=unhealthy, ...）：请求会立即返回 502，后台继续重试`。只在状态**翻转**时打，避免每请求刷屏 |
-| 请求 | 立即 `502`（实测 0.1 s），并打一条 `NO-HEALTHY-ACCEL` warn |
+| 请求 | 立即 `502`（实测 0.1 s），并打一条 `NO-VERIFIED-ACCEL` warn |
 | `/health` | `"status":"down"`，可直接被脚本消费 |
 | `--doctor` | `chain` 项 **FAIL**：`N 个候选全部不可达：下载会立即失败` |
 
@@ -294,12 +312,19 @@ Host: gh-proxy.com
 
 | 行 | 含义 |
 |---|---|
-| `PAC-SERVED` | 有人来取 PAC（说明 PAC 生效） |
+| `PAC-SET <url>` | `autoenv` 已写入 `AutoConfigURL` |
+| `候选源成功/失败/超时 <url>` | 每个候选清单源的实际结果 |
+| `已从上游获取候选清单 ... 来源=<url>` | 最终命中的候选清单源与总耗时 |
+| `PAC-SERVED peer=<addr>` | 有人来取 PAC（说明 PAC 被读取） |
+| `CONNECT <host>:<port> mode=MITM\|TUNNEL` | 收到 CONNECT 并完成分流 |
+| `CONN-ACCEPT peer=<addr>` | TCP 连接已接受（debug 级） |
+| `CONN-FAIL peer=<addr> elapsed=<n>s ...` | 客户端未发送完整 HTTP 头；错误里带已读字节前缀，TLS 直连会提示 `TLS ClientHello` |
+| `REWRITE via=<accel> ... -> <status> <bytes>B <time>s` | 白名单请求已改写并转发 |
 | `REWRITE <host><path> -> <status> <bytes>B <time>s` | 白名单请求已改写并转发 |
 | `PASS ...` | 进入 MITM 但未改写（非白名单，理论上不该出现） |
 | `TUNNEL-FAIL` / `UPSTREAM-FAIL` | 上游不可达 |
 | `MITM-HANDSHAKE-FAIL` | 客户端不信任 CA |
-| `RELAY-ERR` | 转发中断 |
+| `RELAY-ERR host=... via=... retry=... elapsed=... pin_cleared=... path=...` | 正文转发中断；记录实际候选、重试次数、耗时，并解除该文件 pin |
 | `CLIENT-ERR` | 客户端侧异常（含 Name Constraints 拒绝） |
 
 `GET /health` 返回计数：`connects / mitm / tunnel / rewrites / bytes / errors`。
@@ -327,9 +352,10 @@ Host: gh-proxy.com
 ## 12. 明确不做的事
 
 - 不实现 REST 源、不建索引、不同步清单、不注册源（ADR-013）
+- **不支持 `git clone` / 通用 Git 传输**：PAC 将 clone / `git-upload-pack` 等路径默认设为 `DIRECT`，本工具不是 GitHub 通用代理
 - 不做 hosts 劫持、不改 DNS、不启用 `LocalManifestFiles`
 - 不代理 `microsoft.com` / 商店域 / 其它软件源
 - 不实现 HTTP/2——不协商 ALPN，强制 HTTP/1.1（原型即如此，实测 winget 接受）
 - 不做 CRL/OCSP（自签 CA 无吊销信息；`curl` schannel 需 `--ssl-no-revoke`，winget 不受影响）
-- 不做激进并发：健康探测并发 1、间隔 ≥5 分钟
+- 不做激进并发：健康探测分批并发 6 路、间隔 ≥5 分钟
 - 不缓存响应体（同一 URL 重复下载仍走加速器；是否加缓存待实测后再定）

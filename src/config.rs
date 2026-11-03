@@ -32,6 +32,12 @@ pub struct FileConfig {
     pub accelerators: Vec<AcceleratorCfg>,
     pub health: HealthCfg,
     pub log_level: String,
+    /// 可选：自定义证书目录。默认是 exe 同目录下的 `certs`。
+    pub cert_dir: Option<PathBuf>,
+    /// 可选：自定义日志文件。默认是 exe 同目录下的 `proxy.log`。
+    pub log_path: Option<PathBuf>,
+    /// 额外终止 TLS 但不改写的 host，仅用于 Name Constraints 等排障。
+    pub mitm_extra: Vec<String>,
 }
 
 impl Default for FileConfig {
@@ -42,9 +48,12 @@ impl Default for FileConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            accelerators: default_accelerators(),
+            accelerators: Vec::new(),
             health: HealthCfg::default(),
             log_level: "info".into(),
+            cert_dir: None,
+            log_path: None,
+            mitm_extra: Vec::new(),
         }
     }
 }
@@ -101,13 +110,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(file: FileConfig, cli: CliOverrides) -> Result<Self> {
-        let listen_spec = cli.listen.unwrap_or(file.listen);
+    pub fn new(file: FileConfig) -> Result<Self> {
+        let listen_spec = file.listen;
         let listen: SocketAddr = listen_spec
             .parse()
             .with_context(|| format!("listen 不是合法的 host:port: {listen_spec:?}"))?;
 
-        // 代理会终止 TLS，绝不能监听非回环地址——那等于对外提供 MITM 服务。
+        // 代理会终止 TLS，绝不能监听非回环地址。
         if !listen.ip().is_loopback() {
             bail!("listen 必须是回环地址（如 127.0.0.1:8443），当前为 {listen}");
         }
@@ -121,33 +130,27 @@ impl App {
             file.rewrite_hosts
         };
 
-        // 按 priority 升序构成回退链；--accel 覆盖成单元素
-        let specs: Vec<String> = match cli.accel {
-            Some(spec) => vec![spec],
-            None => {
-                let mut items: Vec<&AcceleratorCfg> = file.accelerators.iter().collect();
-                items.sort_by_key(|a| a.priority);
-                items.iter().map(|a| a.template.clone()).collect()
-            }
-        };
-        let specs = if specs.is_empty() {
-            vec![DEFAULT_ACCEL.to_string()]
+        let mut items = if file.accelerators.is_empty() {
+            default_accelerators()
         } else {
-            specs
+            file.accelerators
         };
-        let mut accels = Vec::with_capacity(specs.len());
-        for spec in &specs {
-            accels.push(parse_accel(spec)?);
+        items.sort_by_key(|a| a.priority);
+        let mut accels = Vec::with_capacity(items.len());
+        for item in &items {
+            accels.push(parse_accel(&item.template)?);
+        }
+        if accels.is_empty() {
+            accels.push(parse_accel(DEFAULT_ACCEL)?);
         }
 
         Ok(Self {
             listen,
             rewrite_hosts,
             accels,
-
-            cert_dir: cli.cert_dir.unwrap_or_else(|| PathBuf::from("certs")),
-            log_path: cli.log.unwrap_or_else(|| PathBuf::from("proxy.log")),
-            mitm_extra: cli.mitm_extra,
+            cert_dir: file.cert_dir.unwrap_or_else(|| exe_dir().join("certs")),
+            log_path: file.log_path.unwrap_or_else(|| exe_dir().join("proxy.log")),
+            mitm_extra: file.mitm_extra,
             health_enabled: file.health.enabled,
             health_interval: Duration::from_secs(file.health.interval_seconds.max(60)),
             health_timeout: Duration::from_secs(file.health.timeout_seconds.max(1)),
@@ -166,15 +169,13 @@ impl App {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct CliOverrides {
-    pub listen: Option<String>,
-    pub accel: Option<String>,
-    pub cert_dir: Option<PathBuf>,
-    pub log: Option<PathBuf>,
-    pub mitm_extra: Vec<String>,
+/// exe 所在目录。默认证书/日志按绿色版约定放在 exe 旁边。
+fn exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
-
 /// 读配置文件；路径不存在时用默认值。
 pub fn load(path: Option<&PathBuf>) -> Result<FileConfig> {
     let Some(path) = path else {
@@ -244,24 +245,32 @@ fn default_accelerators() -> Vec<AcceleratorCfg> {
     out
 }
 
-/// exe 所在目录。清单与 certs/log 一样按"绿色版"约定放在 exe 旁边。
-fn exe_dir() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn app(listen: &str) -> Result<App> {
-        let file = FileConfig {
+    fn test_file(listen: &str) -> FileConfig {
+        FileConfig {
             listen: listen.to_string(),
-            ..Default::default()
-        };
-        App::new(file, CliOverrides::default())
+            rewrite_hosts: DEFAULT_REWRITE_HOSTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            accelerators: vec![AcceleratorCfg {
+                name: "a".into(),
+                template: "https://a.example/{url}".into(),
+                priority: 1,
+            }],
+            health: HealthCfg::default(),
+            log_level: "info".into(),
+            cert_dir: Some(PathBuf::from("certs-test")),
+            log_path: Some(PathBuf::from("proxy-test.log")),
+            mitm_extra: Vec::new(),
+        }
+    }
+
+    fn app(listen: &str) -> Result<App> {
+        App::new(test_file(listen))
     }
 
     #[test]
@@ -275,7 +284,6 @@ mod tests {
 
     #[test]
     fn rejects_non_loopback_listen() {
-        // 对外提供终止 TLS 的服务是不可接受的
         assert!(app("0.0.0.0:8443").is_err());
         assert!(app("192.168.1.10:8443").is_err());
     }
@@ -293,52 +301,51 @@ mod tests {
 
     #[test]
     fn mitm_extra_widens_mitm_but_not_rewrite() {
-        let file = FileConfig::default();
-        let cli = CliOverrides {
-            mitm_extra: vec!["example.com".into()],
-            ..Default::default()
-        };
-        let app = App::new(file, cli).unwrap();
+        let mut file = test_file("127.0.0.1:8443");
+        file.mitm_extra = vec!["example.com".into()];
+        let app = App::new(file).unwrap();
         assert!(app.should_mitm("example.com"));
         assert!(!app.should_rewrite("example.com"));
     }
 
     #[test]
     fn picks_lowest_priority_accelerator() {
-        let file = FileConfig {
-            accelerators: vec![
-                AcceleratorCfg {
-                    name: "b".into(),
-                    template: "https://second.example".into(),
-                    priority: 2,
-                },
-                AcceleratorCfg {
-                    name: "a".into(),
-                    template: "https://first.example".into(),
-                    priority: 1,
-                },
-            ],
-            ..Default::default()
-        };
-        let app = App::new(file, CliOverrides::default()).unwrap();
+        let mut file = test_file("127.0.0.1:8443");
+        file.accelerators = vec![
+            AcceleratorCfg {
+                name: "b".into(),
+                template: "https://second.example".into(),
+                priority: 2,
+            },
+            AcceleratorCfg {
+                name: "a".into(),
+                template: "https://first.example".into(),
+                priority: 1,
+            },
+        ];
+        let app = App::new(file).unwrap();
         assert_eq!(app.accels[0].host, "first.example");
     }
 
     #[test]
-    fn cli_accel_overrides_file() {
-        let file = FileConfig::default();
-        let cli = CliOverrides {
-            accel: Some("http://127.0.0.1:9000".into()),
-            ..Default::default()
-        };
-        let app = App::new(file, cli).unwrap();
-        assert_eq!(app.accels.len(), 1, "--accel 应覆盖成单候选");
-        assert_eq!(
-            (app.accels[0].host.as_str(), app.accels[0].port),
-            ("127.0.0.1", 9000)
-        );
+    fn optional_paths_and_mitm_extra_are_honored() {
+        let mut file = test_file("127.0.0.1:8443");
+        file.cert_dir = Some(PathBuf::from("custom-certs"));
+        file.log_path = Some(PathBuf::from("custom.log"));
+        file.mitm_extra = vec!["example.com".into()];
+        let app = App::new(file).unwrap();
+        assert_eq!(app.cert_dir, PathBuf::from("custom-certs"));
+        assert_eq!(app.log_path, PathBuf::from("custom.log"));
+        assert!(app.should_mitm("example.com"));
     }
 
+    #[test]
+    fn default_config_has_no_eager_candidate_fetch() {
+        let file = FileConfig::default();
+        assert!(file.accelerators.is_empty());
+        assert!(file.cert_dir.is_none());
+        assert!(file.log_path.is_none());
+    }
     #[test]
     fn example_config_parses() {
         let text = std::fs::read_to_string("config.example.json").unwrap();
