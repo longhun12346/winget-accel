@@ -1,0 +1,43 @@
+# 二进制/构建产物
+/bin/
+/dist/
+/target/
+*.exe
+*.dll
+*.pdb
+
+# 证书与私钥（绝不入库）
+/certs/
+*.crt
+*.key
+*.pfx
+*.pem
+
+# 本地配置
+/config.json
+config.local.json
+*.local.json
+
+# 日志
+*.log
+/logs/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# Python 原型（docs/prototype）
+/prototype/.venv/
+/prototype/certs/
+/prototype/state.json
+__pycache__/
+/prototype/.pytest_cache/
+/prototype/*.stdout.txt
+/prototype/*.stderr.txt
+/prototype/*.out
+/prototype/*.err
+/prototype/wg-*.txt
+
+# DSH 工具自己的暂存目录
+/.dsh/

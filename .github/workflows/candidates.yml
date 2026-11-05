@@ -1,0 +1,93 @@
+name: Candidates
+
+# 每天全量重测候选池。
+#
+# 为什么每天：域名可用性变化很快——实测过同一天内同一候选 703 → 104 KB/s、
+# 可用 → 429 → 可用。只测增量会长期保留过期判断。
+#
+# 为什么不设"人工 review 闸门"：人看 80 个域名无法判断哪个被攻击者控制，
+# `gh-abcd.xyz` 和 `gh-proxy.com` 在外观上没有区别。真正的判据是机械的：
+# 返回字节是否与直连 GitHub 一致（脚本里做 SHA-256 比对），
+# 加上 winget 官方的 InstallerSha256 校验兜底。
+on:
+  schedule:
+    # 每天 03:17 UTC（北京时间 11:17）。避开整点，减少与其它定时任务抢资源。
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: candidates
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: 重测候选池
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: 全量实测并重写清单
+        id: update
+        shell: pwsh
+        run: ./packaging/update-candidates.ps1
+
+      # 提交必须放在"报错"之前，并且用 always() 保证一定执行。
+      #
+      # 为什么：内容不一致时脚本已经把那些域名写进 watchlist 并**落盘**了，
+      # 但若先跑一个 exit 1 的步骤，Actions 会跳过后续所有步骤——修正永远提交不上去。
+      # 于是第二天跑出同样的结果，CI 一直红、清单一直没被修正，形成死循环。
+      # 现在先提交、再报错：状态被纠正，同时任务变红提醒有人去看。
+      - name: 提交变更
+        shell: pwsh
+        run: |
+          $changed = git status --porcelain candidates.json
+          if (-not $changed) {
+            Write-Host "清单无变化，不提交。"
+            exit 0
+          }
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add candidates.json
+
+          # 变化摘要进提交信息，方便日后追溯"哪天哪个域名掉了"
+          $diff = git diff --cached --unified=0 candidates.json |
+            Select-String '^[+-]' |
+            Select-Object -First 40
+          $summary = ($diff | ForEach-Object { $_.Line }) -join "`n"
+
+          $lines = @(
+            "每天全量重测（candidates.yml）"
+            ""
+            "- candidates: ${{ steps.update.outputs.candidates }} 个"
+            "- watchlist:  ${{ steps.update.outputs.watchlist }} 个"
+            "- 内容不一致: ${{ steps.update.outputs.mismatch }} 个"
+            ""
+            "判据：Range 206 + Content-Range + 64 KiB 采样 + 与直连 GitHub 的 SHA-256 比对。"
+            "429 记为「活着但限流」，不永久剔除；连续 3 次不可用才移除。"
+            "内嵌候选（builtin）即使失败也保留，作为离线兜底。"
+            ""
+            $summary
+          )
+          $lines | Out-File -FilePath "$env:TEMP\msg.txt" -Encoding utf8
+          git commit -F "$env:TEMP\msg.txt"
+          git push
+
+      # 报错放在**提交之后**：状态先被纠正（mismatch 的域名已进 watchlist 并提交），
+      # 再让任务变红提醒有人来看。反过来做会导致修正永远提交不上去（见上一条注释）。
+      # `always()` 是为了脚本本身失败时也能把 mismatch 报出来（那种情况下没有提交可做）。
+      - name: 检查是否有候选返回了不一致的内容
+        if: always() && steps.update.outputs.mismatch != '0' && steps.update.outputs.mismatch != ''
+        shell: pwsh
+        run: |
+          Write-Host "::error::有 ${{ steps.update.outputs.mismatch }} 个候选返回的字节与直连 GitHub 不一致。"
+          Write-Host "这些域名已被写入 watchlist 并标注，绝不会进入 candidates（本次修正已提交）。"
+          Write-Host "如反复出现，应把它们从清单中彻底移除并排查上游。"
+          exit 1

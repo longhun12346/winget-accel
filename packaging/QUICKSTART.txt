@@ -1,0 +1,153 @@
+winget-accel — 让 winget 使用公共 GitHub 加速服务
+================================================
+
+这是一个 Windows 本地代理。它不替换 winget 源、不修改清单，只接管 GitHub 安装包的
+下载请求，把它们转到公共 URL 前缀加速服务。winget 仍使用官方清单和官方哈希校验。
+
+边界
+----
+
+- 支持 Windows 10/11 x64。
+- 不支持 git clone / git-upload-pack。代理不转发请求体。
+- PAC 对 github.com 整域代理；代理内部只改写下载路径，普通页面原样回源。
+- 只能使用公共加速服务。服务可能限流、下线或临时不可用。
+
+放置程序
+--------
+
+把 zip 解压到有写权限的目录，例如：
+
+    D:\Tools\winget-accel
+    %LOCALAPPDATA%\winget-accel
+
+不要放到 C:\Program Files\。程序会在 exe 目录写入：
+
+    certs\                 本机 CA 与私钥
+    proxy.log              运行日志，超过 8 MiB 自动轮转
+    candidates.cache.json  候选服务缓存
+
+PAC 恢复记录和实例锁统一放在：
+
+    %LOCALAPPDATA%\winget-accel\state.json
+    %LOCALAPPDATA%\winget-accel\pac.lock
+
+同一用户只允许一个实例接管 PAC。锁文件在退出后保留是正常的，锁由文件句柄释放。
+
+开始使用
+--------
+
+1. 双击 winget-accel.exe。
+
+   第一次运行会生成 CA，并弹出 Windows 信任确认框。请在可见桌面点击“是”。
+   等日志出现“已就绪”后再开始下载。
+
+2. 在另一个终端正常使用：
+
+       winget install Git.Git
+       winget download --id junegunn.fzf --download-directory C:\Temp\winget-test
+
+   默认模式还会把 winget 用户设置中的 network.downloader 设为 wininet，退出时自动恢复。
+
+3. 停止时回到程序窗口按 Ctrl+C。
+
+   PAC 和 winget 设置会恢复到接管前的值。运行期间你手动改过或删除的设置会保留。
+   强制结束时看门狗会兜底；下次启动也会检查残留状态。
+
+诊断
+----
+
+只读体检：
+
+    winget-accel.exe --doctor
+
+快速体检：
+
+    winget-accel.exe --doctor --quick
+
+重点看：
+
+- `pac`：当前 PAC 是否指向正在运行的实例，以及运行中的 PAC 是否和配置一致；
+- `winget`：下载器是否为 `wininet`；
+- `proxyenv`：是否还开着全局代理；
+- `chain`：候选服务是否可达；
+- `probe`：候选是否能取得测速资产；
+- `ca` / `ca-extra`：CA 是否可读、约束是否匹配、是否有旧 CA 残留。
+
+配置
+----
+
+复制 config.example.json：
+
+    Copy-Item .\config.example.json .\config.json
+
+主要字段：
+
+- `rewriteHosts`：精确主机名列表，不写通配符、协议、路径或端口；
+- `accelerators`：自定义公共候选，非空时替代自动候选池；
+- `health.probeUrl`：自定义测速资产，必须是完整 HTTPS URL；
+- `wingetDownloader`：设为 false 可跳过 winget 下载器设置；
+- `certDir` / `logPath`：覆盖证书和日志路径。
+
+不接管系统设置的测试模式：
+
+    winget-accel.exe --config .\config.json --no-env
+
+该模式仍运行代理和候选验证，但不安装 CA、不写 PAC、不改 winget 设置。
+
+证书和安全
+----------
+
+CA 只允许签发四个白名单域及其子域：
+
+    github.com
+    objects.githubusercontent.com
+    codeload.github.com
+    release-assets.githubusercontent.com
+
+安装包下载完成后，winget 还会按官方清单校验 `InstallerSha256`。CA 私钥在
+certs\ca-key.pem 中，请勿分发或放入云同步目录。
+
+卸载
+----
+
+1. 先按 Ctrl+C 停止代理；
+2. 执行：
+
+       winget-accel.exe --remove-ca
+
+3. 确认所有实例退出后删除 exe 目录；
+4. 如需彻底清理，再删除 `%LOCALAPPDATA%\winget-accel`。
+
+故障排查
+--------
+
+“PAC 状态无法解析”：保留 `%LOCALAPPDATA%\winget-accel\state.json`，先备份并核对
+Windows 代理设置，不要直接删除现有 PAC。状态文件损坏时程序会停止自动接管，避免误删
+用户设置。
+
+“证书错误”：先执行 `--remove-ca`，再重新启动并确认信任新的 CA。
+
+“下载 502”：查看 `--doctor` 的 `chain` 和 `probe`。候选首页可达不代表资产支持
+Range；测速资产被删除时，可以配置自己的 `health.probeUrl`。
+
+“仍然很慢”：确认日志里有 `REWRITE`，并检查 `proxyenv` 是否显示全局代理。公共服务
+的速度和限流会变化，候选池会自动切换。
+
+提交诊断信息时，请提供：
+
+1. `winget-accel.exe --doctor` 全部输出；
+2. `proxy.log` 中出问题时间段的日志。
+
+日志会去掉 URL 查询串，避免把签名参数写进日志。
+
+验证下载包
+----------
+
+包内 SHA256.txt 记录 exe 哈希和大小：
+
+    certutil -hashfile winget-accel.exe SHA256
+
+许可证
+------
+
+MIT。第三方组件许可见 THIRD-PARTY-NOTICES.md。

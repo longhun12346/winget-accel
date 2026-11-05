@@ -1,0 +1,10 @@
+# 统一行尾为 LF：仓库里 15 个源文件是 LF，只有 health.rs 曾经是 CRLF，
+# 结果编辑工具按文件各自的行尾处理，改一个文件时容易整篇重写（diff 变成几百行假改动）。
+# Rust/PowerShell/Python 都不要求 CRLF；winget 的构建产物是 exe，与行尾无关。
+* text=auto eol=lf
+
+# 二进制/归档文件不做行尾转换
+*.exe binary
+*.zip binary
+*.png binary
+*.ico binary

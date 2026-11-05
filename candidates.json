@@ -1,0 +1,686 @@
+{
+  "_comment": [
+    "候选加速器清单。由 .github/workflows/candidates.yml 每天全量实测后自动更新并直接提交。",
+    "",
+    "字段含义：",
+    "  builtin  true  = 编译进二进制，离线/上游消失时仍可用。标准很严：必须是长期存在、",
+    "                   被多个独立项目引用、且我们实测通过的。宁可少，不可滥。",
+    "  builtin  false = 由 CI 从上游发现并实测通过，随发布更新，不进离线兜底。",
+    "  verified        = **CI 侧**实测记录（日期 + KB/s）。CI 跑在 Azure 美国，与用户网络",
+    "                    （如国内）完全不同，此值不代表任何用户的体验，也不能用作排序依据。",
+    "                    它只记录『该域名当时活着、且返回字节与 GitHub 一致』。",
+    "                    真实排序由每个用户自己的运行时探测 + 下载样本决定。",
+    "",
+    "上游发现源：https://hubp.tbedu.top/nodes.json（标准 JSON）。",
+    "只取域名，不采信上游的任何推荐结论或顺序。",
+    "社区现状：加速器列表事实上由 hubporg 一家维护（nodes.json 与 ghproxy-next 的",
+    "nodes.ts 是同一批数据），没有第二个独立且活跃的源。所以这里接受单点上游，",
+    "用「内嵌兜底 + 实测验证」两层把它的失效影响限制在『候选池不再增长』。"
+  ],
+  "version": 2,
+  "updated": "2026-11-05",
+  "candidates": [
+    {
+      "name": "gh-proxy",
+      "template": "https://gh-proxy.com/{url}",
+      "builtin": true,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 79,
+        "note": "实测 79 KB/s"
+      }
+    },
+    {
+      "name": "ghfast",
+      "template": "https://ghfast.top/{url}",
+      "builtin": true,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 98,
+        "note": "实测 98 KB/s"
+      }
+    },
+    {
+      "name": "imciel",
+      "template": "https://ghproxy.imciel.com/{url}",
+      "builtin": true,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 184,
+        "note": "实测 184 KB/s"
+      }
+    },
+    {
+      "name": "ghproxy-site",
+      "template": "https://ghproxy.site/{url}",
+      "builtin": true,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 180,
+        "note": "实测 180 KB/s"
+      }
+    },
+    {
+      "name": "gh-qfmc0721-cc",
+      "template": "https://gh.qfmc0721.cc.cd/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 90,
+        "note": "CI 侧实测 90 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gh-chjina",
+      "template": "https://gh.chjina.com/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 115,
+        "note": "CI 侧实测 115 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "fastgit",
+      "template": "https://fastgit.cc/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 107,
+        "note": "CI 侧实测 107 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "github-tbap",
+      "template": "https://github.tbap.top/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 43,
+        "note": "CI 侧实测 43 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gh-monlor",
+      "template": "https://gh.monlor.com/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 71,
+        "note": "CI 侧实测 71 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "free-cn-eu",
+      "template": "https://free.cn.eu.org/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 52,
+        "note": "CI 侧实测 52 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gg-z321-cc",
+      "template": "https://gg.z321.cc.cd/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 37,
+        "note": "CI 侧实测 37 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gh-geekertao",
+      "template": "https://gh.geekertao.top/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 80,
+        "note": "CI 侧实测 80 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "ghgo-de5",
+      "template": "https://ghgo.de5.net/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 127,
+        "note": "CI 侧实测 127 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gh-acmsz",
+      "template": "https://gh.acmsz.top/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 85,
+        "note": "CI 侧实测 85 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "ghm-078465",
+      "template": "https://ghm.078465.xyz/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 50,
+        "note": "CI 侧实测 50 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gh-beimengvv",
+      "template": "https://gh.beimengvv.xyz/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 29,
+        "note": "CI 侧实测 29 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "tvv",
+      "template": "https://tvv.tw/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 130,
+        "note": "CI 侧实测 130 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "github-mxw-qzz",
+      "template": "https://github.mxw.qzz.io/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 118,
+        "note": "CI 侧实测 118 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "github-chenc",
+      "template": "https://github.chenc.dev/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 29,
+        "note": "CI 侧实测 29 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "g-z321-cc",
+      "template": "https://g.z321.cc.cd/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 138,
+        "note": "CI 侧实测 138 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "github-ednovas",
+      "template": "https://github.ednovas.xyz/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 103,
+        "note": "CI 侧实测 103 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "ghproxy",
+      "template": "https://ghproxy.icu/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 420,
+        "note": "CI 侧实测 420 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "down-mxw-xx",
+      "template": "https://down.mxw.xx.kg/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 73,
+        "note": "CI 侧实测 73 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "ghp-keleyaa",
+      "template": "https://ghp.keleyaa.com/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 148,
+        "note": "CI 侧实测 148 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "cdn-akaere",
+      "template": "https://cdn.akaere.online/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 102,
+        "note": "CI 侧实测 102 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gh-dpik",
+      "template": "https://gh.dpik.top/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 43,
+        "note": "CI 侧实测 43 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "jiashu-1win-eu",
+      "template": "https://jiashu.1win.eu.org/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 152,
+        "note": "CI 侧实测 152 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gh-my-website-ccwu",
+      "template": "https://gh.my-website.ccwu.cc/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 130,
+        "note": "CI 侧实测 130 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gh-inkchills",
+      "template": "https://gh.inkchills.cn/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 39,
+        "note": "CI 侧实测 39 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gh-jjj-gv",
+      "template": "https://gh.jjj.gv.uy/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 36,
+        "note": "CI 侧实测 36 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "ghfile-geekertao",
+      "template": "https://ghfile.geekertao.top/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 42,
+        "note": "CI 侧实测 42 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gh-07150721",
+      "template": "https://gh.07150721.xyz/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 113,
+        "note": "CI 侧实测 113 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gh-sixyin",
+      "template": "https://gh.sixyin.com/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 56,
+        "note": "CI 侧实测 56 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "ghproxy-felicity",
+      "template": "https://ghproxy.felicity.land/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 76,
+        "note": "CI 侧实测 76 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "git-yylx",
+      "template": "https://git.yylx.win/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 30,
+        "note": "CI 侧实测 30 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "ghproxy",
+      "template": "https://ghproxy.net/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 10,
+        "note": "CI 侧实测 10 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "cdn-gh-proxy",
+      "template": "https://cdn.gh-proxy.com/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 79,
+        "note": "CI 侧实测 79 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "gh-noki",
+      "template": "https://gh.noki.icu/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 100,
+        "note": "CI 侧实测 100 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "g-blfrp",
+      "template": "https://g.blfrp.cn/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 11,
+        "note": "CI 侧实测 11 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "xsadwsd-kdns",
+      "template": "https://xsadwsd.kdns.fr/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 154,
+        "note": "CI 侧实测 154 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "down-mxw-qzz",
+      "template": "https://down.mxw.qzz.io/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 73,
+        "note": "CI 侧实测 73 KB/s（Azure 美国，不代表用户网络）"
+      }
+    },
+    {
+      "name": "git-669966",
+      "template": "https://git.669966.xyz/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-05",
+        "kbps": 33,
+        "note": "CI 侧实测 33 KB/s（Azure 美国，不代表用户网络）"
+      }
+    }
+  ],
+  "watchlist": [
+    {
+      "name": "proxy-yaoyaoling",
+      "template": "https://proxy.yaoyaoling.net/{url}",
+      "reason": "曾通过实测，本轮 dead（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "github-xxlab",
+      "template": "https://github.xxlab.tech/{url}",
+      "reason": "曾通过实测，本轮 dead（状态 0）；连续失败 1 次，达 3 次移除",
+      "failures": 1
+    },
+    {
+      "name": "github-dpik",
+      "template": "https://github.dpik.top/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
+      "failures": 2
+    },
+    {
+      "name": "github-proxy-memory-echoes",
+      "template": "https://github-proxy.memory-echoes.cn/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
+      "failures": 2
+    },
+    {
+      "name": "gh-felicity-ac",
+      "template": "https://gh.felicity.ac.cn/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
+      "failures": 2
+    },
+    {
+      "name": "gh-ddlc",
+      "template": "https://gh.ddlc.top/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
+      "failures": 2
+    },
+    {
+      "name": "gitproxy-mrhjx",
+      "template": "https://gitproxy.mrhjx.cn/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
+      "failures": 2
+    },
+    {
+      "name": "ghproxy-cxkpro",
+      "template": "https://ghproxy.cxkpro.top/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
+      "failures": 2
+    },
+    {
+      "name": "gh-idayer",
+      "template": "https://gh.idayer.com/{url}",
+      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
+      "failures": 2
+    },
+    {
+      "name": "j-1lin-dpdns",
+      "template": "https://j.1lin.dpdns.org/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "github-starrlzy",
+      "template": "https://github.starrlzy.cn/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "gh-bugdey-us",
+      "template": "https://gh.bugdey.us.kg/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "j-1win-ggff",
+      "template": "https://j.1win.ggff.net/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "gitproxy-127731",
+      "template": "https://gitproxy.127731.xyz/{url}",
+      "reason": "实测不可用（状态 521）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "gh-catmak",
+      "template": "https://gh.catmak.name/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "slink",
+      "template": "https://slink.ltd/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "ghpr",
+      "template": "https://ghpr.cc/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "github-tmby",
+      "template": "https://github.tmby.shop/{url}",
+      "reason": "实测不可用（状态 401）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "gitproxy",
+      "template": "https://gitproxy.click/{url}",
+      "reason": "实测不可用（状态 401）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "gh-tryxd",
+      "template": "https://gh.tryxd.cn/{url}",
+      "reason": "实测不可用（状态 206）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "ghpxy-hwinzniej",
+      "template": "https://ghpxy.hwinzniej.top/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "gh-jasonzeng",
+      "template": "https://gh.jasonzeng.dev/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "github-geekery",
+      "template": "https://github.geekery.cn/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "gp-zkitefly-eu",
+      "template": "https://gp.zkitefly.eu.org/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "ghproxy-1888866",
+      "template": "https://ghproxy.1888866.xyz/{url}",
+      "reason": "实测不可用（状态 525）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "ghp-arslantu",
+      "template": "https://ghp.arslantu.xyz/{url}",
+      "reason": "实测不可用（状态 525）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "githubdog",
+      "template": "https://githubdog.com/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "gh-meali",
+      "template": "https://gh.meali.top/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "ghproxy-monkeyray",
+      "template": "https://ghproxy.monkeyray.net/{url}",
+      "reason": "实测不可用（状态 404）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "777-z321-cc",
+      "template": "https://777.z321.cc.cd/{url}",
+      "reason": "实测不可用（状态 200）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "js-jiangss",
+      "template": "https://js.jiangss.shop/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "gap-andyjin",
+      "template": "https://gap.andyjin.website/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "github-ikgy",
+      "template": "https://github.ikgy.top/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "cfgh-ikgy",
+      "template": "https://cfgh.ikgy.top/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "github-nswrz",
+      "template": "https://github.nswrz.cn/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "github-cf-947563",
+      "template": "https://github-cf.947563.xyz/{url}",
+      "reason": "实测不可用（状态 521）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "github-gohj99",
+      "template": "https://github.gohj99.site/{url}",
+      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "gh-927223",
+      "template": "https://gh.927223.xyz/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "gh-ruan-dpdns",
+      "template": "https://gh.ruan.dpdns.org/{url}",
+      "reason": "实测不可用（状态 522）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "gh-zhai-edu",
+      "template": "https://gh.zhai.edu.pl/{url}",
+      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    }
+  ]
+}

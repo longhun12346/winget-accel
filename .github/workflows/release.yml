@@ -1,0 +1,166 @@
+name: Release
+
+# 打 tag（v*）时自动构建并发布；也可以手动触发只拿 artifact。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建发布产物
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # tag 是版本号的唯一事实来源：从 v0.1.3 推导出 0.1.3 写回 Cargo.toml。
+      # 这样"发版"只剩一个动作（打 tag），不用记得同时改 Cargo.toml。
+      - name: 从 tag 推导版本号
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: ./packaging/set-version.ps1 -FromTag $env:GITHUB_REF_NAME
+
+      # 打包前先跑一遍测试：产物必须来自测试通过的代码
+      - name: 单元测试
+        run: cargo test --all-targets
+
+      - name: clippy（警告即失败）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 组装发布包
+        id: pack
+        shell: pwsh
+        run: ./packaging/make-release.ps1
+
+      # 发版是"可复现构建"这条承诺真正兑现的地方：用户拿包里的 SHA256.txt 去核对自己
+      # 重编的产物。所以这里必须验证**已发布的那份包**能被逐字节重建，而不是只信 CI。
+      #
+      # 注意：必须真的重编（改 mtime 让指纹失效），并断言出现了 `Compiling`——
+      # 否则 cargo 认为已是最新时，"哈希相同"什么都证明不了（CI 里踩过这个坑）。
+      - name: 可复现性（已打包的 exe 必须能逐字节重建）
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          $stage = "dist\winget-accel-$version-win-x64"
+          $shipped = (Select-String -Path "$stage\SHA256.txt" -Pattern 'SHA256 = ([0-9a-f]+)').Matches.Groups[1].Value
+          $exe = "target\release\winget-accel.exe"
+          $built = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          Write-Host "包内声明 = $shipped"
+          Write-Host "当前产物 = $built"
+          if ($shipped -ne $built) { throw "包内声明的哈希与构建产物不一致：$shipped != $built" }
+
+          # 关闭 ANSI 颜色，确保下面对 `Compiling winget-accel` 的文本匹配稳定。
+          $env:CARGO_TERM_COLOR = 'never'
+          (Get-Item src\main.rs).LastWriteTime = (Get-Date).AddMinutes(2)
+          $out = cargo build --release 2>&1
+          $out | Select-String -Pattern 'Compiling|Finished' | ForEach-Object { $_.Line }
+          if (-not ($out | Select-String -Pattern 'Compiling winget-accel')) {
+            throw "没有真正重编（cargo 认为已是最新），这次的比较无效"
+          }
+          $rebuilt = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          Write-Host "重编产物 = $rebuilt"
+          if ($shipped -ne $rebuilt) {
+            throw "发布产物不可复现：包内 $shipped，重编 $rebuilt（用户将无法核对 SHA256）"
+          }
+          Write-Host "可复现性通过：已打包的 exe 可由同一源码逐字节重建"
+
+
+      # env!("CARGO_PKG_VERSION") 是编译期常量，若某处缓存导致没重新编译，
+      # 这一步能立刻发现（宁可失败，也不要发出一个版本号错误的包）。
+      #
+      # 注意顺序：必须放在"组装发布包"之后 —— release 构建发生在
+      # make-release.ps1 里面，此前 target\release 下的 exe 并不存在。
+      # （v0.1.3 首次尝试就因为把这一步放在构建前而失败。）
+      - name: 校验产物版本与 tag 一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $expected = $env:GITHUB_REF_NAME -replace '^v', ''
+          $exe = "target\release\winget-accel.exe"
+          if (-not (Test-Path $exe)) { throw "找不到构建产物: $exe" }
+          $actual = (& $exe --version) -replace '^winget-accel\s+', ''
+          $actual = $actual.Trim()
+          Write-Host "tag=$expected  二进制=$actual"
+          if ($actual -ne $expected) {
+            throw "产物版本与 tag 不一致：二进制=$actual，tag=$expected"
+          }
+
+      # 冒烟：产出的 exe 必须能跑，且不依赖 VC++ 运行库
+      - name: 冒烟测试产物
+        shell: pwsh
+        run: |
+          $exe = "target\release\winget-accel.exe"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "--version 失败" }
+          & $exe --help | Select-Object -First 2
+          if ($LASTEXITCODE -ne 0) { throw "--help 失败" }
+          # 确认没有 VCRUNTIME / UCRT 依赖（静态 CRT 是否生效）
+          $dumpbin = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio' -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($dumpbin) {
+            $deps = & $dumpbin.FullName /dependents $exe 2>&1 | Select-String '\.dll'
+            $bad = $deps | Where-Object { $_ -match 'VCRUNTIME|MSVCP|api-ms-win-crt' }
+            if ($bad) { throw "产物仍依赖 VC++ 运行库: $bad" }
+            Write-Host "依赖检查通过（无 VCRUNTIME/UCRT）"
+          } else {
+            Write-Host "未找到 dumpbin，跳过依赖检查"
+          }
+
+      # 前面的冒烟测试只验 `target\release` 下的 exe；用户拿到的是 **zip**。
+      # 两者可能不一致（打包漏文件、SHA256.txt 写错、程序依赖仓库目录里的东西）。
+      # 这一步解压 zip 到独立目录逐项验证——与本地 `verify-package.ps1` 完全同一套检查。
+      - name: 交付物验证（解压 zip 后独立运行）
+        shell: pwsh
+        run: |
+          # 显式指定 zip，不依赖"dist 里最新一个"——CI 缓存可能带回旧版本，
+          # 按时间戳取会验错包。
+          $version = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          $zip = "dist\winget-accel-$version-win-x64.zip"
+          if (-not (Test-Path $zip)) { throw "找不到待发布的 zip：$zip" }
+          ./packaging/verify-package.ps1 -Zip $zip -SkipBuild
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: winget-accel-win-x64
+          path: ${{ steps.pack.outputs.zip }}
+          if-no-files-found: error
+
+      - name: 发布到 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pack.outputs.zip }}
+          name: winget-accel ${{ steps.pack.outputs.version }}
+          body: |
+            ## 安装
+            1. 解压 zip
+            2. 双击 `winget-accel.exe`，在弹出的安全警告里点「是」
+            3. 另开窗口正常使用 `winget install ...`
+            4. 停止：回到程序窗口按 `Ctrl+C`（会自动还原系统代理设置）
+
+            详细说明与排障见包内 `QUICKSTART.txt`。
+
+            ## 校验
+            ```
+            SHA256(zip) = ${{ steps.pack.outputs.zip_hash }}
+            ```
+            包内 `SHA256.txt` 含 exe 自身的校验和。
+
+            > 本程序会在「当前用户受信任的根证书」里装一张 CA，
+            > 该 CA 被限制为只能签发 4 个 GitHub 下载域名（Name Constraints），
+            > 不能冒充其它站点。不需要管理员权限。
+          draft: false
+          prerelease: false

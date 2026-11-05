@@ -1,0 +1,10 @@
+# 静态链接 MSVC CRT：产物不依赖 VCRUNTIME140.dll / UCRT 系列，
+# 拷到没装 VC++ 运行库的机器也能直接跑（ADR-009 的"零依赖"要求）。
+#
+# /Brepro：让 MSVC 链接器不写入真实时间戳（改用内容哈希），使构建**可复现**。
+# 实测（2026-11-03）：不加该参数时，同一份源码连续两次 `cargo build --release`
+# 得到的 exe 大小相同但 SHA256 不同；加上之后两次构建字节完全一致。
+# 意义：用户可以用同一工具链重编出与发布包**逐字节相同**的 exe 来核对 SHA256。
+# 前提：rustc 版本需与发布时一致（Cargo.lock 已入库，工具链版本见 CI）。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-args=/Brepro"]

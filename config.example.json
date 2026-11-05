@@ -1,0 +1,71 @@
+{
+  "$comment": "复制为 config.json 后按需修改。config.json 已被 .gitignore 排除。字段形状以本文件为唯一权威，docs/design.md 只做语义解释。",
+  "$comment_schema": "代理架构的最小示例：端口、host 白名单、加速器候选、健康探测、日志级别（ADR-013）。",
+
+  "$comment_listen": "只允许 127.0.0.1。端口同时被 PAC 内容引用，进程内生成，不会出现两者不一致",
+  "listen": "127.0.0.1:8443",
+
+  "$comment_rewriteHosts": "只有命中此列表的 CONNECT 才会被终止 TLS 并改写；其余 host 一律原样隧道（ADR-004 / ADR-014 约束 2）。PAC 与改写共用这一份列表。只接受**精确主机名**：写通配符（*.github.com）、带协议/路径/端口都会被启动时拒绝——这些条目在 PAC 里是精确比较，写了也不会命中，静默失效比报错更难查。github.com 的子域（api.github.com 等）已自动转入隧道，不需要另外声明。新增 host 前必须确认加速器支持它（design.md §8.4）",
+  "rewriteHosts": [
+    "github.com",
+    "objects.githubusercontent.com",
+    "codeload.github.com",
+    "release-assets.githubusercontent.com"
+  ],
+
+  "$comment_accelerators": "按 priority 升序取第一个健康的；{url} 替换为原始完整 URL。**同一 host 只保留第一条**（按 host 去重：同站点不同路径前缀没必要占两个名额），所以写 3 条但其中 2 条同 host 时，启动日志会显示「3 条，合并内置后共 2 个候选」——这是去重生效，不是配置丢了。健康探测打各自 origin 的根路径。默认候选池不在这里——它来自 candidates.json（启动时从上游刷新，约 43 条）；本文件的 accelerators 一旦非空就会**完全取代**默认池，所以只在自建/固定候选时才填",
+  "$comment_accelerators_verified": "下面 5 条是 2026-11-01 的实测快照（同一资源、Range 206 + 整包 SHA256 校验通过：gh-proxy.com 765 KB/s、ghproxy.imciel.com 222 KB/s、ghfast.top 190 KB/s）。公共服务的存活与速度每天都在变，不要把这些数字当作当前值；也不需要照抄——留空 accelerators 就会用自动维护的候选池",
+  "accelerators": [
+    {
+      "name": "gh-proxy",
+      "template": "https://gh-proxy.com/{url}",
+      "priority": 1,
+      "hosts": []
+    },
+    {
+      "name": "geekertao",
+      "template": "https://gh.geekertao.top/{url}",
+      "priority": 2
+    },
+    {
+      "name": "ghfast",
+      "template": "https://ghfast.top/{url}",
+      "priority": 3
+    },
+    {
+      "name": "ghproxy-site",
+      "template": "https://ghproxy.site/{url}",
+      "priority": 4
+    },
+    {
+      "name": "imciel",
+      "template": "https://ghproxy.imciel.com/{url}",
+      "priority": 5
+    }
+  ],
+
+  "health": {
+    "$comment_enabled": "false 只关掉「例行」探测（省流量/离线调试用）；全挂时仍会每 30 秒重探一次，因为那是唯一恢复路径——关掉它会让启动时的临时抖动变成永久 502",
+    "enabled": true,
+    "intervalSeconds": 300,
+    "timeoutSeconds": 8,
+    "failuresBeforeUnhealthy": 2,
+    "probeUrl": null,
+    "$comment_probe": "探测加速器自身 origin 的根路径。收到任意 HTTP 响应（含 404）即视为可达，不要求 2xx。切勿指向 github.com 的资产路径——受限网络下那里本身就不通，会把所有加速器一起误判为不健康",
+    "$comment_probeUrl": "可选：测速用的基准资产（必须 https）。默认是编译期内置的 git-for-windows release 文件，它绑着具体版本，上游删掉就会导致所有候选测速失败 → 全站 502。自建或排障时换成自己的稳定资产",
+    "$comment_rate": "默认 300 秒，配置下限会夹到 60 秒；每轮按批探测（每批 6 个并发）。间隔过短会触发 CDN 侧惩罚（ADR-006）"
+  },
+
+  "$comment_no_fallback": "没有 fallbackToOriginal 这一项：所有候选都不健康时直接快速返回 502，不回退直连（ADR-016）。实测直连 curl 仅 21 KB/s，而 winget 走 WinHTTP 会在 37 秒报 12002 超时、0 字节落盘——回退等于让用户多等一次失败",
+
+  "$comment_paths": "certDir/logPath 可选；默认分别使用 exe 同目录的 certs\\ 和 proxy.log。",
+  "certDir": null,
+  "logPath": null,
+  "$comment_mitm_extra": "额外终止 TLS 但不改写的 host。**只能用于排障**：CA 的 NameConstraints 恰为 rewriteHosts，域外 host 签出的叶证书会被客户端直接拒绝（实测 schannel 0x00004000）。想真正接管新域名，请加进 rewriteHosts 并重建 CA。正常使用留空。",
+  "mitmExtra": [],
+
+  "$comment_wingetDownloader": "启动时把 winget 的 network.downloader 钉成 wininet，退出时还原（ADR-017）。为什么：winget 默认先走 Delivery Optimization，而 DO 不读 PAC，对 GitHub 直连必失败（实测每次白等 60 秒）才回退到本代理。只改这一个键，其余设置原样保留；文件是手写的坏 JSON 时不覆盖、只告警。设为 false 则完全不碰 winget 的设置。",
+  "wingetDownloader": true,
+
+  "logLevel": "info"
+}

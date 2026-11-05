@@ -1,0 +1,60 @@
+[package]
+name = "winget-accel"
+version = "0.1.7"
+edition = "2021"
+rust-version = "1.78"
+description = "用 PAC 把 GitHub 下载域名指到本机，再由本机改写为加速器 URL"
+license = "MIT"
+
+[dependencies]
+# 依赖策略见 ADR-012：**不设数量上限**，但每个直接依赖都必须说清"为什么不能用标准库
+# 或已有依赖"。本工具要求用户信任它改写下载流量，供应链面越大攻击收益越高，
+# 所以控制审计面靠的是逐条理由，不是数字——数量上限曾被随手改过一次，不承载真实约束。
+# 禁用清单：tokio / axum / hyper / actix-web（同步 + 线程已够，异步只扩大审计面）、
+#          native-tls / openssl（系统依赖、静态链接困难）、
+#          reqwest（默认特性拖入 tokio）、git2 / libgit2-sys（引入 C 工具链）。
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# rustls 关掉默认的 aws-lc-rs：它在 Windows 上要 cmake + NASM，构建门槛太高。
+# 统一用 ring，rcgen 也指向同一个后端，避免两套加密实现。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+# rcgen 0.14 才有 `Issuer::from_ca_cert_pem`：能把磁盘上的 CA 重新当成签发者。
+# 0.13 做不到，会导致每次重启换一张 CA、用户必须重新信任。
+# `x509-parser` 是该方法的前置 feature（它要解析 PEM 里的证书）。
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
+# 上游（加速器）证书校验需要根证书；纯数据 crate，无传递依赖，无 C 代码。
+# 这是对 ADR-012 允许清单的一处新增，理由见 docs/design.md。
+webpki-roots = "1"
+# Win32 API：证书存储、Unicode PAC 注册表读写，以及独立看门狗进程标志。
+# 用它替代原先调 powershell.exe 的做法（见 ADR-012 第 3 次修订）。
+windows-sys = { version = "0.60", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_System_Threading"] }
+
+# 解析证书的 NotAfter：windows-sys 没有导出 CERT_NOT_AFTER_FILETIME_PROP_ID，
+# 与其编一个常量，不如用成熟解析器。它已是 rcgen 的传递依赖（^0.18），不引入新 crate。
+x509-parser = "0.18"
+# 证书有效期计算：rcgen 已用 time 0.3，直接声明可统一版本、不新增 crate。
+time = "0.3"
+# HTTP/1.1 头部解析：hyper 内部用的就是它，零传递依赖。
+# 保留自己的逐字节读取策略（那个不能换，否则会吞掉 TLS ClientHello），
+# 只把"解析字节"这一步交给它。
+httparse = "1"
+# 加权随机的均匀采样。fastrand 零依赖、专为这种场景设计，比手写 xorshift 可靠。
+fastrand = "2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+
+
+
+
+
+
+
+

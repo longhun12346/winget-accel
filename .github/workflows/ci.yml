@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust:
+    name: Rust (fmt / clippy / test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      # 这一步现在查六组（脚本自己会打印每组统计）：
+      #   1. CLI 参数：文档提到 → main.rs 必须解析
+      #   2. 配置键：示例配置用到 → config.rs 必须认识
+      #   3. 日志标签：文档提到 → src 里必须有
+      #   4. ADR 引用：不许悬空、不许编号复用
+      #   5. 源码卫生：`#[test]` 不能被注释挤开（我犯过 5 次以上的错）
+      #   6. 行尾统一 + 乱码扫描：遍历全部 57 个受版本控制的文本文件
+      #
+      # 第 6 组取代了原来那条只查「src\*.rs + docs\*.md + README.md」（19 个文件）的乱码检查——
+      # 它漏掉了 CHANGELOG.md（本仓库中文最多的地方）、packaging\*.ps1、prototype\**，
+      # 恰恰是改动最频繁的地方。历史事故：一次编码往返把中文日志替换成 '?'（0x3F）并随 v0.1.6 发布。
+      - name: 文档与代码一致性（含行尾与乱码）
+        shell: pwsh
+        run: ./packaging/check-docs-sync.ps1
+
+      - name: clippy（警告即失败）
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 单元测试
+        run: cargo test --all-targets
+
+      - name: 构建 release
+        run: cargo build --release
+
+      # README 承诺"同一源码两次构建逐字节相同"，但此前 CI **从不验证**这条：
+      # 万一 rustc/MSVC 或 /Brepro 失效，只有用户自己去比 SHA256 才会发现。
+      #
+      # 注意：必须**真正重编**才算验证。踩过这个坑——用 `cargo clean -p`
+      # 之后 cargo 报 "Removed 0 files"、exe 根本没重建，比出来的"相同"毫无意义。
+      # 所以这里改 mtime 让指纹失效，并断言确实出现了 `Compiling`，否则直接失败。
+      - name: 可复现性（同一源码两次构建应逐字节相同）
+        shell: pwsh
+        run: |
+          # cargo 在 CI 里会带 ANSI 颜色输出（`Compiling` 与包名之间夹着转义码），
+          # 于是下面按字面量匹配 `Compiling winget-accel` 永远失败。强制关掉颜色。
+          $env:CARGO_TERM_COLOR = 'never'
+          $exe = "target\release\winget-accel.exe"
+          $h1 = (Get-FileHash $exe -Algorithm SHA256).Hash
+          # 用"未来时间"而不是 Get-Date：这一步紧跟在 release 构建之后，
+          # 两者常落在同一秒，而 cargo 按秒比较 mtime，会认为源码没更新、跳过重编。
+          # 实测 2026-11-04 与 2026-11-05 各因此误报一次（"没有真正重编"）。
+          (Get-Item src\main.rs).LastWriteTime = (Get-Date).AddMinutes(2)
+          $out = cargo build --release 2>&1
+          $out | Select-String -Pattern 'Compiling|Finished' | ForEach-Object { $_.Line }
+          if (-not ($out | Select-String -Pattern 'Compiling winget-accel')) {
+            throw "没有真正重编（cargo 认为已是最新），这次的比较无效"
+          }
+          $h2 = (Get-FileHash $exe -Algorithm SHA256).Hash
+          "first  = $h1"
+          "second = $h2"
+          if ($h1 -ne $h2) { throw "构建不可复现：$h1 != $h2" }
+          Write-Host "可复现性通过（两次构建逐字节相同）"
+
+      # 可复现性还有一条容易破的前提：**工作区的绝对路径不能被编进二进制**。
+      # 实测当前是与路径无关的：把源码复制到含空格/中文的另一个目录、用全新 target
+      # 构建，哈希完全一致；二进制里只有相对的 `src\proxy.rs` 这类 panic 位置，
+      # **没有**绝对路径（`D:\...\src\proxy.rs` 出现 0 次）。
+      # 一旦有人加了 `env!("CARGO_MANIFEST_DIR")` 之类，别人重编就会对不上，
+      # 而"同一路径下两次构建相同"依然会通过——所以这里直接扫绝对路径。
+      # 注意：相对路径（`src\*.rs`）是正常的，不该判失败（我第一版就写错成那样）。
+      - name: 二进制里不应嵌入工作区的绝对路径
+        shell: pwsh
+        run: |
+          $exe = "target\release\winget-accel.exe"
+          $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
+          $ws = (Get-Location).Path
+          if ($text.Contains($ws)) {
+            throw "二进制里嵌入了工作区绝对路径（$ws）：别人重编会得到不同哈希"
+          }
+          # 依赖的绝对路径（…\.cargo\registry\…）是**正常**的：它们就写在那里，
+          # 也正是"核对哈希要同一 CARGO_HOME"的原因。这里只找指向本仓库源码的绝对路径。
+          $abs = [regex]::Matches($text, '[A-Za-z]:\\[^ ]{0,120}?\\src\\(main|proxy|config|ca|http)\.rs')
+          if ($abs.Count -gt 0) {
+            throw "二进制里出现指向本仓库的绝对源码路径：$($abs[0].Value)"
+          }
+          Write-Host "未嵌入工作区绝对路径（可复现性与仓库路径无关）"
+
+      - name: 产物信息
+        run: |
+          $exe = "target\release\winget-accel.exe"
+          $f = Get-Item $exe
+          "大小: {0:N0} B" -f $f.Length
+          "SHA256: " + (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          & $exe --version
+          & $exe --help | Select-Object -First 2
+
+  protocol:
+    name: 协议用例（Python 驱动二进制）
+    runs-on: windows-latest
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装 pytest 与 cryptography
+        run: python -m pip install --disable-pip-version-check pytest cryptography
+
+      - name: 协议用例（无网、不改系统状态）
+        working-directory: prototype
+        run: python -m pytest tests --target-binary "${{ github.workspace }}\target\release\winget-accel.exe" -q
