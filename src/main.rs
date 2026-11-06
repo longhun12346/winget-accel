@@ -149,6 +149,7 @@ fn main() -> Result<()> {
     let ca = Arc::new(CertAuthority::load_or_create(
         &app.cert_dir,
         &app.rewrite_hosts,
+        auto_env,
     )?);
 
     let tracker = Arc::new(Tracker::new(app.accels.clone(), app.health_failures));

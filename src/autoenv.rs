@@ -89,11 +89,7 @@ impl EnvGuard {
     /// 生产路径固定用 `INET_KEY`；测试用自建的一次性键，不碰用户的代理设置。
     pub fn recover_stale_at(dir: &Path, inet_key: &str) -> Result<()> {
         let state_path = dir.join(STATE_FILE);
-        let saved = read_state_best_effort(&state_path);
         restore_saved_state(&state_path, inet_key, None)?;
-        if let Some(line) = saved.as_ref().and_then(restore_winget_from) {
-            crate::log::info(&format!("WINGET-RESTORED (stale) {line}"));
-        }
         Ok(())
     }
 
@@ -264,8 +260,6 @@ impl Drop for EnvGuard {
         if self.console_restore {
             PAC_WRITTEN.store(false, AtomicOrdering::SeqCst);
         }
-        // 先读一份状态：restore 成功后会删掉文件，winget 原值就读不到了
-        let saved = read_state_best_effort(&self.state_path);
         let outcome = restore_saved_state(
             &self.state_path,
             &self.inet_key,
@@ -274,11 +268,8 @@ impl Drop for EnvGuard {
         match outcome {
             Ok(outcome) => crate::log::info(&format!("PAC-RESTORED {}", outcome.description())),
             Err(err) => crate::log::warn(&format!(
-                "还原 PAC 失败，已保留状态文件，请检查 Internet Settings 的 AutoConfigURL：{err:#}"
+                "还原环境失败，已保留状态文件供重试，请检查 PAC 与 winget 设置：{err:#}"
             )),
-        }
-        if let Some(line) = saved.as_ref().and_then(restore_winget_from) {
-            crate::log::info(&format!("WINGET-RESTORED {line}"));
         }
     }
 }
@@ -599,25 +590,17 @@ static PAC_UPDATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 会走 `delete_pac()` 把**用户自己的** `AutoConfigURL` 删掉。
 static PAC_WRITTEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn restore_now() -> Option<(Result<RestoreOutcome>, Option<String>)> {
-    // 没写过就不动：处理器是无条件注册的，这里必须自己判断
+fn restore_now() -> Option<Result<RestoreOutcome>> {
     if !PAC_WRITTEN.swap(false, AtomicOrdering::SeqCst) {
         return None;
     }
     RESTORE_CONTEXT.get().map(|context| {
-        let saved = read_state_best_effort(&context.state_path);
-        let outcome = restore_saved_state_impl(
+        restore_saved_state_impl(
             &context.state_path,
             &context.inet_key,
             context.session.as_deref(),
             false,
-        );
-        // 状态属于别的会话时不要动，与 PAC 的判定保持一致
-        let winget = match &outcome {
-            Ok(RestoreOutcome::NewSession) => None,
-            _ => saved.as_ref().and_then(restore_winget_from),
-        };
-        (outcome, winget)
+        )
     })
 }
 
@@ -642,7 +625,7 @@ unsafe extern "system" fn on_console_event(event: u32) -> i32 {
     // 避免主线程正持有锁时把事件线程卡住（那样按 Ctrl+C 会退不掉）。
     // 这一行是事后判断"加速何时失效、以什么方式失效"的唯一线索：
     // 此前这条路径静默还原，proxy.log 里完全看不出进程何时退出。
-    if let Some((outcome, winget)) = outcome {
+    if let Some(outcome) = outcome {
         let detail = match outcome {
             Ok(outcome) => outcome.description().to_string(),
             Err(err) => format!("失败，保留状态文件: {err:#}"),
@@ -651,12 +634,6 @@ unsafe extern "system" fn on_console_event(event: u32) -> i32 {
             "PAC-RESTORED (console-event: {}) {detail}",
             event_name(event)
         ));
-        if let Some(line) = winget {
-            crate::log::emergency(&format!(
-                "WINGET-RESTORED (console-event: {}) {line}",
-                event_name(event)
-            ));
-        }
     }
     // 返回 FALSE(0) = "未处理"，交回默认处理器终止进程。
     // 注意：若返回 TRUE(1) 会阻止默认终止行为，导致按 Ctrl+C 后进程赖着不走。
@@ -826,19 +803,7 @@ fn restore_from_state_for_session(
     inet_key: &str,
     session: Option<&str>,
 ) -> bool {
-    let saved = read_state_best_effort(state_path);
     let result = restore_saved_state(state_path, inet_key, session);
-    if let Some(line) = saved.as_ref().and_then(restore_winget_from) {
-        if let Some(path) = log_path {
-            crate::log::append_line(
-                path,
-                &crate::log::format_line(
-                    crate::log::Level::Info,
-                    &format!("WINGET-RESTORED (watchdog) {line}"),
-                ),
-            );
-        }
-    }
     if let Some(path) = log_path {
         // 用 append_line 而不是全局 logger：看门狗是独立进程，没有共享的 logger
         let outcome = match &result {
@@ -867,38 +832,25 @@ enum RestoreOutcome {
 impl RestoreOutcome {
     fn description(&self) -> &'static str {
         match self {
-            Self::Restored => "已还原原始 PAC",
-            Self::Changed => "当前 PAC 已被用户或其他程序更改，保留现值",
+            Self::Restored => "已还原原始 PAC，并完成 winget 设置恢复检查",
+            Self::Changed => "当前 PAC 已更改，保留现值；已完成 winget 设置恢复检查",
             Self::NewSession => "状态属于其他会话，跳过",
             Self::Absent => "无待恢复状态",
         }
     }
 }
 
-/// 还原状态文件里记录的 winget 设置，返回一行可读描述；没记过就返回 `None`。
-///
-/// 与 PAC 恢复共用同一份 `state.json`：崩溃/强杀后看门狗读的就是它，
-/// 不存在"PAC 还原了、winget 还钉在 wininet"的半吊子状态。
-fn restore_winget_from(state: &SavedState) -> Option<String> {
-    let winget = state.winget.as_ref()?;
-    let prior = crate::winget::Prior {
-        path: PathBuf::from(&winget.path),
-        value: winget.value.clone(),
-        created_file: winget.created_file,
-    };
-    let shown = prior
-        .value
-        .clone()
-        .unwrap_or_else(|| "<不存在>".to_string());
-    Some(match crate::winget::restore_at(&prior) {
-        Ok(()) => format!("原值={shown} 还原成功"),
-        Err(err) => format!("原值={shown} 还原失败: {err:#}"),
-    })
-}
-
-/// 读状态文件，失败就当没有（恢复路径不该因为读不到而在中途报错）。
-fn read_state_best_effort(path: &Path) -> Option<SavedState> {
-    pacstate::read(path).ok().flatten()
+/// 与 PAC 共用恢复事务；错误向上传递，保留原值供看门狗或下次启动重试。
+fn restore_winget_from(state: &SavedState) -> Result<()> {
+    if let Some(winget) = &state.winget {
+        crate::winget::restore_at(&crate::winget::Prior {
+            path: PathBuf::from(&winget.path),
+            value: winget.value.clone(),
+            created_file: winget.created_file,
+        })
+        .context("还原 winget 下载器失败")?;
+    }
+    Ok(())
 }
 
 /// 四条退出/恢复路径共用。调用者持有用户级锁，控制台事件则仍由父进程持锁。
@@ -933,6 +885,8 @@ fn restore_saved_state_impl(
     } else {
         RestoreOutcome::Changed
     };
+    // PAC 已还原时也可重试 winget；全部成功后才消费恢复日志。
+    restore_winget_from(&state)?;
     // 控制台事件发生时主线程可能还在写 PAC，保留日志供父进程真正退出后的看门狗再核对。
     if consume {
         std::fs::remove_file(state_path)
@@ -1046,6 +1000,51 @@ mod tests {
             read_pac_checked(&sandbox.key).unwrap().as_deref(),
             Some(manual)
         );
+        // PAC 已恢复但 winget 被独占时，日志必须保留，解锁后下次启动可完整重试。
+        use std::os::windows::fs::OpenOptionsExt;
+        let settings = sandbox.root.join("settings.json");
+        std::fs::write(&settings, r#"{"network":{"downloader":"default"}}"#).unwrap();
+        let guard = EnvGuard::enable_with(
+            &certs,
+            &sandbox.root,
+            18443,
+            EnableOptions {
+                winget_path: Some(settings.clone()),
+                ..options()
+            },
+        )
+        .unwrap();
+        let journal = std::fs::read(&state_path).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&settings)
+            .unwrap();
+        // 迟到的旧看门狗连 winget 都不能碰。
+        assert!(restore_from_state_for_session(
+            &state_path,
+            None,
+            &sandbox.key,
+            Some("old-session")
+        ));
+        assert_eq!(std::fs::read(&state_path).unwrap(), journal);
+        drop(guard);
+        assert_eq!(std::fs::read(&state_path).unwrap(), journal);
+        assert_eq!(
+            read_pac_checked(&sandbox.key).unwrap().as_deref(),
+            Some(manual)
+        );
+        drop(lock);
+        assert_eq!(
+            crate::winget::current_at(&settings).as_deref(),
+            Some("wininet")
+        );
+        EnvGuard::recover_stale_at(&sandbox.root, &sandbox.key).unwrap();
+        assert_eq!(
+            crate::winget::current_at(&settings).as_deref(),
+            Some("default")
+        );
+        assert!(!state_path.exists());
     }
 
     #[test]

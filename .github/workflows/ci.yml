@@ -40,6 +40,10 @@ jobs:
         shell: pwsh
         run: ./packaging/check-docs-sync.ps1
 
+      - name: 候选分类回归（离线）
+        shell: pwsh
+        run: ./packaging/test-candidate-catalog.ps1
+
       - name: 获取锁定依赖（兼容空缓存）
         run: cargo fetch --locked
 
@@ -47,6 +51,8 @@ jobs:
         run: cargo clippy --all-targets --offline -- -D warnings
 
       - name: Rust 单元测试
+        env:
+          WINGET_ACCEL_SELFTEST: "1"
         run: cargo test --bin winget-accel --offline
 
       - name: 构建 release

@@ -1238,7 +1238,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wg-doc-nc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let hosts = vec!["github.com".to_string()];
-        CertAuthority::load_or_create(&dir, &hosts).unwrap();
+        CertAuthority::load_or_create(&dir, &hosts, false).unwrap();
         let pem = CertAuthority::ca_pem_path(&dir);
 
         // 一致 → 通过

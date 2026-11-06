@@ -112,6 +112,11 @@ try {
         if ($LASTEXITCODE -ne 0) { throw '文档与代码不一致' }
     }
 
+    Invoke-Step '候选分类回归（离线）' {
+        & ./packaging/test-candidate-catalog.ps1
+        if ($LASTEXITCODE -ne 0) { throw '候选分类回归失败' }
+    }
+
     Invoke-Step '构建 release' {
         cargo build --release --offline
         if ($LASTEXITCODE -ne 0) { throw 'release 构建失败' }

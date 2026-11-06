@@ -49,7 +49,16 @@ impl CertAuthority {
     ///
     /// `permitted` 必须与配置里的改写白名单一致：改了白名单却沿用旧 CA，
     /// 新 host 会签不出证书（Name Constraints 会拒绝），所以这里直接报错。
-    pub fn load_or_create(dir: &Path, permitted: &[String]) -> Result<Self> {
+    pub fn load_or_create(dir: &Path, permitted: &[String], manage_trust: bool) -> Result<Self> {
+        Self::load_with_remover(dir, permitted, manage_trust, remove_trusted_ca)
+    }
+
+    fn load_with_remover(
+        dir: &Path,
+        permitted: &[String],
+        manage_trust: bool,
+        remove_trust: impl Fn(&str),
+    ) -> Result<Self> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("建不了证书目录: {}", dir.display()))?;
 
@@ -69,7 +78,9 @@ impl CertAuthority {
                         "本机 CA 有效期剩余 {days} 天（阈值 {RENEW_BEFORE_DAYS} 天），自动轮换：\
                          移除旧证书并重新生成，需要重新信任一次。"
                     ));
-                    remove_trusted_ca(&thumb);
+                    if manage_trust {
+                        remove_trust(&thumb);
+                    }
                     let _ = std::fs::remove_file(&cert_path);
                     let _ = std::fs::remove_file(&key_path);
                     let _ = std::fs::remove_file(&meta_path);
@@ -82,38 +93,29 @@ impl CertAuthority {
             let key_pem = std::fs::read_to_string(&key_path)
                 .with_context(|| format!("读不到 {}", key_path.display()))?;
 
-            match std::fs::read_to_string(&meta_path) {
-                Ok(meta) => {
-                    let recorded: Vec<String> = serde_json::from_str(&meta).unwrap_or_default();
-                    let normalized = |hosts: &[String]| {
-                        let mut hosts: Vec<_> = hosts
-                            .iter()
-                            .map(|host| host.trim().to_ascii_lowercase())
-                            .collect();
-                        hosts.sort();
-                        hosts.dedup();
-                        hosts
-                    };
-                    if normalized(&recorded) != normalized(permitted) {
-                        bail!(
-                            "已存在的 CA 的授权域名与当前配置不一致。\n\
-                             旧: {recorded:?}\n新: {permitted:?}\n\
-                             请删除 {} 后重试（会生成新 CA，需要重新信任一次）",
-                            dir.display()
-                        );
-                    }
-                }
-                // 没有 meta 就只能告警：无法判断授权域名是否仍匹配，但不该拒绝启动。
-                // 这里的隐患很隐蔽——CA 的 Name Constraints 仍绑着**旧**白名单，
-                // 新加的 host 签得出叶证书却会被客户端拒绝，日志里只有
-                // MITM-HANDSHAKE-FAIL，看不出根因。所以启动时就把该怎么说写清楚。
-                Err(_) => crate::log::warn(&format!(
-                    "找不到 {}：无法确认这张 CA 的授权域名与当前 rewriteHosts 一致。\
-                     若日志里出现 MITM-HANDSHAKE-FAIL，请删除 {} 后重新启动\
-                     （会生成新 CA，需要重新信任一次）",
-                    meta_path.display(),
-                    dir.display()
-                )),
+            // 元数据只是旁注；必须核对 Windows 实际执行的证书约束。
+            let normalize = |hosts: &[String]| {
+                let mut hosts: Vec<_> = hosts
+                    .iter()
+                    .map(|h| h.trim().to_ascii_lowercase())
+                    .collect();
+                hosts.sort();
+                hosts.dedup();
+                hosts
+            };
+            let actual = Self::permitted_dns_names(&cert_path)
+                .context("已有 CA 缺少有效的 NameConstraints，请删除证书目录后重新生成并信任")?;
+            if normalize(&actual) != normalize(permitted) {
+                bail!("已存在的 CA 的实际授权域名与当前配置不一致。旧: {actual:?} 新: {permitted:?}；请删除 {} 后重新生成并信任", dir.display());
+            }
+            let der = crate::certinfo::read_ca_der(&cert_path).context("CA 证书无法解析")?;
+            let (_, parsed) = x509_parser::parse_x509_certificate(&der)
+                .map_err(|e| anyhow::anyhow!("CA 证书无法解析: {e}"))?;
+            let basic = parsed
+                .basic_constraints()?
+                .context("CA 缺少 BasicConstraints")?;
+            if !basic.value.ca || basic.value.path_len_constraint != Some(0) {
+                bail!("CA 必须禁止签发下级 CA（path_length = 0），请重新生成并信任");
             }
 
             // 私钥与证书必须是一对。rcgen 不校验这一点（见 `key_matches_cert` 的说明），
@@ -455,14 +457,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn renewal_only_changes_trust_when_environment_management_is_enabled() {
+        for manage_trust in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "wg-ca-renew-{}-{}",
+                std::process::id(),
+                manage_trust
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut params = CertificateParams::default();
+            params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(10);
+            params.not_after = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+            let key = KeyPair::generate().unwrap();
+            let expired = params.self_signed(&key).unwrap().pem();
+            std::fs::write(dir.join(CA_CERT_FILE), &expired).unwrap();
+            std::fs::write(dir.join(CA_KEY_FILE), key.serialize_pem()).unwrap();
+            let removed = std::cell::Cell::new(0);
+            let ca = CertAuthority::load_with_remover(
+                &dir,
+                &["github.com".into()],
+                manage_trust,
+                |_| removed.set(removed.get() + 1),
+            )
+            .unwrap();
+            assert_ne!(ca.ca_pem(), expired);
+            assert_eq!(removed.get(), usize::from(manage_trust));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn reuses_existing_ca_across_loads() {
         let dir = std::env::temp_dir().join(format!("wgaccel-ca-{}", std::process::id()));
         let hosts = vec!["github.com".to_string()];
-        let first = CertAuthority::load_or_create(&dir, &hosts).unwrap();
-        let second = CertAuthority::load_or_create(&dir, &hosts).unwrap();
+        let first = CertAuthority::load_or_create(&dir, &hosts, false).unwrap();
+        let second = CertAuthority::load_or_create(&dir, &hosts, false).unwrap();
         assert_eq!(first.ca_pem(), second.ca_pem());
         let equivalent = vec![" GITHUB.COM ".to_string(), "github.com".to_string()];
-        let normalized = CertAuthority::load_or_create(&dir, &equivalent).unwrap();
+        let normalized = CertAuthority::load_or_create(&dir, &equivalent, false).unwrap();
         assert_eq!(first.ca_pem(), normalized.ca_pem());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -470,31 +502,28 @@ mod tests {
     #[test]
     fn rejects_ca_when_permitted_hosts_change() {
         let dir = std::env::temp_dir().join(format!("wgaccel-ca-meta-{}", std::process::id()));
-        CertAuthority::load_or_create(&dir, &["github.com".to_string()]).unwrap();
-        // 白名单变了却沿用旧 CA：新 host 签不出证书，必须显式报错而不是静默继续
-        let err = CertAuthority::load_or_create(&dir, &["example.com".to_string()])
+        CertAuthority::load_or_create(&dir, &["github.com".to_string()], false).unwrap();
+        // 即使旁注伪装成新白名单，也必须依据真实证书拒绝启动。
+        std::fs::write(dir.join(CA_META_FILE), r#"["example.com"]"#).unwrap();
+        let err = CertAuthority::load_or_create(&dir, &["example.com".to_string()], false)
             .err()
             .expect("应当报错");
         assert!(err.to_string().contains("不一致"), "实际错误: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 缺 `ca-meta.json` 时只能告警，不能拒绝启动。
-    ///
-    /// 场景：从旧版本升级上来、或用户手工删了 meta。此时无法判断 CA 的
-    /// Name Constraints 是否仍与当前白名单一致；直接报错会把"可能还能用"变成"一定不能用"，
-    /// 所以只告警并给出遇到 MITM-HANDSHAKE-FAIL 时的处理方式。
+    /// 缺失旁注时，实际证书约束匹配仍能加载。
     #[test]
-    fn missing_meta_warns_but_still_loads() {
+    fn matching_certificate_loads_without_meta() {
         let dir = std::env::temp_dir().join(format!("wgaccel-ca-nometa-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        CertAuthority::load_or_create(&dir, &["github.com".to_string()]).unwrap();
+        CertAuthority::load_or_create(&dir, &["github.com".to_string()], false).unwrap();
         std::fs::remove_file(dir.join(CA_META_FILE)).expect("应能删掉 meta");
 
-        let ca = CertAuthority::load_or_create(&dir, &["github.com".to_string()]);
+        let ca = CertAuthority::load_or_create(&dir, &["github.com".to_string()], false);
         assert!(ca.is_ok(), "缺 meta 不该拒绝启动");
         assert_eq!(ca.unwrap().ca_pem(), {
-            CertAuthority::load_or_create(&dir, &["github.com".to_string()])
+            CertAuthority::load_or_create(&dir, &["github.com".to_string()], false)
                 .unwrap()
                 .ca_pem()
                 .to_string()
@@ -506,7 +535,7 @@ mod tests {
     fn leaf_config_is_cached_per_host() {
         let dir = std::env::temp_dir().join(format!("wgaccel-ca-cache-{}", std::process::id()));
         let hosts = vec!["github.com".to_string()];
-        let ca = CertAuthority::load_or_create(&dir, &hosts).unwrap();
+        let ca = CertAuthority::load_or_create(&dir, &hosts, false).unwrap();
         let first = ca.server_config("github.com").unwrap();
         let second = ca.server_config("github.com").unwrap();
         assert!(Arc::ptr_eq(&first, &second), "同 host 应复用同一 TLS 配置");
@@ -518,7 +547,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("wgaccel-ca-concurrent-{}", std::process::id()));
         let hosts = vec!["github.com".to_string()];
-        let ca = Arc::new(CertAuthority::load_or_create(&dir, &hosts).unwrap());
+        let ca = Arc::new(CertAuthority::load_or_create(&dir, &hosts, false).unwrap());
         let mut handles = Vec::new();
         for _ in 0..8 {
             let ca = Arc::clone(&ca);
@@ -540,7 +569,7 @@ mod tests {
         use x509_parser::extensions::GeneralName;
         let dir = std::env::temp_dir().join(format!("wgaccel-ca-leaf-{}", std::process::id()));
         let hosts = vec!["github.com".to_string()];
-        let ca = CertAuthority::load_or_create(&dir, &hosts).unwrap();
+        let ca = CertAuthority::load_or_create(&dir, &hosts, false).unwrap();
         let (cert, _) = ca.build_leaf("github.com").unwrap();
         let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref()).unwrap();
 
@@ -567,7 +596,7 @@ mod tests {
     fn detects_mismatched_key_pair() {
         let dir = std::env::temp_dir().join(format!("wgaccel-ca-kp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        CertAuthority::load_or_create(&dir, &["github.com".to_string()]).unwrap();
+        CertAuthority::load_or_create(&dir, &["github.com".to_string()], false).unwrap();
 
         assert_eq!(
             CertAuthority::key_matches_cert(&dir),
@@ -585,7 +614,7 @@ mod tests {
         );
 
         // 换了私钥就不该还能启动：与其让用户对着 MITM-HANDSHAKE-FAIL 猜，不如启动即失败
-        let err = CertAuthority::load_or_create(&dir, &["github.com".to_string()])
+        let err = CertAuthority::load_or_create(&dir, &["github.com".to_string()], false)
             .err()
             .expect("不配对时必须拒绝启动");
         assert!(err.to_string().contains("不配对"), "实际错误: {err}");
@@ -609,7 +638,7 @@ mod tests {
             "codeload.github.com".to_string(),
             "release-assets.githubusercontent.com".to_string(),
         ];
-        CertAuthority::load_or_create(&dir, &hosts).unwrap();
+        CertAuthority::load_or_create(&dir, &hosts, false).unwrap();
 
         let mut got = CertAuthority::permitted_dns_names(&CertAuthority::ca_pem_path(&dir))
             .expect("应能读出");
@@ -639,7 +668,7 @@ mod tests {
             "codeload.github.com".to_string(),
             "release-assets.githubusercontent.com".to_string(),
         ];
-        let ca = CertAuthority::load_or_create(&dir, &hosts).unwrap();
+        let ca = CertAuthority::load_or_create(&dir, &hosts, false).unwrap();
         let (_, pem) = x509_parser::pem::parse_x509_pem(ca.ca_pem().as_bytes()).unwrap();
         let cert = pem.parse_x509().unwrap();
 

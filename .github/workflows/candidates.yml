@@ -72,7 +72,7 @@ jobs:
             ""
             "判据：Range 206 + Content-Range + 64 KiB 采样 + 与直连 GitHub 的 SHA-256 比对。"
             "429 记为「活着但限流」，不永久剔除；连续 3 次不可用才移除。"
-            "内嵌候选（builtin）即使失败也保留，作为离线兜底。"
+            "内置候选仅在普通网络故障时保留兜底；内容不符持续隔离，重新通过哈希校验后才恢复。"
             ""
             $summary
           )
@@ -89,5 +89,5 @@ jobs:
         run: |
           Write-Host "::error::有 ${{ steps.update.outputs.mismatch }} 个候选返回的字节与直连 GitHub 不一致。"
           Write-Host "这些域名已被写入 watchlist 并标注，绝不会进入 candidates（本次修正已提交）。"
-          Write-Host "如反复出现，应把它们从清单中彻底移除并排查上游。"
+          Write-Host "隔离记录会持续保留；请排查上游，只有重新通过样本哈希校验才会解除隔离。"
           exit 1

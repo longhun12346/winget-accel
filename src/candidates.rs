@@ -1,7 +1,7 @@
 //! 候选清单：启动时刷新，网络失败时回退缓存与编译期内置清单。
 //!
 //! 用户手放的 candidates.json 优先。自动获取并发请求权威源与公共加速器，
-//! 在六秒预算内选择候选数最多的有效结果，再缓存供离线使用。
+//! 在六秒预算内优先采用权威源的有效结果，再缓存供离线使用。
 //! 获取到的候选仍须通过运行期资产验证，不能直接进入下载调度。
 
 use std::path::Path;
@@ -34,14 +34,23 @@ const UPSTREAM_URLS: [&str; 2] = [
 /// 当时 `fetch_best` 取"最快成功"的那个，而 jsDelivr 响应更快，
 /// 结果就是**拿到了过期数据**。
 ///
-/// 教训："最快"不等于"最新"。宁可多等 300 ms 拿权威源，也不要秒回旧数据。
+/// 教训："最快"和"条目最多"都不等于"最新"，删除候选的新清单反而更短。
+/// 优先采用权威源，只有它失败时才采用加速镜像。
 /// 若将来要用 jsDelivr，必须用 tag 或 commit hash 的 URL（不可变），不能用分支。
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawDoc {
-    #[serde(default)]
     candidates: Vec<RawEntry>,
+    #[serde(default)]
+    watchlist: Vec<QuarantinedEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QuarantinedEntry {
+    template: String,
+    #[serde(default)]
+    quarantined: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,10 +91,9 @@ pub fn load(dir: &Path, allow_fetch: bool) -> (Vec<Candidate>, String) {
     if manual.is_file() {
         match std::fs::read_to_string(&manual) {
             Ok(text) => match parse(&text) {
-                Ok(list) if !list.is_empty() => {
+                Ok(list) => {
                     return (list, format!("{}（手动放置）", manual.display()));
                 }
-                Ok(_) => {}
                 Err(err) => crate::log::warn(&format!(
                     "候选清单解析失败（{err:#}），忽略: {}",
                     manual.display()
@@ -101,7 +109,7 @@ pub fn load(dir: &Path, allow_fetch: bool) -> (Vec<Candidate>, String) {
     let cache = dir.join(CACHE_FILE_NAME);
 
     // 2) **每次运行都从上游获取**（用户明确要求）。
-    //    并发请求所有端点，在六秒预算内取候选数最多的有效结果。
+    //    并发请求所有端点，在六秒预算内按来源优先级选有效结果。
     if allow_fetch {
         let started = std::time::Instant::now();
         match fetch_best() {
@@ -130,9 +138,7 @@ pub fn load(dir: &Path, allow_fetch: bool) -> (Vec<Candidate>, String) {
     if cache.is_file() {
         if let Ok(text) = std::fs::read_to_string(&cache) {
             if let Ok(list) = parse(&text) {
-                if !list.is_empty() {
-                    return (list, format!("{}（缓存）", cache.display()));
-                }
+                return (list, format!("{}（缓存）", cache.display()));
             }
             crate::log::warn("候选清单缓存损坏，改用内置清单");
         }
@@ -148,7 +154,7 @@ pub fn load(dir: &Path, allow_fetch: bool) -> (Vec<Candidate>, String) {
     }
 }
 
-/// 并发获取上游，六秒内选择候选数最多的有效结果；全部失败则回退本地清单。
+/// 并发获取上游，六秒内优先采用权威源的有效结果；全部失败则回退本地清单。
 fn fetch_best() -> Result<(String, Vec<Candidate>, String)> {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -176,10 +182,8 @@ fn fetch_best() -> Result<(String, Vec<Candidate>, String)> {
     }
     drop(tx);
 
-    // 取**内容最完整**的那份，而不是"最先返回"的那份。
-    //
-    // 原因：实测中 jsDelivr 的旧缓存比权威源快，按"最快"取会拿到过期数据。
-    // 现在的做法是：等所有端点（最多 6 秒），选候选数最多的有效结果。
+    // 删除或隔离候选会使新清单更短；不能把条目多当作内容更新的证据。
+    // 端点顺序表示权威源、加速镜像的优先级，空 candidates 也能表达全部停用。
     let deadline = Instant::now() + Duration::from_secs(6);
     let mut errors: Vec<String> = Vec::new();
     let mut best: Option<(String, Vec<Candidate>, String)> = None;
@@ -189,21 +193,21 @@ fn fetch_best() -> Result<(String, Vec<Candidate>, String)> {
             _ => break,
         };
         match rx.recv_timeout(remaining) {
-            Ok((url, Ok((body, list)))) if !list.is_empty() => {
+            Ok((url, Ok((body, list)))) => {
                 seen.push(url.clone());
                 crate::log::info(&format!("候选源成功: {url} -> {} 条", list.len()));
-                let better = match &best {
-                    Some((_, cur, _)) => list.len() > cur.len(),
-                    None => true,
+                let priority = |url: &str| {
+                    known_urls
+                        .iter()
+                        .position(|known| known == url)
+                        .unwrap_or(usize::MAX)
                 };
-                if better {
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, _, current)| priority(&url) < priority(current))
+                {
                     best = Some((body, list, url));
                 }
-            }
-            Ok((url, Ok(_))) => {
-                seen.push(url.clone());
-                crate::log::warn(&format!("候选源返回空内容: {url}"));
-                errors.push(format!("{url}: 内容为空"));
             }
             Ok((url, Err(err))) => {
                 seen.push(url.clone());
@@ -238,6 +242,16 @@ fn http_get(url: &str, timeout_secs: u64) -> Result<String> {
 
 fn parse(text: &str) -> Result<Vec<Candidate>> {
     let doc: RawDoc = serde_json::from_str(text).context("候选清单不是合法 JSON")?;
+    let blocked: Vec<_> = doc
+        .watchlist
+        .iter()
+        .filter(|entry| entry.quarantined)
+        .filter_map(|entry| {
+            crate::rewrite::parse_accel(&entry.template)
+                .ok()
+                .map(|accel| accel.host)
+        })
+        .collect();
     let mut out = Vec::with_capacity(doc.candidates.len());
     for entry in doc.candidates {
         if entry.name.trim().is_empty() || entry.template.trim().is_empty() {
@@ -275,6 +289,11 @@ fn parse(text: &str) -> Result<Vec<Candidate>> {
             ));
             continue;
         }
+        if crate::rewrite::parse_accel(&entry.template)
+            .is_ok_and(|accel| blocked.contains(&accel.host))
+        {
+            continue;
+        }
         out.push(Candidate {
             name: entry.name,
             template: entry.template,
@@ -302,6 +321,24 @@ mod tests {
         let result = http_get(&format!("http://{address}/"), 2);
         server.join().unwrap();
         result
+    }
+
+    #[test]
+    fn quarantine_and_explicit_empty_catalog_do_not_resurrect_fallbacks() {
+        let dir = std::env::temp_dir().join(format!("wg-quarantined-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let document = r#"{"candidates":[{"name":"bad","template":"https://bad.example/{url}","builtin":true}],"watchlist":[{"template":"https://bad.example/{url}","quarantined":true}]}"#;
+        assert!(parse(document).unwrap().is_empty());
+        for file in [FILE_NAME, CACHE_FILE_NAME] {
+            std::fs::write(dir.join(file), document).unwrap();
+            let (list, source) = load(&dir, false);
+            assert!(list.is_empty());
+            assert_ne!(source, "编译期内置");
+            std::fs::remove_file(dir.join(file)).unwrap();
+        }
+        assert!(parse(r#"{"candidates":[]}"#).unwrap().is_empty());
+        assert!(parse("{}").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

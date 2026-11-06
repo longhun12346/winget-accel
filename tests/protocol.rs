@@ -35,6 +35,7 @@ struct RequestRecord {
 enum UpstreamMode {
     Normal,
     IgnoreRange,
+    WrongRange,
     Truncate,
     TruncateChunked,
     Status(u16),
@@ -156,6 +157,15 @@ fn handle_http_connection(
                 ("X-End-To-End", "keep"),
             ],
             &[],
+        );
+        return;
+    }
+    if matches!(mode, UpstreamMode::WrongRange) && headers.contains_key("range") {
+        write_response(
+            &mut stream,
+            206,
+            &[("Content-Range", "bytes 100-101/1024")],
+            b"AB",
         );
         return;
     }
@@ -770,33 +780,35 @@ fn fails_over_when_all_candidates_ignore_range() {
 
 #[test]
 fn fails_over_from_bad_candidate_to_good_candidate() {
-    let first = HttpUpstream::start(UpstreamMode::Normal);
-    let second = HttpUpstream::start(UpstreamMode::Normal);
-    let proxy = Proxy::start(
-        &[
-            (&first.url(), UpstreamMode::Normal),
-            (&second.url(), UpstreamMode::Normal),
-        ],
-        &[],
-    );
-    let url = asset("failover-range.zip");
-    let (pinned, other) = prime_file_pin(&proxy, &first, &second, &url);
-    pinned.set_mode(UpstreamMode::IgnoreRange);
+    for mode in [UpstreamMode::IgnoreRange, UpstreamMode::WrongRange] {
+        let first = HttpUpstream::start(UpstreamMode::Normal);
+        let second = HttpUpstream::start(UpstreamMode::Normal);
+        let proxy = Proxy::start(
+            &[
+                (&first.url(), UpstreamMode::Normal),
+                (&second.url(), UpstreamMode::Normal),
+            ],
+            &[],
+        );
+        let url = asset("failover-range.zip");
+        let (pinned, other) = prime_file_pin(&proxy, &first, &second, &url);
+        pinned.set_mode(mode);
 
-    // 同一条请求必须先命中已有绑定，再由另一个候选完成；不依赖初次随机选中谁。
-    let result = curl(&proxy, &url, &["-r", "0-99"]);
-    assert_curl_ok(&result);
-    assert_eq!(result.status, 206);
-    assert_eq!(result.body, (0u8..100).collect::<Vec<_>>());
-    let bad_records = pinned.records();
-    let good_records = other.records();
-    assert_eq!(bad_records.len(), 3);
-    assert_eq!(good_records.len(), 1);
-    assert_eq!(bad_records[2].path, format!("/{url}"));
-    assert_eq!(good_records[0].path, bad_records[2].path);
-    assert_eq!(good_records[0].headers["range"], "bytes=0-99");
-    let log = proxy.wait_log(|text| rewrite_lines(text).len() == 3);
-    assert!(rewrite_lines(&log)[2].contains("pick retry=1 "), "{log}");
+        // 同一条请求必须先命中已有绑定，再由另一个候选完成；不依赖初次随机选中谁。
+        let result = curl(&proxy, &url, &["-r", "0-1"]);
+        assert_curl_ok(&result);
+        assert_eq!(result.status, 206);
+        assert_eq!(result.body, (0u8..2).collect::<Vec<_>>());
+        let bad_records = pinned.records();
+        let good_records = other.records();
+        assert_eq!(bad_records.len(), 3);
+        assert_eq!(good_records.len(), 1);
+        assert_eq!(bad_records[2].path, format!("/{url}"));
+        assert_eq!(good_records[0].path, bad_records[2].path);
+        assert_eq!(good_records[0].headers["range"], "bytes=0-1");
+        let log = proxy.wait_log(|text| rewrite_lines(text).len() == 3);
+        assert!(rewrite_lines(&log)[2].contains("pick retry=1 "), "{log}");
+    }
 }
 
 #[test]

@@ -23,9 +23,9 @@
        （这挡不住"只对探测资产正常、对其它资产投毒"的定向攻击，
         那一层由 winget 官方的 InstallerSha256 校验兜底。）
 
-    4. **内嵌候选（builtin: true）即使本次实测失败也保留**。
-       它们是离线兜底：上游消失/断网时程序还得能启动。
-       失败情况记进 verified.note，但不移出。
+    4. **内嵌候选的临时网络故障仍保留，内容不符一律隔离**。
+       隔离记录跨轮次保存，不因断网、未测或失败次数而消失；
+       只有重新通过样本哈希校验才能恢复启用。
 
 .PARAMETER DryRun
     只打印结果，不写文件。
@@ -48,10 +48,7 @@ param(
     [switch]$FirstPassOnly
 )
 
-function Get-HostFromTemplate([string]$template) {
-    if ($template -notmatch '^https?://([^/:]+)') { return $null }
-    return $Matches[1].ToLower()
-}
+. "$PSScriptRoot/candidate-catalog.ps1"
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -85,25 +82,19 @@ Write-Host "上游: $Upstream"
 
 # ---------------------------------------------------------------- 读取现有清单
 $existing = $null
-$comment = $null
-$builtinTemplates = @{}
 $known = @{}
-$failures = @{}
 
 if (Test-Path $outPath) {
     $raw = Get-Content $outPath -Raw | ConvertFrom-Json
     $existing = $raw
-    if ($raw.PSObject.Properties.Name -contains '_comment') { $comment = $raw._comment }
     foreach ($c in @($raw.candidates)) {
         $h = Get-HostFromTemplate $c.template
         $known[$h] = $c
-        if ($c.builtin -eq $true) { $builtinTemplates[$c.template] = $c }
     }
     foreach ($w in @($raw.watchlist)) {
         if (-not $w) { continue }
         $h = Get-HostFromTemplate $w.template
         if (-not $known.ContainsKey($h)) { $known[$h] = $w }
-        if ($w.PSObject.Properties.Name -contains 'failures') { $failures[$h] = [int]$w.failures }
     }
     Write-Host "现有清单: $(@($raw.candidates).Count) 个候选 + $(@($raw.watchlist).Count) 个观察项"
 }
@@ -242,138 +233,12 @@ if ($mismatch.Count -gt 0) {
 }
 
 # ---------------------------------------------------------------- 生成新清单
-$today = (Get-Date).ToString('yyyy-MM-dd')
-$byHost = @{}
-foreach ($r in $results) { $byHost[$r.host] = $r }
-
-$newCandidates = [System.Collections.Generic.List[object]]::new()
-$newWatchlist = [System.Collections.Generic.List[object]]::new()
-
-# 1) 内置候选：无论如何保留
-foreach ($tpl in $builtinTemplates.Keys | Sort-Object) {
-    $b = $builtinTemplates[$tpl]
-    $h = Get-HostFromTemplate $tpl
-    $r = $byHost[$h]
-    $note = if ($r -and $r.verdict -eq 'ok') {
-        "实测 $($r.kbps) KB/s"
-    }
-    elseif ($r) {
-        "本轮实测失败（$($r.verdict)/$($r.status)），仍作为离线兜底保留"
-    }
-    else {
-        '本轮未测'
-    }
-    $newCandidates.Add([ordered]@{
-            name     = $b.name
-            template = $tpl
-            builtin  = $true
-            verified = [ordered]@{ date = $today; kbps = if ($r) { $r.kbps } else { 0 }; note = $note }
-        })
-}
-
-# 2) 已在 candidates 里的非内置项：通过则保留，失败则降级到 watchlist
-foreach ($c in @($existing.candidates)) {
-    if ($c.builtin -eq $true) { continue }
-    $h = Get-HostFromTemplate $c.template
-    $r = $byHost[$h]
-    if ($r -and $r.verdict -eq 'ok') {
-        $newCandidates.Add([ordered]@{
-                name     = $c.name
-                template = $c.template
-                builtin  = $false
-                verified = [ordered]@{ date = $today; kbps = $r.kbps; note = "CI 侧实测 $($r.kbps) KB/s（Azure 美国，不代表用户网络）" }
-            })
-    }
-    else {
-        # 本轮**没测到**（被 -Limit 截断，或上游清单没覆盖它）与"测了但失败"必须分开：
-        # 前者是"没有证据"，不该累计失败次数——否则只因一次本地调试或上游漏项，
-        # 就会把一个候选推向"连续 3 次移除"。
-        # （这里曾经直接读 `$r.verdict`：$r 为 $null 时在 StrictMode 下直接抛错，
-        #   而且失败次数照样 +1。）
-        if ($r) {
-            $f = 1 + [int]($failures[$h])
-            $why = "本轮 $($r.verdict)（状态 $($r.status)）"
-        }
-        else {
-            $f = [int]($failures[$h])
-            $why = "本轮未测（被 -Limit 截断或上游未覆盖）"
-        }
-        if ($f -lt 3) {
-            $newWatchlist.Add([ordered]@{
-                    name     = $c.name
-                    template = $c.template
-                    reason   = "曾通过实测，$why；连续失败 $f 次，达 3 次移除"
-                    failures = $f
-                })
-        }
-    }
-}
-
-# 3) 新通过实测的域名
-$builtinHosts = @($builtinTemplates.Keys | ForEach-Object { Get-HostFromTemplate $_ })
-$alreadyListed = @($newCandidates | ForEach-Object { Get-HostFromTemplate $_.template }) +
-@($newWatchlist | ForEach-Object { Get-HostFromTemplate $_.template })
-foreach ($r in $ok) {
-    if ($alreadyListed -contains $r.host) { continue }
-    $tpl = "https://$($r.host)/{url}"
-    $name = $r.host -replace '\.[^.]+$', '' -replace '[^a-z0-9]+', '-'
-
-    # 通过实测即启用。不加任何"观察期/第二轮"之类的额外门槛：
-    # 判据本身已经够严（206 + 64 KiB + 与直连 GitHub 字节一致），
-    # 且运行时会再探测一次，失败会被换候选重试兜住。
-    # 早先我擅自加过"连续两轮通过才启用"，那等于把"自动启用"变成延迟一天，是错的。
-    if ($FirstPassOnly) {
-        $newWatchlist.Add([ordered]@{
-                name     = $name
-                template = $tpl
-                reason   = "实测通过（$($r.kbps) KB/s）；-FirstPassOnly 下仅观察不启用"
-                failures = 0
-            })
-    }
-    else {
-        $newCandidates.Add([ordered]@{
-                name     = $name
-                template = $tpl
-                builtin  = $false
-                verified = [ordered]@{ date = $today; kbps = $r.kbps; note = "实测通过（CI 侧 $($r.kbps) KB/s，不代表用户网络）" }
-            })
-    }
-}
-
-# 4) 其余（限流 / 死 / 内容不符）
-foreach ($r in @($limited) + @($dead) + @($mismatch)) {
-    if ($alreadyListed -contains $r.host) { continue }
-    if ($builtinHosts -contains $r.host) { continue }
-    $tpl = "https://$($r.host)/{url}"
-    $name = $r.host -replace '\.[^.]+$', '' -replace '[^a-z0-9]+', '-'
-    $f = 1 + [int]($failures[$r.host])
-    if ($f -ge 3) { continue }   # 连续 3 次不可用才移除
-
-    $reason = switch ($r.verdict) {
-        'ratelimited' { "实测限流（状态 $($r.status)）。429 是『活着但拒绝』，不永久剔除；连续失败 $f 次" }
-        'mismatch' { "⚠ 返回内容与直连 GitHub 不一致，严禁启用；连续失败 $f 次" }
-        default { "实测不可用（状态 $($r.status)）；连续失败 $f 次，达 3 次移除" }
-    }
-    $newWatchlist.Add([ordered]@{
-            name     = $name
-            template = $tpl
-            reason   = $reason
-            failures = $f
-        })
-}
-
+$doc = New-CandidateCatalog -Existing $existing -Results @($results) -FirstPassOnly:$FirstPassOnly
+$newCandidates = @($doc.candidates)
+$newWatchlist = @($doc.watchlist)
 if ($mismatch.Count -gt 0) {
-    # 内容不一致是安全事故级别的信号，不能只写在 JSON 里
-    Write-Host ''
-    Write-Host "::warning::发现 $($mismatch.Count) 个候选返回内容与 GitHub 不一致：$($mismatch.host -join ', ')"
+    Write-Host "::warning::发现 $($mismatch.Count) 个候选内容不符，已隔离：$($mismatch.host -join ', ')"
 }
-
-$doc = [ordered]@{}
-if ($comment) { $doc['_comment'] = $comment }
-$doc['version'] = 2
-$doc['updated'] = $today
-$doc['candidates'] = @($newCandidates)
-$doc['watchlist'] = @($newWatchlist)
 
 # 完成度自检：每个待测域名都必须有一个结果。
 #

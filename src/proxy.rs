@@ -299,6 +299,17 @@ impl Proxy {
             }
             return http::response(501, "text/plain", "");
         }
+        if !rewrite::needs_rewrite(host, &target)
+            || !self
+                .app
+                .rewrite_hosts
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(host))
+        {
+            let plan =
+                rewrite::origin_plan(req.method().as_str(), host, port, &target, req.headers());
+            return self.forward_original(plan).await;
+        }
         let expect_partial = req.headers().contains_key("range");
         let initial_probe = is_initial_probe(&req);
         let retryable = matches!(req.method().as_str(), "GET" | "HEAD");
@@ -356,14 +367,32 @@ impl Proxy {
             let attempt_started = std::time::Instant::now();
             let outcome = match http::request(&plan.method, &plan.path, plan.headers.clone()) {
                 Ok(request) => {
-                    http::send(plan.scheme, &plan.host, plan.port, request, attempt_timeout).await
+                    match remaining_attempt_budget(
+                        started.elapsed(),
+                        failover_time,
+                        attempt_timeout,
+                    ) {
+                        Some(budget) => {
+                            http::send(plan.scheme, &plan.host, plan.port, request, budget).await
+                        }
+                        None => Err(anyhow!("failover total deadline exceeded")),
+                    }
                 }
                 Err(error) => Err(error),
             };
             match outcome {
                 Ok(response) => {
                     let status = response.status().as_u16();
-                    if (expect_partial && status == 200)
+                    let bad_range =
+                        status == 206 && !range_response_matches(req.headers(), response.headers());
+                    if bad_range {
+                        self.log.warn(&format!(
+                            "ACCEL-BAD-RANGE {} 响应范围与请求不一致",
+                            accel.host
+                        ));
+                    }
+                    if bad_range
+                        || (expect_partial && status == 200)
                         || http::is_rate_limited(status)
                         || is_retryable_status(status)
                     {
@@ -493,6 +522,52 @@ impl Proxy {
                     }
                     self.log.warn(&format!("RETRY {host} 换下一个候选"));
                 }
+            }
+        }
+    }
+
+    /// 复用同一 HTTP/TLS 传输，原站状态与正文原样返回，不触发加速器冷却或学习。
+    async fn forward_original(self: Arc<Self>, plan: rewrite::Plan) -> Response<http::BoxBody> {
+        let started = std::time::Instant::now();
+        let outcome = match http::request(&plan.method, &plan.path, plan.headers.clone()) {
+            Ok(request) => {
+                http::send(
+                    plan.scheme,
+                    &plan.host,
+                    plan.port,
+                    request,
+                    MAX_FAILOVER_TIME,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(response) => {
+                let status = response.status();
+                http::observe(response, move |result| match result {
+                    Ok(size) => {
+                        Stats::add(&self.stats.bytes, size);
+                        self.log.info(&format!(
+                            "PASS via=- {} -> {status} {size}B {:.2}s",
+                            crate::log::loggable(&plan.path, 76),
+                            started.elapsed().as_secs_f64()
+                        ));
+                    }
+                    Err(error) => {
+                        Stats::bump(&self.stats.errors);
+                        self.log
+                            .warn(&format!("RELAY-ERR host={} via=- err={error:#}", plan.host));
+                    }
+                })
+            }
+            Err(error) => {
+                Stats::bump(&self.stats.errors);
+                self.log.warn(&format!(
+                    "UPSTREAM-FAIL {}:{} {error:#}",
+                    plan.host, plan.port
+                ));
+                http::response(502, "text/plain", "")
             }
         }
     }
@@ -818,9 +893,227 @@ fn is_initial_probe(req: &Request<Incoming>) -> bool {
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("bytes=0-1"))
 }
 
+fn remaining_attempt_budget(
+    elapsed: Duration,
+    total: Duration,
+    per_attempt: Duration,
+) -> Option<Duration> {
+    total
+        .checked_sub(elapsed)
+        .map(|remaining| remaining.min(per_attempt))
+        .filter(|d| !d.is_zero())
+}
+
+/// RFC 9110 §14：只校验显式范围与请求的一致性，消息分帧仍由 Hyper 负责。
+/// 兼容部分公共服务省略 Content-Range；multipart 正文不在此解析。
+fn range_response_matches(request: &hyper::HeaderMap, response: &hyper::HeaderMap) -> bool {
+    let Some(content_range) = response.get("content-range") else {
+        return true;
+    };
+    let parse = || -> Option<bool> {
+        if response.get_all("content-range").iter().count() != 1 {
+            return None;
+        }
+        let (unit, value) = content_range.to_str().ok()?.trim().split_once(' ')?;
+        if !unit.eq_ignore_ascii_case("bytes") {
+            return None;
+        }
+        let (interval, total) = value.split_once('/')?;
+        let (first, last) = interval.split_once('-')?;
+        let number = |s: &str| -> Option<u64> {
+            if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            s.parse().ok()
+        };
+        let first = number(first)?;
+        let last = number(last)?;
+        let length = last.checked_sub(first)?.checked_add(1)?;
+        let total = if total == "*" {
+            None
+        } else {
+            Some(number(total)?)
+        };
+        if total.is_some_and(|total| last >= total) {
+            return None;
+        }
+        if let Some(length_header) = response.get("content-length") {
+            if number(length_header.to_str().ok()?)? != length {
+                return None;
+            }
+        }
+        let range = request.get("range")?.to_str().ok()?.trim();
+        let (unit, ranges) = range.split_once('=')?;
+        if !unit.eq_ignore_ascii_case("bytes") {
+            return None;
+        }
+        Some(ranges.split(',').any(|range| {
+            let Some((start, end)) = range.trim().split_once('-') else {
+                return false;
+            };
+            if start.is_empty() {
+                let Some(suffix) = number(end).filter(|n| *n > 0) else {
+                    return false;
+                };
+                return match total {
+                    Some(total) => first == total.saturating_sub(suffix) && last == total - 1,
+                    None => length <= suffix,
+                };
+            }
+            let Some(start) = number(start) else {
+                return false;
+            };
+            if first != start {
+                return false;
+            }
+            if end.is_empty() {
+                return total.is_none_or(|total| last == total - 1);
+            }
+            let Some(end) = number(end).filter(|end| *end >= start) else {
+                return false;
+            };
+            last == total.map_or(end, |total| end.min(total - 1))
+        }))
+    };
+    parse() == Some(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failover_attempts_share_one_total_budget() {
+        let total = Duration::from_secs(20);
+        assert_eq!(
+            remaining_attempt_budget(Duration::from_secs(11), total, total),
+            Some(Duration::from_secs(9))
+        );
+        assert_eq!(
+            remaining_attempt_budget(
+                Duration::from_secs(14),
+                Duration::from_secs(15),
+                Duration::from_secs(5)
+            ),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(remaining_attempt_budget(total, total, total), None);
+        assert_eq!(
+            remaining_attempt_budget(total + Duration::from_secs(1), total, total),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_response_ranges_must_match_requested_bytes() {
+        for (requested, returned, length, valid) in [
+            ("bytes=0-1", "bytes 0-1/1024", "2", true),
+            ("bytes=0-1", "bytes 100-101/1024", "2", false),
+            ("bytes=0-1000", "bytes 0-99/100", "100", true),
+            ("bytes=50-", "bytes 50-99/100", "50", true),
+            ("bytes=-10", "bytes 90-99/100", "10", true),
+            ("bytes=-1000", "bytes 0-99/100", "100", true),
+            ("bytes=0-1", "bytes 0-1/*", "2", true),
+            ("bytes=0-1", "bytes 0-1/1", "2", false),
+            ("bytes=0-1", "bytes 1-0/100", "2", false),
+            ("bytes=0-1", "bytes 0-1/100", "1", false),
+            ("bytes=0-1", "bytes 0-18446744073709551615/*", "0", false),
+            ("bytes=0-1", "invalid", "2", false),
+        ] {
+            let mut request = hyper::HeaderMap::new();
+            request.insert("range", requested.parse().unwrap());
+            let mut response = hyper::HeaderMap::new();
+            response.insert("content-range", returned.parse().unwrap());
+            response.insert("content-length", length.parse().unwrap());
+            assert_eq!(
+                range_response_matches(&request, &response),
+                valid,
+                "{requested} -> {returned}"
+            );
+        }
+        assert!(range_response_matches(
+            &hyper::HeaderMap::new(),
+            &hyper::HeaderMap::new()
+        ));
+    }
+
+    #[test]
+    fn origin_refusals_preserve_body_without_penalizing_candidates() {
+        use http_body_util::BodyExt;
+        use std::io::{Read, Write};
+        for verified in [false, true] {
+            for status in [403, 429, 503] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let server = std::thread::spawn(move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    while !bytes.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        socket.read_exact(&mut byte).unwrap();
+                        bytes.push(byte[0]);
+                    }
+                    write!(socket, "HTTP/1.1 {status} Refused\r\nContent-Length: 6\r\nConnection: close\r\n\r\norigin").unwrap();
+                });
+                let app = Arc::new(
+                    App::new(crate::config::FileConfig {
+                        accelerators: vec![crate::config::AcceleratorCfg {
+                            name: "test".into(),
+                            template: "http://127.0.0.1:9/{url}".into(),
+                            priority: 1,
+                            hosts: Vec::new(),
+                        }],
+                        ..crate::config::FileConfig::default()
+                    })
+                    .unwrap(),
+                );
+                let health = Arc::new(Tracker::new(app.accels.clone(), app.health_failures));
+                if verified {
+                    health.mark(0, true);
+                }
+                let before = health.snapshot();
+                let ca_dir = std::env::temp_dir().join(format!(
+                    "wg-pass-{}-{verified}-{status}",
+                    std::process::id()
+                ));
+                let ca = Arc::new(
+                    CertAuthority::load_or_create(&ca_dir, &app.rewrite_hosts, false).unwrap(),
+                );
+                let log = Arc::new(Logger::new(Level::Error, ca_dir.join("test.log")));
+                let proxy = Arc::new(Proxy::new(
+                    app,
+                    ca,
+                    Arc::new(Stats::default()),
+                    log,
+                    health.clone(),
+                ));
+                // Only this local fixture uses HTTP; production origin_plan always selects HTTPS.
+                let mut plan = rewrite::origin_plan(
+                    "GET",
+                    "127.0.0.1",
+                    port,
+                    "/ordinary",
+                    &hyper::HeaderMap::new(),
+                );
+                plan.scheme = rewrite::Scheme::Http;
+                let response = http::block_on(proxy.clone().forward_original(plan));
+                assert_eq!(response.status().as_u16(), status);
+                let body = http::block_on(response.into_body().collect())
+                    .unwrap()
+                    .to_bytes();
+                assert_eq!(body.as_ref(), b"origin");
+                assert_eq!(health.snapshot(), before);
+                assert!(proxy.cooldowns.service_blocked().is_empty());
+                assert!(proxy.learned.blocked_pairs().is_empty());
+                assert_eq!(proxy.stats.ratelimited.load(Ordering::Relaxed), 0);
+                server.join().unwrap();
+                std::fs::remove_dir_all(ca_dir).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn splits_host_port() {

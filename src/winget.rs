@@ -69,7 +69,7 @@ pub fn inspect_at(path: &Path) -> Result<Prior> {
 
 /// 写入 `network.downloader = wininet`，其余内容保持不变。
 pub fn apply_at(prior: &Prior) -> Result<()> {
-    let mut doc = if prior.created_file {
+    let mut doc = if prior.created_file && !prior.path.exists() {
         // 文件本来不存在：从一个空对象开始，父目录按需创建
         serde_json::json!({})
     } else {
@@ -104,6 +104,10 @@ pub fn restore_at(prior: &Prior) -> Result<()> {
         return Ok(());
     }
     let mut doc = read_doc(&prior.path)?;
+    // 只撤销仍属于本程序的值，保留用户在运行期间修改或删除的设置。
+    if downloader_of(&doc).as_deref() != Some(DOWNLOADER) {
+        return Ok(());
+    }
     let Some(obj) = doc.as_object_mut() else {
         bail!("{} 的顶层不是 JSON 对象，无法还原", prior.path.display());
     };
@@ -199,6 +203,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn restore_preserves_manual_changes_and_deletions() {
+        let dir = temp_dir("winget-manual");
+        let path = dir.join("settings.json");
+        for manual in [
+            serde_json::json!({"network":{"downloader":"do"}, "custom":true}),
+            serde_json::json!({"network":{}, "custom":true}),
+            serde_json::json!({"custom":true}),
+        ] {
+            write_doc(
+                &path,
+                &serde_json::json!({"network":{"downloader":"default"}}),
+            )
+            .unwrap();
+            let prior = inspect_at(&path).unwrap();
+            apply_at(&prior).unwrap();
+            write_doc(&path, &manual).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            restore_at(&prior).unwrap();
+            restore_at(&prior).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let prior = inspect_at(&path).unwrap();
+        apply_at(&prior).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        restore_at(&prior).unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 文件不存在时：创建它、写入键、并标记 created_file。

@@ -18,7 +18,6 @@ pub const DEFAULT_REWRITE_HOSTS: [&str; 4] = [
 ];
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8443";
-const DEFAULT_ACCEL: &str = "https://gh-proxy.com";
 
 /// 内置候选链（按多次实测中位数排序，2026-11-01）。
 ///
@@ -252,10 +251,6 @@ impl App {
             accels.push(parse_accel(&item.template)?);
             caps.push(item.hosts.clone());
         }
-        if accels.is_empty() {
-            accels.push(parse_accel(DEFAULT_ACCEL)?);
-            caps.push(Vec::new());
-        }
 
         let mut health_probe_custom = false;
         let health_probe = match file.health.probe_url.as_deref() {
@@ -454,10 +449,7 @@ fn collect_unknown(
     }
 }
 
-/// 默认候选：仓库清单（`candidates.json`）+ 编译期内置，按 host 去重。
-///
-/// 为什么两者都要：清单是"可维护、可被 CI 更新"的那份，内置是"清单被写坏/删掉
-/// 也还能启动"的兜底。合并顺序保持清单在前，这样优先级沿用清单顺序。
+/// 自动候选按 host 去重。只有来源不可用或损坏才回退；有效的空清单表示全部停用。
 fn default_accelerators() -> Vec<AcceleratorCfg> {
     let mut out: Vec<AcceleratorCfg> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
@@ -491,24 +483,9 @@ fn default_accelerators() -> Vec<AcceleratorCfg> {
         push(&c.name, &c.template, i as u32 + 1, &mut out, &mut seen);
     }
 
-    if from_file.is_empty() {
-        // 清单损坏/为空：至少保证有一个候选能启动。
-        // 此时不再有"内置 5 个"可退——候选清单就是唯一来源。
-        crate::log::warn(&format!(
-            "候选清单为空，回退到单一默认候选: {DEFAULT_ACCEL}"
-        ));
-        out.push(AcceleratorCfg {
-            name: "fallback".to_string(),
-            template: DEFAULT_ACCEL.to_string(),
-            priority: 1,
-            hosts: Vec::new(),
-        });
-    } else {
-        crate::log::info(&format!(
-            "候选清单来源: {source}（{} 条，合并内置后共 {} 个候选）",
-            from_file.len(),
-            out.len()
-        ));
+    crate::log::info(&format!("候选清单来源: {source}（{} 个候选）", out.len()));
+    if out.is_empty() {
+        crate::log::warn("候选清单已停用全部服务；加速请求会快速失败，请检查隔离记录或配置");
     }
     out
 }

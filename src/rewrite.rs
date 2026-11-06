@@ -205,17 +205,15 @@ pub fn plan_with(
 ) -> Plan {
     let rewritten = allow_rewrite && rewrite_hosts.iter().any(|h| h.eq_ignore_ascii_case(host));
 
-    let (scheme, up_host, up_port, up_path) = if rewritten {
-        (
-            accel.scheme,
-            accel.host.clone(),
-            accel.port,
-            rewrite_path(accel, host, target),
-        )
-    } else {
-        // 透传：客户端已按原站 TLS 建连，上游必须仍是 https
-        (Scheme::Https, host.to_string(), port, target.to_string())
-    };
+    if !rewritten {
+        return origin_plan(method, host, port, target, headers);
+    }
+    let (scheme, up_host, up_port, up_path) = (
+        accel.scheme,
+        accel.host.clone(),
+        accel.port,
+        rewrite_path(accel, host, target),
+    );
 
     let mut headers = headers.clone();
     crate::http::strip_hop_headers(&mut headers);
@@ -233,6 +231,21 @@ pub fn plan_with(
         host: up_host,
         port: up_port,
         path: up_path,
+        method: method.to_string(),
+        headers,
+    }
+}
+
+/// 原站透传无需候选，也不参与候选健康评分。
+pub fn origin_plan(method: &str, host: &str, port: u16, target: &str, headers: &HeaderMap) -> Plan {
+    let mut headers = headers.clone();
+    crate::http::strip_hop_headers(&mut headers);
+    Plan {
+        rewritten: false,
+        scheme: Scheme::Https,
+        host: host.to_string(),
+        port,
+        path: target.to_string(),
         method: method.to_string(),
         headers,
     }
