@@ -5,15 +5,23 @@
 
 ## ADR-012：依赖和供应链
 
-项目使用 Rust 标准库加少量有明确理由的直接依赖。代理采用同步线程模型，不引入
-`tokio`、`axum`、`hyper`、`actix-web` 或 `reqwest`；不引入 `openssl`、`native-tls` 和
-`git2`，避免额外系统依赖、C 工具链和更大的审计面。证书、TLS、JSON、HTTP 头解析、
-Windows API 和随机选择各自使用专门依赖，理由写在 `Cargo.toml`。
+2026-11-06 修订：网络内核采用 Tokio + Hyper，以成熟实现取代自维护的 HTTP 头读取、
+chunked 分帧、消息边界和线程式转发。Hyper 只启用 HTTP/1.1 客户端与服务端；Tokio
+只启用运行时、网络、时间、I/O 和同步功能。hyper-util 提供官方 I/O / 计时适配，
+http-body-util 与 bytes 表达流式正文，tokio-io-timeout 提供读写空闲期限。
+
+TLS 使用 tokio-rustls 接入现有 rustls，继续统一采用 ring 后端。CA 签发、证书解析和
+Windows 信任管理分别复用 rcgen、x509-parser 和 windows-sys；公共加速服务选择、
+故障切换、文件绑定和恢复策略属于本项目逻辑。httparse 改为 Hyper 的传递依赖。
+
+不叠加没有具体用途的 Web 路由框架或第二套 HTTP 客户端；不引入 openssl、native-tls
+或 git2。每个直接依赖仍须在 Cargo.toml 说明作用，并通过 Rust 1.88、静态 CRT、
+协议回归和可复现构建检查。
 
 ## ADR-013：PAC + 本机 TLS MITM
 
 目标是加速安装包下载，而不是替换 winget 源。PAC 只圈定 GitHub 下载相关域名，本机
-终止 TLS 并在请求侧改写，响应字节原样转发。清单仍来自官方源，程序不需要管理员权限，
+终止 TLS 并在请求侧改写，响应正文内容保持一致、HTTP 分帧由 Hyper 处理。清单仍来自官方源，程序不需要管理员权限，
 只使用当前用户 PAC 和当前用户根证书。
 
 代价是需要用户信任一张本机 CA、依赖公共加速服务，并且代理成为下载链路中的单点。若

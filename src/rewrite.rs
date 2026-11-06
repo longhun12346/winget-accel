@@ -3,7 +3,8 @@
 //! 全程不碰 socket，因此可以用纯单元测试钉住行为。改写规则的 ID（REW-01..REW-08）
 //! 与协议集成测试逐条对应。
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use hyper::HeaderMap;
 
 /// 逐跳头（RFC 7230 §6.1）：只对单跳连接有意义，不得转发。
 ///
@@ -105,35 +106,19 @@ pub fn parse_accel(spec: &str) -> Result<Accel> {
     };
     let prefix = if prefix == "/" { String::new() } else { prefix };
 
-    // 用 proxy.rs 里同一套 host:port 拆分：它正确处理 IPv6 方括号
-    // （`[::1]:8080`），而 `rsplit_once(':')` 会把 `::1` 切成 `:` 与 `1`。
-    let host_str = authority.trim_start_matches('[').trim_end_matches(']');
-    let (host, port) = if authority.starts_with('[') {
-        // [v6]:port 或 [v6]
-        match authority.rsplit_once("]:") {
-            Some((h, p)) => {
-                let port: u16 = p
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("加速器端口非法: {p}"))?;
-                (h.trim_start_matches('[').to_string(), port)
-            }
-            None => (host_str.to_string(), scheme.default_port()),
-        }
-    } else {
-        match authority.rsplit_once(':') {
-            Some((h, p)) if !p.is_empty() => {
-                let port: u16 = p
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("加速器端口非法: {p}"))?;
-                (h.to_string(), port)
-            }
-            _ => (authority.to_string(), scheme.default_port()),
-        }
-    };
-
-    if host.is_empty() {
-        bail!("加速器地址缺少主机名: {spec:?}");
+    let authority: hyper::http::uri::Authority =
+        authority.parse().context("加速器 authority 非法")?;
+    if authority.as_str().contains('@')
+        || authority.host().is_empty()
+        || (authority.as_str() != authority.host() && authority.port_u16().is_none())
+    {
+        bail!("加速器地址或端口非法: {spec:?}");
     }
+    let host = authority
+        .host()
+        .trim_matches(['[', ']'])
+        .to_ascii_lowercase();
+    let port = authority.port_u16().unwrap_or(scheme.default_port());
 
     Ok(Accel {
         scheme,
@@ -150,8 +135,13 @@ pub fn rewrite_path(accel: &Accel, host: &str, target: &str) -> String {
 
 /// Host 头：非默认端口必须带端口，否则上游会按 80/443 解释。
 pub fn host_header(scheme: Scheme, host: &str, port: u16) -> String {
-    if port == scheme.default_port() {
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
         host.to_string()
+    };
+    if port == scheme.default_port() {
+        host
     } else {
         format!("{host}:{port}")
     }
@@ -165,8 +155,8 @@ pub struct Plan {
     pub host: String,
     pub port: u16,
     pub path: String,
-    /// 完整的请求头文本（含请求行与结尾空行）。
-    pub head: Vec<u8>,
+    pub method: String,
+    pub headers: HeaderMap,
 }
 
 /// PAC 只能整域代理 `github.com`（WinINet 对 HTTPS 不把路径交给 PAC，见 ADR-018），
@@ -208,7 +198,7 @@ pub fn plan_with(
     host: &str,
     port: u16,
     target: &str,
-    header_lines: &[String],
+    headers: &HeaderMap,
     rewrite_hosts: &[String],
     accel: &Accel,
     allow_rewrite: bool,
@@ -227,51 +217,24 @@ pub fn plan_with(
         (Scheme::Https, host.to_string(), port, target.to_string())
     };
 
-    let mut head = String::with_capacity(256);
-    head.push_str(&format!("{method} {up_path} HTTP/1.1\r\n"));
+    let mut headers = headers.clone();
+    crate::http::strip_hop_headers(&mut headers);
     if rewritten {
-        head.push_str(&format!(
-            "Host: {}\r\n",
+        headers.insert(
+            "host",
             host_header(scheme, &up_host, up_port)
-        ));
+                .parse()
+                .expect("validated accelerator authority"),
+        );
     }
-
-    let connection_tokens: Vec<String> = header_lines
-        .iter()
-        .filter_map(|line| line.split_once(':'))
-        .filter(|(name, _)| name.trim().eq_ignore_ascii_case("connection"))
-        .flat_map(|(_, value)| value.split(','))
-        .map(|token| token.trim().to_ascii_lowercase())
-        .collect();
-    for line in header_lines {
-        if line.is_empty() {
-            break;
-        }
-        let name = line
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        if HOP_BY_HOP.contains(&name.as_str()) || connection_tokens.contains(&name) {
-            continue;
-        }
-        if rewritten && name == "host" {
-            continue;
-        }
-        head.push_str(line);
-        head.push_str("\r\n");
-    }
-    // 统一以 close 结束，简化响应定界
-    head.push_str("Connection: close\r\n\r\n");
-
     Plan {
         rewritten,
         scheme,
         host: up_host,
         port: up_port,
         path: up_path,
-        head: head.into_bytes(),
+        method: method.to_string(),
+        headers,
     }
 }
 
@@ -321,7 +284,7 @@ mod tests {
         host: &str,
         port: u16,
         target: &str,
-        header_lines: &[String],
+        headers: &HeaderMap,
         rewrite_hosts: &[String],
         accel: &Accel,
     ) -> Plan {
@@ -330,7 +293,7 @@ mod tests {
             host,
             port,
             target,
-            header_lines,
+            headers,
             rewrite_hosts,
             accel,
             true,
@@ -359,12 +322,16 @@ mod tests {
         }
     }
 
-    fn head_of(plan: &Plan) -> String {
-        String::from_utf8(plan.head.clone()).unwrap()
-    }
-
-    fn headers(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
+    fn headers(items: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for line in items {
+            let (name, value) = line.split_once(':').unwrap();
+            headers.append(
+                name.parse::<hyper::header::HeaderName>().unwrap(),
+                value.trim().parse().unwrap(),
+            );
+        }
+        headers
     }
 
     #[test]
@@ -391,13 +358,19 @@ mod tests {
         );
         assert!(plan.rewritten);
         assert_eq!(plan.host, "gh-proxy.com");
-        let head = head_of(&plan).to_ascii_lowercase();
-        assert!(!head.contains("secret"));
-        assert!(!head.contains("proxy-auth"));
-        assert!(head.contains("range: bytes=0-1\r\n"));
-        assert!(head.contains("if-range: \"etag\"\r\n"));
-        assert!(head.contains("x-end-to-end: keep\r\n"));
-        assert_eq!(head.matches("connection:").count(), 1);
+
+        for name in [
+            "x-internal-token",
+            "x-second",
+            "proxy-authorization",
+            "proxy-authenticate",
+            "connection",
+        ] {
+            assert!(!plan.headers.contains_key(name));
+        }
+        assert_eq!(plan.headers["range"], "bytes=0-1");
+        assert_eq!(plan.headers["if-range"], "\"etag\"");
+        assert_eq!(plan.headers["x-end-to-end"], "keep");
     }
 
     // CFG-01
@@ -525,10 +498,8 @@ mod tests {
             (Scheme::Https, "gh-proxy.com", 443)
         );
         assert_eq!(plan.path, "/https://github.com/a.zip");
-        let head = head_of(&plan);
-        assert!(head.starts_with("GET /https://github.com/a.zip HTTP/1.1\r\n"));
-        assert!(head.contains("Host: gh-proxy.com\r\n"));
-        assert!(!head.contains("Host: github.com\r\n"));
+        assert_eq!(plan.method, "GET");
+        assert_eq!(plan.headers["host"], "gh-proxy.com");
     }
 
     #[test]
@@ -548,7 +519,7 @@ mod tests {
             &whitelist(),
             &accel,
         );
-        assert!(head_of(&plan).contains("Host: 127.0.0.1:9000\r\n"));
+        assert_eq!(plan.headers["host"], "127.0.0.1:9000");
     }
 
     /// 条件请求头必须原样透传（design.md §5 的承诺）。
@@ -573,31 +544,16 @@ mod tests {
             &whitelist(),
             &accel(),
         );
-        let head = head_of(&plan);
-        assert!(
-            head.contains("Range: bytes=1024-2047\r\n"),
-            "Range 透传: {head}"
-        );
-        assert!(
-            head.contains("If-Range: \"abc123etag\"\r\n"),
-            "If-Range 透传: {head}"
-        );
-        assert!(
-            head.contains("If-None-Match: \"abc123etag\"\r\n"),
-            "If-None-Match 透传: {head}"
-        );
-        assert!(
-            head.contains("User-Agent: winget-cli/1.29\r\n"),
-            "User-Agent 透传: {head}"
-        );
-        // 同时确认 Host 被换成加速器，而不是保留原站
-        assert!(head.contains("Host: gh-proxy.com\r\n"), "{head}");
-        assert!(!head.contains("Host: github.com\r\n"), "{head}");
+        assert_eq!(plan.headers["range"], "bytes=1024-2047");
+        assert_eq!(plan.headers["if-range"], "\"abc123etag\"");
+        assert_eq!(plan.headers["if-none-match"], "\"abc123etag\"");
+        assert_eq!(plan.headers["user-agent"], "winget-cli/1.29");
+        assert_eq!(plan.headers["host"], "gh-proxy.com");
     }
 
     // REW-04
     #[test]
-    fn drops_hop_by_hop_and_forces_close() {
+    fn drops_hop_by_hop_before_hyper_frames_request() {
         let plan = plan(
             "GET",
             "github.com",
@@ -617,19 +573,11 @@ mod tests {
             &whitelist(),
             &accel(),
         );
-        let head = head_of(&plan).to_ascii_lowercase();
-        assert!(head.contains("range: bytes=0-1023"));
-        assert!(head.contains("accept: */*"));
-        for gone in [
-            "proxy-connection",
-            "keep-alive:",
-            "te:",
-            "trailer:",
-            "upgrade:",
-        ] {
-            assert!(!head.contains(gone), "未剥离 {gone}");
+        assert_eq!(plan.headers["range"], "bytes=0-1023");
+        assert_eq!(plan.headers["accept"], "*/*");
+        for gone in HOP_BY_HOP {
+            assert!(!plan.headers.contains_key(gone));
         }
-        assert!(head.contains("connection: close"));
     }
 
     // REW-05
@@ -650,9 +598,7 @@ mod tests {
             (Scheme::Https, "example.com", 443)
         );
         assert_eq!(plan.path, "/index.html");
-        let head = head_of(&plan);
-        assert!(head.contains("Host: example.com\r\n"));
-        assert!(!head.contains("gh-proxy.com"));
+        assert_eq!(plan.headers["host"], "example.com");
     }
 
     // REW-06

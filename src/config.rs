@@ -498,7 +498,7 @@ mod tests {
             "github.com",
             443,
             "/a.zip",
-            &[],
+            &hyper::HeaderMap::new(),
             &app.rewrite_hosts,
             &app.accels[0],
             true,

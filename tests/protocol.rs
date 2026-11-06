@@ -37,6 +37,7 @@ enum UpstreamMode {
     IgnoreRange,
     Truncate,
     TruncateChunked,
+    Status(u16),
 }
 
 struct HttpUpstream {
@@ -141,6 +142,23 @@ fn handle_http_connection(
 
     // 探测始终正常；故障开关只影响下载，避免后台探测改变候选选择。
     let mode = *mode.lock().expect("upstream mode lock");
+    if let UpstreamMode::Status(status) = mode {
+        write_response(
+            &mut stream,
+            status,
+            &[
+                (
+                    "Location",
+                    "https://release-assets.githubusercontent.com/test",
+                ),
+                ("Connection", "X-Upstream-Only"),
+                ("X-Upstream-Only", "secret"),
+                ("X-End-To-End", "keep"),
+            ],
+            &[],
+        );
+        return;
+    }
     if matches!(mode, UpstreamMode::IgnoreRange) && headers.contains_key("range") {
         write_response(&mut stream, 200, &[], &[b'Q'; 65_536]);
         return;
@@ -176,7 +194,7 @@ fn handle_http_connection(
         let _ = write!(
             stream,
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\
-             Connection: close\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n1\r\nh\r\n0\r\n\r\n"
+             Connection: transfer-encoding, close\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n1\r\nh\r\n0\r\n\r\n"
         );
         let _ = stream.flush();
         return;
@@ -904,16 +922,16 @@ fn non_whitelisted_host_is_tunneled() {
     let mut client = TcpStream::connect(("127.0.0.1", proxy.port)).expect("connect proxy");
     write!(
         client,
-        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+        "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n\
+         GET /plain HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n",
         upstream.addr.port(),
         upstream.addr.port()
     )
     .expect("write connect");
     let head = read_until(&mut client, b"\r\n\r\n");
     assert!(head.starts_with(b"HTTP/1.1 200"), "{head:?}");
-    client
-        .write_all(b"GET /plain HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
-        .expect("write tunneled request");
+    // The tunnel payload shared a write with CONNECT: Hyper must hand read-ahead
+    // bytes to the upgraded connection instead of losing them.
     let response = read_to_end(&mut client);
     assert!(response.ends_with(b"hello-through-tunnel"), "{response:?}");
     assert_eq!(
@@ -951,6 +969,35 @@ fn oversized_headers_get_431_and_connection_limit_is_bounded() {
         response.windows(3).any(|window| window == b"503"),
         "{response:?}"
     );
+    assert!(String::from_utf8_lossy(&proxy.pac()).contains("function FindProxyForURL"));
+    assert!(proxy.health()["connLimitRejects"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn preserves_no_body_redirect_and_refusal_responses_and_filters_hop_headers() {
+    for status in [204, 304, 302, 401, 451] {
+        let upstream = HttpUpstream::start(UpstreamMode::Status(status));
+        let proxy = Proxy::start(&[(&upstream.url(), UpstreamMode::Normal)], &[]);
+        let header_path = proxy._dir.path().join("headers.txt");
+        let result = curl(
+            &proxy,
+            &asset("status"),
+            &["--dump-header", header_path.to_str().unwrap()],
+        );
+        assert_curl_ok(&result);
+        assert_eq!(result.status, status);
+        assert!(result.body.is_empty());
+        assert_eq!(upstream.records().len(), 1);
+        if status == 302 {
+            let headers = std::fs::read_to_string(header_path)
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(headers.contains("location: https://release-assets.githubusercontent.com/test"));
+            assert!(headers.contains("x-end-to-end: keep"));
+            assert!(!headers.contains("x-upstream-only"));
+            assert_eq!(proxy.health()["errors"], 0);
+        }
+    }
 }
 
 #[test]

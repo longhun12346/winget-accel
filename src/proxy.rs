@@ -3,16 +3,16 @@
 //! 分流规则（ADR-014 约束 2）：只有 `rewrite_hosts`（含配置中的 `mitmExtra`）会被终止 TLS，
 //! 其余 host 一律原样隧道——我们不解析、不记录、不改写那些流量。
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use rustls::{ClientConnection, ServerConnection, StreamOwned};
+use hyper::body::Incoming;
+use hyper::{Request, Response};
 
-use crate::ca::{upstream_client_config, CertAuthority};
+use crate::ca::CertAuthority;
 use crate::config::App;
 use crate::health::Tracker;
 use crate::http;
@@ -21,28 +21,22 @@ use crate::rewrite;
 use crate::stats::Stats;
 
 mod local;
+mod network;
 mod probe;
 
 pub use probe::{probe, DEFAULT_PROBE_ASSET};
 pub(crate) use probe::{probe_speed, split_asset};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const IO_TIMEOUT: Duration = Duration::from_secs(60);
+use crate::http::IO_TIMEOUT;
 /// 建连后等**首个请求头**的期限。
 ///
 /// 比 `IO_TIMEOUT` 短得多：连接在发出任何请求之前就占着一个并发名额（总共 64 个）。
 /// 浏览器开一批 `*.github.com` 标签页时容易攒出几十条空闲连接，
 /// 让它们各自占 60 秒，winget 的下载就可能被 503 挡掉。
-/// 读完请求头之后会恢复成 `IO_TIMEOUT`（见 `handle_client`）。
+/// 正文使用独立的 `IO_TIMEOUT`，持续有数据的大文件不会受首包期限影响。
 const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// 单次上游尝试的最短 idle 超时。
-///
-/// 换候选的预算（`MAX_FAILOVER_TIME`）不是硬上限——它只在每次尝试**开始前**检查，
-/// 一次卡住的尝试仍可超出它一个 idle 超时。
-/// 这里的下限保证收窄后也不会变成"刚发出就超时"：读超时衡量的是"多久没有新数据"，
-/// 设得比 `MIN_ATTEMPT_TIMEOUT` 更小会误杀正常但偏慢的链路。
-const MIN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
-/// 同时处理的连接上限。超出直接拒绝，避免 PAC 把大量子域流量导进来时无限建线程。
+/// 同时处理的连接上限，限制下载和 TLS 会话占用。
 const MAX_CONNECTIONS: usize = 64;
 /// 隧道最多占多少个名额（留一部分给下载）。
 ///
@@ -64,15 +58,6 @@ const _: () = assert!(
     MAX_CONNECTIONS - MAX_TUNNELS >= 8,
     "至少要给下载留 8 个名额，否则并发分片会被饿死"
 );
-const BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
-/// 带请求体的请求：本代理只转发响应体，明确不支持而不是让它卡到超时。
-const BODY_UNSUPPORTED: &[u8] =
-    b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-/// 回 501 前最多读掉多少请求体。
-///
-/// 不是"支持请求体"，只是为了让客户端能读到那个 501：连接里留着未读数据就关闭，
-/// Windows 会发 RST，客户端只会看到"连接被重置"。上限很小，因为它只是礼貌性的收尾。
-const MAX_DRAIN: u64 = 64 * 1024;
 /// 同一文件的候选绑定有效期。winget 下载一个包通常几十秒到几分钟。
 const PIN_TTL: Duration = Duration::from_secs(600);
 /// 绑定表最多记多少个文件。
@@ -94,20 +79,6 @@ const FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 const INITIAL_PROBE_TIME: Duration = Duration::from_secs(15);
 /// A single initial-probe candidate attempt must not consume the whole budget.
 const INITIAL_PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
-/// 一次上游尝试的结果。
-///
-/// 拆成三态是为了支持"换候选重试"：
-/// 429/503 时上游还没把任何字节转发给客户端，可以安全地换一个候选；
-/// 而一旦开始转发正文，就不能再改主意了。
-enum Fwd {
-    /// 响应已经完整（或按协议定界）转发给客户端。
-    Done(u16, u64),
-    /// 尚未向客户端写任何字节，可以换候选重试。
-    RetryableStatus(u16),
-    /// 上游连接/读取失败，尚未向客户端写任何字节。
-    RetryableFailure(anyhow::Error),
-}
-
 /// 失败冷却，分两个作用域。
 ///
 /// 为什么要分：`429`/`503`/连接失败是**服务级**问题（整个候选都不用试），
@@ -211,22 +182,17 @@ impl CooldownScope<'_> {
     }
 }
 
-/// 连接槽位：线程结束时把 `Proxy::active` 减回去。
-///
-/// 用 Drop 而不是在每处 return 手动减——`handle_client` 有多条提前返回路径，
-/// 漏掉一条就会永久占用一个名额，最终把自己锁死。
+/// 槽位跨 CONNECT 升级共享，直到 TLS/隧道任务结束才归还。
 struct ActiveSlot(Arc<Proxy>);
 
 /// 隧道连接的计数守卫（`Proxy::tunnels` 的 RAII 包装）。
 ///
-/// 用 Drop 释放而不是在每个返回点手写 `fetch_sub`：`do_tunnel` 有多条提前返回路径，
-/// 漏一条就会永久吃掉一个名额（和 `ActiveSlot` 当初同样的理由）。
-/// 这里借用计数器的引用而非 `Arc<Proxy>`——`dispatch_connect` 拿到的是 `&Proxy`。
-struct TunnelSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+/// 建连失败、升级失败和搬运结束都会通过 Drop 归还名额。
+struct TunnelSlot(Arc<Proxy>);
 
-impl Drop for TunnelSlot<'_> {
+impl Drop for TunnelSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.tunnels.fetch_sub(1, Ordering::Relaxed);
     }
 }
 impl Drop for ActiveSlot {
@@ -247,7 +213,7 @@ pub struct Proxy {
     pins_saturated: AtomicBool,
     /// 上一次观测到的"全挂"状态，用来只在**状态翻转**时报警，避免每请求刷日志。
     down: AtomicBool,
-    /// 当前在处理中的连接数（含隧道与 MITM），用于限制线程数。
+    /// 当前在处理中的连接数（含隧道与 MITM），从 accept 开始计数。
     active: std::sync::atomic::AtomicUsize,
     /// 当前**隧道**连接数（是 `active` 的子集），用于把名额优先留给下载。
     tunnels: std::sync::atomic::AtomicUsize,
@@ -295,235 +261,45 @@ impl Proxy {
         })
     }
 
-    /// 阻塞式接受连接，每连接一个线程；监听端口由 main 在接管系统前预留。
-    pub fn serve(self: Arc<Self>, listener: TcpListener) -> Result<()> {
-        self.spawn_health_prober();
-
-        for incoming in listener.incoming() {
-            match incoming {
-                Ok(mut stream) => {
-                    let peer = stream
-                        .peer_addr()
-                        .map(|addr| addr.to_string())
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    // 先原子占一个名额再判断：`load()` 后 `fetch_add()` 之间有两个线程
-                    // 同时看到 63 的窗口，一起进来就会变成 65，上限形同虚设。
-                    // 占用失败立刻还回去，避免泄漏名额。
-                    let slot = self.active.fetch_add(1, Ordering::Relaxed);
-                    if slot >= MAX_CONNECTIONS {
-                        self.active.fetch_sub(1, Ordering::Relaxed);
-                        // 名额满时，**本地端点仍要能服务**：Windows 会定期重新取 PAC，
-                        // 而占满名额的正是下载本身——取不到 PAC 就可能退回直连，
-                        // 于是"下载越多、加速越容易失效"。实测：64 个连接占满后
-                        // `GET /winget-accel.pac` 会拿到 503。
-                        if self.serve_local_if_saturated(&mut stream, &peer) {
-                            continue;
-                        }
-                        Stats::bump(&self.stats.conn_limited);
-                        self.log.warn(&format!(
-                            "CONN-LIMIT peer={peer} 并发连接已达上限 {MAX_CONNECTIONS}，拒绝本次连接"
-                        ));
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        );
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
-                        continue;
-                    }
-                    let proxy = Arc::clone(&self);
-                    std::thread::spawn(move || {
-                        let _slot = ActiveSlot(Arc::clone(&proxy));
-                        // 建连后先给一个**短的**"首个请求"期限：连接在发请求之前就占着一个
-                        // 并发名额，而名额只有 64 个。浏览器打开一批 `*.github.com` 标签页
-                        // 时很容易攒出几十条空闲连接；若都按 60 s 的 IO 超时等着，
-                        // winget 的下载可能被 503 挡掉。
-                        let _ = stream.set_read_timeout(Some(FIRST_REQUEST_TIMEOUT));
-                        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-                        let started = std::time::Instant::now();
-                        proxy
-                            .log
-                            .log(Level::Debug, &format!("CONN-ACCEPT peer={peer}"));
-                        if let Err(err) = proxy.handle_client(stream) {
-                            proxy.log.warn(&format!(
-                                "CONN-FAIL peer={peer} elapsed={:.2}s {err:#}",
-                                started.elapsed().as_secs_f64()
-                            ));
-                        }
-                    });
-                }
-                Err(err) => self.log.warn(&format!("ACCEPT-FAIL {err}")),
-            }
-        }
-        Ok(())
-    }
-
-    fn handle_client(&self, mut stream: TcpStream) -> Result<()> {
-        Stats::bump(&self.stats.connects);
-
-        let head = match http::read_head(&mut stream) {
-            Ok(head) => head,
-            Err(err) => {
-                Stats::bump(&self.stats.errors);
-                // 头过大时回一个明确的 431，而不是默默断线。
-                //
-                // 但只在"已经能看出这是个 HTTP 请求"时才回：随机二进制/TLS 握手打进来的
-                // 连接得到一个 HTTP 响应没有意义，对端也读不懂。
-                // 本地代理不是对外服务，这一条纯粹是为了"客户端报错能指对方向"——
-                // 实测超大请求头此前表现为客户端侧的连接重置，看不出原因。
-                if err.kind() == std::io::ErrorKind::InvalidData {
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    );
-                    let _ = stream.flush();
-                    // 写完要先**排空对端还在发的数据**再关，否则内核会发 RST，
-                    // 某些客户端连 431 都读不到（实测：直接 ConnectionResetError，
-                    // 而用 curl 手工写同样的字节却能看到 431——差别就在收尾方式）。
-                    drain_briefly(&mut stream, MAX_DRAIN, Duration::from_millis(300));
-                }
-                return Err(anyhow!("读请求头失败: {err}"));
-            }
-        };
-
-        // 请求头已经到了：把读超时恢复成常规值。此前的 10 秒只针对"连上但不说话"
-        // 的连接（保护 64 个并发名额），不该限制后续的正常收发。
-        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-
-        let Some(req) = http::parse_head(&head) else {
-            Stats::bump(&self.stats.errors);
-            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
-            return Err(anyhow!(
-                "请求头无法解析（{} 字节: {}）",
-                head.len(),
-                http::bytes_preview(&head)
-            ));
-        };
-
-        if req.method.eq_ignore_ascii_case("CONNECT") {
-            return self.dispatch_connect(stream, &req);
-        }
-        self.serve_local(stream, &req)
-    }
-
-    /// CONNECT 分流：白名单走 MITM，其余走隧道。
-    fn dispatch_connect(&self, stream: TcpStream, req: &http::Head) -> Result<()> {
-        let (host, port) = split_host_port(&req.target)
-            .with_context(|| format!("CONNECT 目标非法: {}", req.target))?;
-        // 统一转小写再往下走：DNS 名字大小写不敏感（RFC 4343），而下游的
-        // pin 键、能力矩阵、日志都以它为准。也让"PAC 匹配上了却分流到隧道"
-        // 这种自相矛盾的情形不可能再出现。
-        let host = host.to_ascii_lowercase();
-
-        let mode = if self.app.should_mitm(&host) {
-            "MITM"
-        } else {
-            "TUNNEL"
-        };
-        self.log.info(&format!("CONNECT {host}:{port} mode={mode}"));
-
-        if self.app.should_mitm(&host) {
-            Stats::bump(&self.stats.mitm);
-            self.do_mitm(stream, &host, port)
-        } else {
-            // 隧道名额有独立上限：超了就把这个名额让给下载（见 MAX_TUNNELS 的说明）。
-            // 检查与占用是同一步 `fetch_add`，不会两个线程同时看到 47 一起进来。
-            let n = self.tunnels.fetch_add(1, Ordering::Relaxed);
-            if n >= MAX_TUNNELS {
-                self.tunnels.fetch_sub(1, Ordering::Relaxed);
-                Stats::bump(&self.stats.conn_limited);
-                self.log.warn(&format!(
-                    "TUNNEL-LIMIT {host}:{port} 隧道已达上限 {MAX_TUNNELS}（总名额 {MAX_CONNECTIONS}）：\
-                     名额优先留给下载，本次隧道被拒"
-                ));
-                let mut stream = stream;
-                let _ = stream.write_all(
-                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-                return Ok(());
-            }
-            let _guard = TunnelSlot(&self.tunnels);
-            Stats::bump(&self.stats.tunnel);
-            self.do_tunnel(stream, &host, port)
-        }
-    }
-
-    /// 原样隧道：不终止 TLS，不解析内容。
-    fn do_tunnel(&self, mut client: TcpStream, host: &str, port: u16) -> Result<()> {
-        let upstream = match connect_tcp(host, port) {
-            Ok(stream) => stream,
-            Err(err) => {
-                Stats::bump(&self.stats.errors);
-                self.log.warn(&format!("TUNNEL-FAIL {host}:{port} {err:#}"));
-                let _ = client.write_all(BAD_GATEWAY);
-                return Ok(());
-            }
-        };
-        client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
-
-        let mut up_read = upstream.try_clone()?;
-        let mut cli_read = client.try_clone()?;
-        let mut cli_write = client;
-        let mut up_write = upstream;
-
-        let up_to_cli = std::thread::spawn(move || {
-            let _ = std::io::copy(&mut up_read, &mut cli_write);
-            let _ = cli_write.shutdown(std::net::Shutdown::Write);
-        });
-        let _ = std::io::copy(&mut cli_read, &mut up_write);
-        let _ = up_write.shutdown(std::net::Shutdown::Write);
-        let _ = up_to_cli.join();
-
-        self.log.info(&format!("TUNNEL {host}:{port}"));
-        Ok(())
-    }
-
-    /// 终止 TLS 并改写请求。
-    fn do_mitm(&self, mut client: TcpStream, host: &str, port: u16) -> Result<()> {
-        client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
-
-        let server_cfg = self.ca.server_config(host)?;
-        let conn = ServerConnection::new(server_cfg).context("构造 TLS 服务端会话失败")?;
-        let mut tls = StreamOwned::new(conn, client);
-
-        let head = match http::read_head(&mut tls) {
-            Ok(head) => head,
-            Err(err) => {
-                Stats::bump(&self.stats.errors);
-                self.log.warn(&format!("MITM-READ-FAIL {host} {err}"));
-                return Ok(());
-            }
-        };
-        let Some(req) = http::parse_head(&head) else {
-            Stats::bump(&self.stats.errors);
-            return Ok(());
-        };
-
-        // 带请求体的请求直接 501：本代理不转发请求体，硬发出去只会让上游等 body、
-        // 让客户端卡到读超时。失败要快，而且要能一眼看出原因（见 `has_request_body`）。
-        if has_request_body(&req) {
+    /// Select candidates before exposing response headers; never retry a streamed body.
+    async fn download(
+        self: Arc<Self>,
+        mut req: Request<Incoming>,
+        host: &str,
+        port: u16,
+    ) -> Response<http::BoxBody> {
+        use http_body_util::BodyExt;
+        let target = req
+            .uri()
+            .path_and_query()
+            .map_or("/", |p| p.as_str())
+            .to_string();
+        if req.headers().contains_key("transfer-encoding")
+            || req
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some_and(|n| n > 0)
+        {
             Stats::bump(&self.stats.errors);
             self.log.warn(&format!(
-                "REQ-BODY-UNSUPPORTED host={host} method={} contentLength={} \
-                 本代理不转发请求体（git clone 等走 PAC 的 DIRECT），返回 501",
-                req.method,
-                req.header("content-length").unwrap_or("-")
+                "REQ-BODY-UNSUPPORTED host={host} method={} 返回 501",
+                req.method()
             ));
-            // 先把**小的**请求体读掉再回 501：连接里还有未读数据就关闭，
-            // Windows 会发 RST，客户端读不到这个 501、只看到"连接被重置"。
-            // 上限 64 KiB——本代理本来就不支持请求体，为它无限读没有意义。
-            if let Some(len) = request_body_len(&req).filter(|len| *len <= MAX_DRAIN) {
-                // 对方可能正在等 100 Continue，不能为了拒绝请求先等它发 body。
-                let _ = tls.sock.set_read_timeout(Some(Duration::from_millis(300)));
-                let _ = std::io::copy(&mut (&mut tls).take(len), &mut std::io::sink());
+            // Do not poll an Expect: 100-continue body just to reject it.
+            if !req.headers().contains_key("expect") {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    http_body_util::Limited::new(req.body_mut(), 64 * 1024).collect(),
+                )
+                .await;
             }
-            self.send_status(&mut tls, BODY_UNSUPPORTED);
-            return Ok(());
+            return http::response(501, "text/plain", "");
         }
-
-        let no_body = req.method.eq_ignore_ascii_case("HEAD");
-        let expect_partial = req.header("range").is_some();
+        let expect_partial = req.headers().contains_key("range");
         let initial_probe = is_initial_probe(&req);
-        // 只有幂等方法才允许换候选重试（GET/HEAD）。
-        let retryable = req.method.eq_ignore_ascii_case("GET") || no_body;
+        let retryable = matches!(req.method().as_str(), "GET" | "HEAD");
         let failover_limit = if initial_probe {
             usize::MAX
         } else {
@@ -535,165 +311,167 @@ impl Proxy {
             MAX_FAILOVER_TIME
         };
         let started = std::time::Instant::now();
-        // 读写超时在进入重试循环时算**一次**，所有尝试共用：它是"多久没有新数据"的
-        // idle 超时，不是总时长。刻意不按每次尝试收窄——把重试的超时越收越短，
-        // 会把"慢但能成"的候选误杀（本项目的目标是"下载可用"，不是"总耗时最短"）。
-        // 代价：卡住的单次尝试可以超出 MAX_FAILOVER_TIME 一个 idle 超时，
-        // 所以那个预算只是"近似有界"，真正的硬边界是"不再发起新尝试"。
         let attempt_timeout = if initial_probe {
-            Some(INITIAL_PROBE_ATTEMPT_TIMEOUT)
+            INITIAL_PROBE_ATTEMPT_TIMEOUT
         } else {
-            let remaining = failover_time.saturating_sub(started.elapsed());
-            Some(remaining.max(MIN_ATTEMPT_TIMEOUT))
+            failover_time
         };
-
-        // 每轮尝试各自的起点（在 `break` 里带出）：速度样本要用"这一次尝试"的耗时，
-        // 而不是整个请求的耗时（含之前失败候选的切换开销，那会把速度算低）。
-        let mut tried: Vec<usize> = Vec::new();
-        // 最近一次"候选给出了明确状态码"的响应。
-        //
-        // 为什么需要：401/451 这类状态码说明**这个候选**不行（要认证 / 被它屏蔽），
-        // 换候选重试是对的；但如果候选用尽了，把 401 变成 502 就丢了上游语义——
-        // 用户看到 451 会想到"被屏蔽"，看到 502 只会以为是我们这层挂了。
-        // 实测过：单候选返回 401 时，改动后客户端拿到 502，排查方向完全被带偏。
+        let mut tried = Vec::new();
         let mut last_status: Option<u16> = None;
         if initial_probe {
             self.log
                 .info(&format!("INITIAL-PROBE host={host} range=bytes=0-1"));
         }
-
-        let (plan, accel_idx, accel, status, size, pin_hit, attempt_started) = loop {
+        loop {
             if !tried.is_empty() && started.elapsed() >= failover_time {
                 self.log.warn(&format!(
-                    "FAILOVER-TIMEOUT host={host} initial_probe={initial_probe} tried={} elapsed={:.2}s",
-                    tried.len(),
-                    started.elapsed().as_secs_f64()
+                    "FAILOVER-TIMEOUT host={host} tried={}",
+                    tried.len()
                 ));
-                self.send_bad_gateway(&mut tls);
-                return Ok(());
+                return http::response(502, "text/plain", "");
             }
-            let Some((accel_idx, accel, from_pin)) = self.pick_for(host, &req.target, &tried)
-            else {
+            let Some((idx, accel, from_pin)) = self.pick_for(host, &target, &tried) else {
                 Stats::bump(&self.stats.errors);
-                // 候选用尽，但最后一次曾拿到**表示拒绝**的状态码 → 透传它，别一律 502。
-                // 401（要认证）/451（被屏蔽）与 502（我们这层挂了）对用户意味着完全不同的处理方向。
-                // 但 2xx 绝不能透传：Range 请求拿到 200 说明上游回了整包，
-                // 交给客户端会被当成某个分片，内容就错了。
-                if let Some(status) = last_status.filter(|s| *s >= 400) {
-                    self.log.warn(&format!(
-                        "NO-VERIFIED-ACCEL {host} 候选已试 {} 个均失败，透传最后一次状态 {status}",
-                        tried.len()
-                    ));
-                    self.send_passthrough_status(&mut tls, status);
-                } else {
-                    self.log.warn(&format!(
-                        "NO-VERIFIED-ACCEL {host} 无已验证候选（未探测候选不会使用；已试 {} 个），返回 502",
-                        tried.len()
-                    ));
-                    self.send_bad_gateway(&mut tls);
-                }
-                return Ok(());
+                self.log
+                    .warn(&format!("NO-VERIFIED-ACCEL {host} tried={}", tried.len()));
+                return http::response(
+                    last_status.filter(|s| *s >= 400).unwrap_or(502),
+                    "text/plain",
+                    "",
+                );
             };
-
             let plan = rewrite::plan_with(
-                &req.method,
+                req.method().as_str(),
                 host,
                 port,
-                &req.target,
-                &req.headers,
+                &target,
+                req.headers(),
                 &self.app.rewrite_hosts,
                 &accel,
-                rewrite::needs_rewrite(host, &req.target),
+                rewrite::needs_rewrite(host, &target),
             );
-
-            // 关键：在写任何客户端字节前确定本次是否还可能重试。
-            let allow_retry = retryable
-                && plan.rewritten
-                && tried.len() + 1 < failover_limit
-                && started.elapsed() < failover_time;
+            let allow_retry = retryable && plan.rewritten && tried.len() + 1 < failover_limit;
             let attempt_started = std::time::Instant::now();
-            let outcome = match plan.scheme {
-                rewrite::Scheme::Https => {
-                    self.forward_tls(&plan, no_body, expect_partial, attempt_timeout, &mut tls)
+            let outcome = match http::request(&plan.method, &plan.path, plan.headers.clone()) {
+                Ok(request) => {
+                    http::send(plan.scheme, &plan.host, plan.port, request, attempt_timeout).await
                 }
-                rewrite::Scheme::Http => {
-                    self.forward_plain(&plan, no_body, expect_partial, attempt_timeout, &mut tls)
-                }
+                Err(error) => Err(error),
             };
-
             match outcome {
-                Ok(Fwd::Done(status, size)) => {
-                    break (
-                        plan,
-                        accel_idx,
-                        accel,
-                        status,
-                        size,
-                        from_pin,
-                        attempt_started,
-                    );
-                }
-                Ok(Fwd::RetryableStatus(status)) => {
-                    Stats::bump(&self.stats.errors);
-                    if http::is_rate_limited(status) {
-                        self.health.mark(accel_idx, false);
-                        self.cooldowns.block_service(accel_idx, FAILURE_COOLDOWN);
-                        self.log.warn(&format!(
-                            "ACCEL-COOLDOWN {} for {}s: rate limited {status}",
-                            accel.host,
-                            FAILURE_COOLDOWN.as_secs()
-                        ));
-                        Stats::bump(&self.stats.ratelimited);
-                    } else {
-                        let scope = failure_scope(status, host);
-                        self.note_accel_failure(
-                            accel_idx,
-                            &accel,
-                            &format!("upstream status {status}"),
-                            scope,
-                        );
-                        // 403/404 是"该候选不愿服务这个 URL"的证据（限流/故障不是），
-                        // 记进能力学习：同一 (候选, host) 反复如此就临时跳过它，
-                        // 免得后续请求继续把换候选预算浪费在它身上。
-                        if matches!(status, 403 | 404)
-                            && plan.rewritten
-                            && self.learned.note_unsupported(accel_idx, host)
-                        {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    if (expect_partial && status == 200)
+                        || http::is_rate_limited(status)
+                        || is_retryable_status(status)
+                    {
+                        Stats::bump(&self.stats.errors);
+                        if http::is_rate_limited(status) {
+                            self.health.mark(idx, false);
+                            self.cooldowns.block_service(idx, FAILURE_COOLDOWN);
+                            Stats::bump(&self.stats.ratelimited);
                             self.log.warn(&format!(
-                                "CAPS-LEARNED host={host} 候选 {} 连续返回 {status}，\
-                                 该组合暂时跳过（这是运行期学到的，不是配置里的能力矩阵）",
+                                "ACCEL-COOLDOWN {} rate limited {status}",
                                 accel.host
                             ));
-                        }
-                    }
-                    self.log.warn(&format!(
-                        "ACCEL-BAD-STATUS {} 返回 {status}，换下一个候选重试",
-                        accel.host
-                    ));
-                    // 记下它，候选用尽时透传（别把 401/451 变成 502）
-                    last_status = Some(status);
-                    if initial_probe {
-                        self.log.warn(&format!(
-                            "INITIAL-PROBE-RETRY via={} status={status} tried={}",
-                            accel.host,
-                            tried.len()
-                        ));
-                    }
-                    tried.push(accel_idx);
-                    if !allow_retry {
-                        // 不能重试（非幂等方法，或只剩这一条）：这是最后一次尝试。
-                        // 只透传**表示拒绝**的状态码（4xx/5xx）——401/451 变成 502 会把
-                        // 排查方向带偏。2xx 不能透传：Range 请求拿到 200 意味着上游回了整包，
-                        // 交给客户端会被当成某个分片，内容就错了（协议用例钉住这条）。
-                        if status >= 400 {
-                            self.send_passthrough_status(&mut tls, status);
                         } else {
-                            self.send_bad_gateway(&mut tls);
+                            self.note_accel_failure(
+                                idx,
+                                &accel,
+                                &format!("upstream status {status}"),
+                                failure_scope(status, host),
+                            );
+                            if matches!(status, 403 | 404)
+                                && plan.rewritten
+                                && self.learned.note_unsupported(idx, host)
+                            {
+                                self.log.warn(&format!(
+                                    "CAPS-LEARNED host={host} via={} status={status}",
+                                    accel.host
+                                ));
+                            }
                         }
-                        return Ok(());
+                        self.log.warn(&format!(
+                            "ACCEL-BAD-STATUS {} 返回 {status}，换下一个候选重试",
+                            accel.host
+                        ));
+                        last_status = Some(status);
+                        tried.push(idx);
+                        if initial_probe {
+                            self.log.warn(&format!(
+                                "INITIAL-PROBE-RETRY via={} status={status} tried={}",
+                                accel.host,
+                                tried.len()
+                            ));
+                        }
+                        if !allow_retry {
+                            return http::response(
+                                if status >= 400 { status } else { 502 },
+                                "text/plain",
+                                "",
+                            );
+                        }
+                        continue;
                     }
+                    let host = host.to_owned();
+                    let proxy = self.clone();
+                    return http::observe(response, move |result| {
+                        let size = match result {
+                            Ok(size) => size,
+                            Err(err) => {
+                                Stats::bump(&proxy.stats.errors);
+                                if plan.rewritten {
+                                    proxy.unpin(&host, &target);
+                                }
+                                proxy.log.warn(&format!(
+                                    "RELAY-ERR host={host} via={} kind={} retry={} elapsed={:.2}s pin_cleared={} path={} err={err:#}",
+                                    accel.host, io_error_kind(&err), tried.len(), started.elapsed().as_secs_f64(),
+                                    plan.rewritten, crate::log::loggable(&plan.path, 100)));
+                                return;
+                            }
+                        };
+                        if initial_probe {
+                            proxy.log.info(&format!(
+                                "INITIAL-PROBE-OK via={} status={status} size={size} tried={}",
+                                accel.host,
+                                tried.len()
+                            ));
+                        }
+                        if plan.rewritten {
+                            Stats::bump(&proxy.stats.rewrites);
+                            if (200..300).contains(&status) {
+                                proxy.cooldowns.clear_for(idx, &host);
+                                proxy.health.record_success(idx);
+                                proxy.health.record_sample(
+                                    idx,
+                                    size,
+                                    attempt_started.elapsed().as_secs_f64(),
+                                );
+                                proxy.pin(&host, &target, idx);
+                                proxy.learned.note_success(idx, &host);
+                                proxy.report_health_state();
+                            }
+                        }
+                        Stats::add(&proxy.stats.bytes, size);
+                        let tag = if plan.rewritten { "REWRITE" } else { "PASS" };
+                        let via = if plan.rewritten {
+                            accel.host.as_str()
+                        } else {
+                            "-"
+                        };
+                        let pin = if from_pin { "bind" } else { "pick" };
+                        proxy.log.info(&format!(
+                            "{tag} via={via} {pin} retry={} {} -> {status} {size}B {:.2}s",
+                            tried.len(),
+                            crate::log::loggable(&plan.path, 76),
+                            started.elapsed().as_secs_f64()
+                        ));
+                        if plan.rewritten && !(200..300).contains(&status) {
+                            proxy.log.warn(&format!("REWRITE-FAILED via={via} status={status} size={size}B tried={tried:?} {}", crate::log::loggable(&plan.path, 100)));
+                        }
+                    });
                 }
-                Ok(Fwd::RetryableFailure(err)) => {
+                Err(err) => {
                     Stats::bump(&self.stats.errors);
                     self.log.warn(&format!(
                         "UPSTREAM-FAIL {host} -> {}:{} {err:#}",
@@ -701,133 +479,22 @@ impl Proxy {
                     ));
                     if plan.rewritten {
                         self.note_accel_failure(
-                            accel_idx,
+                            idx,
                             &accel,
                             &format!("{err:#}"),
                             CooldownScope::Service,
                         );
                     }
-                    tried.push(accel_idx);
-                    if allow_retry {
-                        self.log.warn(&format!("RETRY {host} 换下一个候选"));
-                    } else {
-                        self.send_bad_gateway(&mut tls);
-                        return Ok(());
+                    tried.push(idx);
+                    if !allow_retry {
+                        return http::response(502, "text/plain", "");
                     }
-                }
-                Err(err) => {
-                    Stats::bump(&self.stats.errors);
-                    // `kind=` 让两种完全不同的情况不再长得一样：
-                    // - timeout：上游在完整消息结束前不再发数据
-                    // - early-eof：上游提前断开，正文真的不完整
-                    // 以前它们都只是"RELAY-ERR + 一句 err"，排障时容易误判成下载失败。
-                    self.log.warn(&format!(
-                        "RELAY-ERR host={host} via={} kind={} retry={} elapsed={:.2}s pin_cleared={} path={} err={err:#}",
-                        accel.host,
-                        io_error_kind(&err),
-                        tried.len(),
-                        started.elapsed().as_secs_f64(),
-                        plan.rewritten,
-                        crate::log::loggable(&plan.path, 100)
-                    ));
-                    if plan.rewritten {
-                        self.unpin(host, &req.target);
-                    }
-                    tls.conn.send_close_notify();
-                    let _ = tls.flush();
-                    let _ = tls.sock.shutdown(std::net::Shutdown::Both);
-                    return Ok(());
-                }
-            }
-        };
-
-        if initial_probe {
-            self.log.info(&format!(
-                "INITIAL-PROBE-OK via={} status={status} size={size} tried={}",
-                accel.host,
-                tried.len()
-            ));
-        }
-
-        if plan.rewritten {
-            Stats::bump(&self.stats.rewrites);
-            if (200..300).contains(&status) {
-                self.cooldowns.clear_for(accel_idx, host);
-                self.health.record_success(accel_idx);
-                // 用**这一次尝试**的耗时，不含之前失败候选的切换开销：
-                // 用总耗时会把速度算低，进而把这个候选的权重压低（选择越选越偏）。
-                self.health
-                    .record_sample(accel_idx, size, attempt_started.elapsed().as_secs_f64());
-                self.pin(host, &req.target, accel_idx);
-                // 它确实服务过这个 host：把"不支持"的记录清掉，避免误杀
-                self.learned.note_success(accel_idx, host);
-            } else {
-                // 3xx 是**合法**响应：客户端（winget）会自己跟随重定向，我们只负责透传。
-                // 实测：加速器返回 302 指向 release-assets.githubusercontent.com 时，
-                // 原来的日志写成 `ACCEL-BAD-STATUS … 返回 302`，看起来像候选坏了——
-                // 而它其实工作正常，只是把重定向交回客户端。分开写，别误导排查。
-                if (300..400).contains(&status) {
-                    self.log.log(
-                        Level::Debug,
-                        &format!(
-                            "ACCEL-REDIRECT {} 返回 {status}（{host}），原样透传给客户端跟随",
-                            accel.host
-                        ),
-                    );
-                } else {
-                    self.log.warn(&format!(
-                        "ACCEL-BAD-STATUS {} 返回 {status}（{host}），不计样本、不绑定",
-                        accel.host
-                    ));
+                    self.log.warn(&format!("RETRY {host} 换下一个候选"));
                 }
             }
         }
-
-        Stats::add(&self.stats.bytes, size);
-        if plan.rewritten {
-            if status >= 500 {
-                self.note_accel_failure(
-                    accel_idx,
-                    &accel,
-                    &format!("上游返回 {status}"),
-                    CooldownScope::Service,
-                );
-            } else if (200..300).contains(&status) {
-                self.report_health_state();
-            }
-        }
-
-        let tag = if plan.rewritten { "REWRITE" } else { "PASS" };
-        let via = if plan.rewritten {
-            accel.host.as_str()
-        } else {
-            "-"
-        };
-        let pin = if pin_hit { "bind" } else { "pick" };
-        self.log.info(&format!(
-            "{tag} via={via} {pin} retry={} {} -> {status} {size}B {:.2}s",
-            tried.len(),
-            crate::log::loggable(&plan.path, 76),
-            started.elapsed().as_secs_f64()
-        ));
-        if plan.rewritten && !(200..300).contains(&status) {
-            let elapsed = started.elapsed().as_secs_f64();
-            let speed = if elapsed > 0.0 {
-                (size as f64 / 1024.0) / elapsed
-            } else {
-                0.0
-            };
-            self.log.warn(&format!(
-                "REWRITE-FAILED via={via} status={status} size={size}B {speed:.0}KB/s tried={tried:?} {}",
-                crate::log::loggable(&plan.path, 100)
-            ));
-        }
-
-        tls.conn.send_close_notify();
-        let _ = tls.flush();
-        let _ = tls.sock.shutdown(std::net::Shutdown::Both);
-        Ok(())
     }
+
     /// 同一个文件（同 host + 同 path）固定用同一个候选。
     ///
     /// 代理看不到"文件"，只能看到请求；winget 对一个包发的多个 Range 分片
@@ -988,173 +655,6 @@ impl Proxy {
     fn max_retries(&self) -> usize {
         MAX_ACCEL_RETRIES.min(self.health.accels().len().max(1))
     }
-
-    fn forward_tls(
-        &self,
-        plan: &rewrite::Plan,
-        no_body: bool,
-        expect_partial: bool,
-        attempt_timeout: Option<Duration>,
-        tls: &mut StreamOwned<ServerConnection, TcpStream>,
-    ) -> Result<Fwd> {
-        let timeout = attempt_timeout.unwrap_or(CONNECT_TIMEOUT);
-        let mut upstream = match self.open_tls_upstream(plan, timeout) {
-            Ok(stream) => stream,
-            Err(err) => return Ok(Fwd::RetryableFailure(err)),
-        };
-
-        if let Some(timeout) = attempt_timeout {
-            let _ = upstream.sock.set_read_timeout(Some(timeout));
-            let _ = upstream.sock.set_write_timeout(Some(timeout));
-        }
-
-        if let Err(err) = upstream
-            .write_all(&plan.head)
-            .and_then(|()| upstream.flush())
-        {
-            return Ok(Fwd::RetryableFailure(err.into()));
-        }
-
-        let result = self.relay_checked(&mut upstream, tls, no_body, expect_partial);
-        upstream.conn.send_close_notify();
-        result
-    }
-
-    fn forward_plain(
-        &self,
-        plan: &rewrite::Plan,
-        no_body: bool,
-        expect_partial: bool,
-        attempt_timeout: Option<Duration>,
-        tls: &mut StreamOwned<ServerConnection, TcpStream>,
-    ) -> Result<Fwd> {
-        let timeout = attempt_timeout.unwrap_or(CONNECT_TIMEOUT);
-        let mut upstream = match connect_tcp_timeout(&plan.host, plan.port, timeout) {
-            Ok(stream) => stream,
-            Err(err) => return Ok(Fwd::RetryableFailure(err)),
-        };
-        if let Some(timeout) = attempt_timeout {
-            let _ = upstream.set_read_timeout(Some(timeout));
-            let _ = upstream.set_write_timeout(Some(timeout));
-        }
-
-        if let Err(err) = upstream
-            .write_all(&plan.head)
-            .and_then(|()| upstream.flush())
-        {
-            return Ok(Fwd::RetryableFailure(err.into()));
-        }
-
-        self.relay_checked(&mut upstream, tls, no_body, expect_partial)
-    }
-
-    /// 先读上游响应头并转发；具体判定见 `relay_checked_impl`。
-    ///
-    /// 这里**不判断能否重试**：`Fwd` 的三态本身就是"写到客户端了没有"，
-    /// 由调用方（`do_mitm`）根据自己的 `allow_retry` 决定换候选还是回 502。
-    /// 曾经把这个布尔一路传进来但没人用，读代码的人会以为"重试是在这里决定的"。
-    fn relay_checked<R: std::io::Read>(
-        &self,
-        up: &mut R,
-        tls: &mut StreamOwned<ServerConnection, TcpStream>,
-        no_body: bool,
-        expect_partial: bool,
-    ) -> Result<Fwd> {
-        relay_checked_impl(up, tls, no_body, expect_partial)
-    }
-    /// 只在最终失败时调用；保证客户端只收到一个 502。
-    fn send_bad_gateway(&self, tls: &mut StreamOwned<ServerConnection, TcpStream>) {
-        self.send_status(tls, BAD_GATEWAY);
-    }
-
-    /// 把上游给过的某个状态码原样回给客户端（无正文）。
-    ///
-    /// 用于"候选都试过了，最后一个是 401/451 这类明确语义"的情形：
-    /// 与其一律换成 502，不如让客户端看到上游的真实回答——
-    /// 401 指向"需要认证"、451 指向"被该服务屏蔽"，而 502 只会让人以为是我们这层坏了。
-    fn send_passthrough_status(
-        &self,
-        tls: &mut StreamOwned<ServerConnection, TcpStream>,
-        status: u16,
-    ) {
-        let reason = match status {
-            401 => "Unauthorized",
-            403 => "Forbidden",
-            404 => "Not Found",
-            451 => "Unavailable For Legal Reasons",
-            500..=599 => "Server Error",
-            _ => "Error",
-        };
-        let response =
-            format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        self.send_status(tls, response.as_bytes());
-    }
-
-    /// 向客户端写一个**预先固定**的响应并收尾（不再读上游）。
-    ///
-    /// 传 `&[u8]` 而不是 code + body：调用点只有两种固定响应，
-    /// 拼字符串只会多一处可以写错的地方。
-    fn send_status(&self, tls: &mut StreamOwned<ServerConnection, TcpStream>, response: &[u8]) {
-        let _ = tls.write_all(response);
-        tls.conn.send_close_notify();
-        let _ = tls.flush();
-        let _ = tls.sock.shutdown(std::net::Shutdown::Both);
-    }
-    fn open_tls_upstream(
-        &self,
-        plan: &rewrite::Plan,
-        timeout: Duration,
-    ) -> Result<StreamOwned<ClientConnection, TcpStream>> {
-        let cfg = upstream_client_config();
-        let server_name: rustls::pki_types::ServerName<'static> = plan
-            .host
-            .clone()
-            .try_into()
-            .map_err(|_| anyhow!("上游主机名非法: {}", plan.host))?;
-        let conn = ClientConnection::new(cfg, server_name).context("构造 TLS 客户端会话失败")?;
-        let stream = connect_tcp_timeout(&plan.host, plan.port, timeout)?;
-        Ok(StreamOwned::new(conn, stream))
-    }
-}
-
-/// 读上游响应头并判断"这个响应能不能改写客户端"。
-///
-/// 返回值的三态就是答案：`Done` 已经写出去（不能再改主意）；
-/// `RetryableStatus` / `RetryableFailure` 保证**一个字节都没写给客户端**，
-/// 所以调用方可以安全地换候选。能不能换由调用方按自己的预算决定。
-fn relay_checked_impl<R: std::io::Read, W: std::io::Write>(
-    up: &mut R,
-    client: &mut W,
-    no_body: bool,
-    expect_partial: bool,
-) -> Result<Fwd> {
-    let head = match http::read_head(up) {
-        Ok(head) => head,
-        Err(err) => return Ok(Fwd::RetryableFailure(anyhow!("读取上游响应头失败: {err}"))),
-    };
-    let status = http::status_code(&head).unwrap_or(0);
-
-    // Range 请求如果被上游忽略并返回 200，不能把这个响应透给 winget：
-    // winget 会把小探测响应误认为完整安装包，随后报哈希不匹配。
-    if expect_partial && status == 200 {
-        return Ok(Fwd::RetryableStatus(200));
-    }
-
-    // 429/503 即使在最后一次尝试也要由调用方合成 502；
-    // 其它坏状态只有还有候选时才在写客户端前拦截。
-    if http::is_rate_limited(status) || is_retryable_status(status) {
-        return Ok(Fwd::RetryableStatus(status));
-    }
-
-    client.write_all(&head)?;
-    client.flush()?;
-    let size = http::forward_body(up, client, &head, no_body)?;
-    Ok(Fwd::Done(status, size))
-}
-/// 哪些上游状态值得换候选重试。
-fn is_initial_probe(req: &http::Head) -> bool {
-    req.header("range")
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("bytes=0-1"))
 }
 
 /// 取 pin 并在命中时**续期**；不满足条件时既不续期也不生效。
@@ -1225,44 +725,7 @@ fn is_retryable_status(status: u16) -> bool {
 ///
 /// 混在一起时两种情况的日志一模一样，排障的人会把"其实成功的下载"当成失败。
 fn io_error_kind(err: &anyhow::Error) -> &'static str {
-    match err.downcast_ref::<std::io::Error>().map(|io| io.kind()) {
-        Some(std::io::ErrorKind::WouldBlock) | Some(std::io::ErrorKind::TimedOut) => "timeout",
-        Some(std::io::ErrorKind::UnexpectedEof) => "early-eof",
-        _ => "other",
-    }
-}
-
-/// 请求体长度（仅当有合法的 `Content-Length`）。
-fn request_body_len(req: &http::Head) -> Option<u64> {
-    req.header("content-length")
-        .and_then(|value| value.trim().parse::<u64>().ok())
-}
-
-/// 请求是否带正文。
-///
-/// 本代理**只转发响应体，不转发请求体**（这也是 PAC 把 `git clone` 路径设为 DIRECT
-/// 的原因：clone 的 `git-upload-pack` 依赖 POST body）。
-/// 真有人在 MITM 路径上发带体的请求时，必须立刻拒绝：
-/// 否则上游收到 `Content-Length: 15` 却永远等不到那 15 字节，
-/// 客户端要卡满 60 秒读超时才失败，期间还占着一个连接名额。
-///
-/// `Content-Length: 0` 不算带体；`Transfer-Encoding` 一律算（分块体长度未知）。
-fn has_request_body(req: &http::Head) -> bool {
-    req.header("transfer-encoding").is_some() || request_body_len(req).is_some_and(|len| len > 0)
-}
-
-/// 在关闭连接前，把对端**还在发**的数据读掉一小段。
-///
-/// 为什么必须做：连接里还有未读数据就直接关闭，Windows 会发 RST 而不是 FIN，
-/// 客户端那边**连我们刚写好的响应都读不到**，只看到"连接被重置"。
-/// 这个坑出现过两次：501（请求体不支持）与 431（请求头过大）。
-/// 上限与超时都很保守——本代理从不为对端的多余数据无限等待。
-fn drain_briefly(stream: &mut TcpStream, max: u64, timeout: Duration) {
-    // 排空阶段用**短**超时：对端若不再发数据，最多等这么久。
-    // 不调的话会沿用常规 IO_TIMEOUT（60 s），反而把连接名额占住。
-    let _ = stream.set_read_timeout(Some(timeout));
-    let mut sink = std::io::sink();
-    let _ = std::io::copy(&mut stream.take(max), &mut sink);
+    http::error_kind(err)
 }
 
 /// 查谁占用了监听端口：`netstat -ano` 找 PID，`tasklist` 找进程名。
@@ -1334,46 +797,23 @@ fn process_name(pid: u32) -> Option<String> {
     }
 }
 
-fn connect_tcp(host: &str, port: u16) -> Result<TcpStream> {
-    connect_tcp_timeout(host, port, CONNECT_TIMEOUT)
-}
-
-fn connect_tcp_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
-    let addrs: Vec<SocketAddr> = (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("解析不了 {host}:{port}"))?
-        .collect();
-
-    let mut last: Option<anyhow::Error> = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, timeout) {
-            Ok(stream) => {
-                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-                let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-                let _ = stream.set_nodelay(true);
-                return Ok(stream);
-            }
-            Err(err) => last = Some(err.into()),
-        }
-    }
-    Err(last.unwrap_or_else(|| anyhow!("没有可用地址: {host}:{port}")))
-}
-
-/// 解析 `host:port`，支持 IPv6 方括号写法。
 fn split_host_port(target: &str) -> Result<(String, u16)> {
-    if let Some(rest) = target.strip_prefix('[') {
-        let (host, tail) = rest
-            .split_once(']')
-            .ok_or_else(|| anyhow!("IPv6 目标缺少 ]: {target}"))?;
-        let port = tail
-            .strip_prefix(':')
-            .ok_or_else(|| anyhow!("IPv6 目标缺少端口: {target}"))?;
-        return Ok((host.to_string(), port.parse()?));
+    let authority: hyper::http::uri::Authority =
+        target.parse().context("invalid CONNECT authority")?;
+    let port = authority
+        .port_u16()
+        .context("CONNECT requires an explicit port")?;
+    let host = authority.host().trim_matches(['[', ']']);
+    if host.is_empty() {
+        bail!("CONNECT requires a host");
     }
-    match target.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() => Ok((host.to_string(), port.parse()?)),
-        _ => bail!("缺少端口: {target}"),
-    }
+    Ok((host.to_ascii_lowercase(), port))
+}
+fn is_initial_probe(req: &Request<Incoming>) -> bool {
+    req.headers()
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("bytes=0-1"))
 }
 
 #[cfg(test)]
@@ -1394,36 +834,6 @@ mod tests {
         assert!(split_host_port("github.com").is_err());
         assert!(split_host_port(":443").is_err());
     }
-    /// 3xx 是**合法**响应，必须原样透传、不能当作候选故障。
-    ///
-    /// 实测背景：加速器可能返回 302 指向 `release-assets.githubusercontent.com`
-    /// （GitHub 资产最终就落在那里），客户端会自己跟随。而 `release-assets` 也在
-    /// `rewriteHosts` 里，所以下一跳仍会经过我们。
-    /// 这条用例钉住两件事：重定向**不被改写/吞掉**，也不进入"可重试"分支
-    /// （否则会白白换候选并给健康度扣分）。
-    #[test]
-    fn redirect_is_forwarded_and_not_treated_as_failure() {
-        use std::io::Cursor;
-        let mut up = Cursor::new(
-            b"HTTP/1.1 302 Found\r\nLocation: https://release-assets.githubusercontent.com/x\r\n\
-              Content-Length: 0\r\n\r\n"
-                .to_vec(),
-        );
-        let mut client = Vec::new();
-        let result = relay_checked_impl(&mut up, &mut client, false, false).unwrap();
-        // 不是 RetryableStatus —— 客户端要拿到这个 302
-        assert!(
-            matches!(result, Fwd::Done(302, _)),
-            "302 应原样透传，实际不是 Done(302)"
-        );
-        let text = String::from_utf8_lossy(&client);
-        assert!(text.starts_with("HTTP/1.1 302"), "{text}");
-        assert!(
-            text.contains("Location: https://release-assets.githubusercontent.com/x"),
-            "Location 头必须保留: {text}"
-        );
-    }
-
     /// 401/451 表示"**这个**候选不行"，必须换候选重试；而 `HttpStatus` 之外的
     /// 非 2xx（如 418）仍透传。
     ///
@@ -1438,93 +848,6 @@ mod tests {
         for status in [200u16, 204, 206, 302, 304, 418] {
             assert!(!is_retryable_status(status), "{status} 不该当作候选故障");
         }
-    }
-
-    #[test]
-    fn retryable_status_is_not_written_to_client() {
-        use std::io::Cursor;
-        let mut up = Cursor::new(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".to_vec());
-        let mut client = Vec::new();
-        let result = relay_checked_impl(&mut up, &mut client, false, false).unwrap();
-        assert!(matches!(result, Fwd::RetryableStatus(502)));
-        assert!(client.is_empty(), "重试前不得向客户端写任何字节");
-    }
-
-    #[test]
-    fn final_response_is_written_exactly_once() {
-        use std::io::Cursor;
-        let mut up = Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec());
-        let mut client = Vec::new();
-        let result = relay_checked_impl(&mut up, &mut client, false, false).unwrap();
-        assert!(matches!(result, Fwd::Done(200, 5)));
-        assert!(client.starts_with(b"HTTP/1.1 200 OK\r\n"));
-        assert!(client.ends_with(b"hello"));
-    }
-
-    #[test]
-    fn rate_limit_is_retryable_even_on_last_attempt() {
-        use std::io::Cursor;
-        let mut up =
-            Cursor::new(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n".to_vec());
-        let mut client = Vec::new();
-        let result = relay_checked_impl(&mut up, &mut client, false, false).unwrap();
-        assert!(matches!(result, Fwd::RetryableStatus(429)));
-        assert!(client.is_empty());
-    }
-    #[test]
-    fn retry_then_success_writes_only_second_response() {
-        use std::io::Cursor;
-        let mut bad =
-            Cursor::new(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".to_vec());
-        let mut good = Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".to_vec());
-        let mut client = Vec::new();
-
-        let first = relay_checked_impl(&mut bad, &mut client, false, false).unwrap();
-        assert!(matches!(first, Fwd::RetryableStatus(502)));
-        assert!(client.is_empty(), "第一次失败不能写客户端");
-
-        let second = relay_checked_impl(&mut good, &mut client, false, false).unwrap();
-        assert!(matches!(second, Fwd::Done(200, 5)));
-        let text = String::from_utf8(client).unwrap();
-        assert_eq!(text.matches("HTTP/1.1").count(), 1, "只能有一个最终响应");
-        assert!(text.ends_with("hello"));
-    }
-
-    #[test]
-    fn all_candidates_fail_write_single_502() {
-        use std::io::Cursor;
-        let mut bad =
-            Cursor::new(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".to_vec());
-        let mut client = Vec::new();
-
-        let first = relay_checked_impl(&mut bad, &mut client, false, false).unwrap();
-        assert!(matches!(first, Fwd::RetryableStatus(502)));
-        assert!(client.is_empty());
-
-        let mut bad2 =
-            Cursor::new(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n".to_vec());
-        let last = relay_checked_impl(&mut bad2, &mut client, false, false).unwrap();
-        assert!(matches!(last, Fwd::RetryableStatus(502)));
-        assert!(client.is_empty(), "最终坏状态由调用方统一合成 502");
-    }
-
-    #[test]
-    fn malformed_upstream_head_is_retryable_without_client_write() {
-        use std::io::Cursor;
-        let mut up = Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n".to_vec());
-        let mut client = Vec::new();
-        let result = relay_checked_impl(&mut up, &mut client, false, false).unwrap();
-        assert!(matches!(result, Fwd::RetryableFailure(_)));
-        assert!(client.is_empty());
-    }
-    #[test]
-    fn range_request_rejects_upstream_200() {
-        use std::io::Cursor;
-        let mut up = Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nab".to_vec());
-        let mut client = Vec::new();
-        let result = relay_checked_impl(&mut up, &mut client, false, true).unwrap();
-        assert!(matches!(result, Fwd::RetryableStatus(200)));
-        assert!(client.is_empty(), "200 不能作为 Range 响应透给客户端");
     }
 
     /// `RELAY-ERR` 的 `kind=` 必须能分开"上游不发数据了"与"正文真的不完整"。
@@ -1728,47 +1051,6 @@ mod tests {
 
         // 不存在 → None
         assert_eq!(take_pin(&mut pins, "missing", now, ttl, |_| true), None);
-    }
-
-    #[test]
-    fn final_403_is_returned_as_retryable_status_not_written() {
-        use std::io::Cursor;
-        let mut up = Cursor::new(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\nno".to_vec());
-        let mut client = Vec::new();
-        let result = relay_checked_impl(&mut up, &mut client, false, true).unwrap();
-        assert!(matches!(result, Fwd::RetryableStatus(403)));
-        assert!(client.is_empty(), "最终 403 也不能透传给客户端");
-    }
-
-    #[test]
-    fn initial_probe_is_detected() {
-        let head = http::parse_head(b"GET / HTTP/1.1\r\nRange: bytes=0-1\r\n\r\n").unwrap();
-        assert!(is_initial_probe(&head));
-        let full = http::parse_head(b"GET / HTTP/1.1\r\nRange: bytes=0-9\r\n\r\n").unwrap();
-        assert!(!is_initial_probe(&full));
-    }
-
-    /// 带请求体的请求必须被判出来（然后回 501），否则会卡到 60 秒读超时。
-    #[test]
-    fn request_body_detection() {
-        let with_len =
-            http::parse_head(b"POST /x HTTP/1.1\r\nHost: github.com\r\nContent-Length: 15\r\n\r\n")
-                .unwrap();
-        assert!(has_request_body(&with_len), "Content-Length > 0 应判为带体");
-
-        let zero = http::parse_head(b"POST /x HTTP/1.1\r\nContent-Length: 0\r\n\r\n").unwrap();
-        assert!(!has_request_body(&zero), "Content-Length: 0 不带体");
-
-        let chunked =
-            http::parse_head(b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
-        assert!(has_request_body(&chunked), "分块体长度未知，一律算带体");
-
-        let get = http::parse_head(b"GET /x HTTP/1.1\r\nHost: github.com\r\n\r\n").unwrap();
-        assert!(!has_request_body(&get), "普通 GET 不带体");
-
-        // 畸形的 Content-Length 不该 panic，也不该被当成带体
-        let bad = http::parse_head(b"POST /x HTTP/1.1\r\nContent-Length: nope\r\n\r\n").unwrap();
-        assert!(!has_request_body(&bad));
     }
 
     #[test]

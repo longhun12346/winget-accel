@@ -348,6 +348,7 @@ mod tests {
             ("main.rs", include_str!("main.rs")),
             ("pac.rs", include_str!("pac.rs")),
             ("proxy.rs", include_str!("proxy.rs")),
+            ("proxy/network.rs", include_str!("proxy/network.rs")),
             ("proxy/local.rs", include_str!("proxy/local.rs")),
             ("proxy/probe.rs", include_str!("proxy/probe.rs")),
             ("rewrite.rs", include_str!("rewrite.rs")),

@@ -10,9 +10,8 @@ license = "MIT"
 # 依赖策略见 ADR-012：**不设数量上限**，但每个直接依赖都必须说清"为什么不能用标准库
 # 或已有依赖"。本工具要求用户信任它改写下载流量，供应链面越大攻击收益越高，
 # 所以控制审计面靠的是逐条理由，不是数字——数量上限曾被随手改过一次，不承载真实约束。
-# 禁用清单：tokio / axum / hyper / actix-web（同步 + 线程已够，异步只扩大审计面）、
-#          native-tls / openssl（系统依赖、静态链接困难）、
-#          reqwest（默认特性拖入 tokio）、git2 / libgit2-sys（引入 C 工具链）。
+# HTTP 分帧、CONNECT 升级和异步网络交给 Hyper/Tokio，不再维护协议解析器。
+# 不叠加 axum/reqwest；不引入 native-tls/openssl 或 git2/libgit2-sys。
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,19 +28,29 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem",
 webpki-roots = "1"
 # Win32 API：证书存储、Unicode PAC 注册表读写，以及独立看门狗进程标志。
 # 用它替代原先调 powershell.exe 的做法（见 ADR-012 第 3 次修订）。
-windows-sys = { version = "0.60", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_System_Threading"] }
+# 与 Tokio/mio/socket2 共用 0.61，避免重复绑定和 windows-targets 依赖树。
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_System_Threading"] }
 
 # 解析证书的 NotAfter：windows-sys 没有导出 CERT_NOT_AFTER_FILETIME_PROP_ID，
 # 与其编一个常量，不如用成熟解析器。它已是 rcgen 的传递依赖（^0.18），不引入新 crate。
 x509-parser = "0.18"
 # 证书有效期计算：rcgen 已用 time 0.3，直接声明可统一版本、不新增 crate。
 time = "0.3"
-# HTTP/1.1 头部解析：hyper 内部用的就是它，零传递依赖。
-# 保留自己的逐字节读取策略（那个不能换，否则会吞掉 TLS ClientHello），
-# 只把"解析字节"这一步交给它。
-httparse = "1"
 # 加权随机的均匀采样。fastrand 零依赖、专为这种场景设计，比手写 xorshift 可靠。
 fastrand = "2"
+# 共享四线程运行时、异步 socket、计时与并发名额，不启用 full 或宏。
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "time", "io-util", "sync"] }
+# HTTP/1.1 客户端/服务端、消息定界和 CONNECT 缓冲移交；不启用 HTTP/2。
+hyper = { version = "1.12.0", features = ["client", "server", "http1"] }
+# Hyper 与 Tokio I/O、计时器的官方适配层。
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+# Empty/Full/流式正文适配与 Bytes 缓冲；不整体缓存安装包。
+http-body-util = "0.1.5"
+bytes = "1.12.1"
+# 复用现有 rustls 配置与 ring 后端，把 TLS 握手/流接入 Tokio。
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+# 复用成熟的读写空闲超时适配器，避免自行实现 AsyncRead/AsyncWrite 计时。
+tokio-io-timeout = "1.2.1"
 
 [profile.release]
 opt-level = "z"

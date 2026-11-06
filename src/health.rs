@@ -212,14 +212,18 @@ impl Tracker {
         let kbps = (bytes as f64 / 1024.0) / secs;
         let now = std::time::Instant::now();
         let mut states = self.states.lock().expect("健康状态锁中毒");
-        // 基准只取**最近**的样本：过期样本不参与，否则会永久抬高基准（见 BASELINE_WINDOW）
+        // 相对门槛比较“其它可用候选”。不能拿自己的启动瞬时速度淘汰自己，
+        // 也不能拿已不可用候选的旧峰值判死当前唯一可用的链路。
         let best = states
             .iter()
-            .filter(|s| {
-                s.last_sample
-                    .is_some_and(|at| now.duration_since(at) <= BASELINE_WINDOW)
+            .enumerate()
+            .filter(|(other, s)| {
+                *other != idx
+                    && s.health == Health::Healthy
+                    && s.last_sample
+                        .is_some_and(|at| now.duration_since(at) <= BASELINE_WINDOW)
             })
-            .map(|s| s.ema_kbps)
+            .map(|(_, s)| s.ema_kbps)
             .fold(0.0f64, f64::max);
         let Some(state) = states.get_mut(idx) else {
             return;
@@ -745,6 +749,21 @@ mod tests {
             t.is_healthy(1),
             "4 倍慢只该降低权重，不该判成不健康（相对门槛是 0.1，即 10 倍）"
         );
+    }
+
+    #[test]
+    fn relative_baseline_needs_another_usable_candidate() {
+        for other_health in [Health::Unknown, Health::Unhealthy] {
+            let t = tracker(3);
+            t.seed_speed(0, 100_000.0);
+            t.seed_speed(1, 100_000.0);
+            t.states.lock().unwrap()[0].health = other_health;
+            for _ in 0..SLOW_STRIKES {
+                t.record_success(1);
+                t.record_sample(1, 200 * 1024, 2.0);
+            }
+            assert!(t.is_healthy(1), "没有其它可用候选时，只按绝对下限判断");
+        }
     }
 
     /// 但真正"差一个数量级"仍然要被判死；绝对下限也要照常生效。

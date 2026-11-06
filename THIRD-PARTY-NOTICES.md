@@ -3,10 +3,7 @@
 `winget-accel.exe` 是静态链接的单文件二进制，其中包含下列第三方 Rust crate 的代码。
 本文件按许可证分组列出它们，并说明每类许可证的原文位置。
 
-> 上一版本文件只列了 rewinged / winget-pkgs / winget-cli-restsource ——
-> 后两项属于**已废弃的 REST 源架构**（ADR-013），而且漏掉了真正被打进二进制的
-> Rust 依赖（含 ISC / BSD-3-Clause / CDLA-Permissive-2.0）。2026-11-03 已按
-> `cargo metadata` 的实际依赖重写。
+已于 2026-11-06 按锁定依赖的 `cargo metadata` 核对，包含 Tokio / Hyper 网络栈。
 
 依赖清单可用以下命令复现（同一份 `Cargo.lock` 结果一致）：
 
@@ -21,21 +18,23 @@ cargo metadata --format-version 1 | ConvertFrom-Json |
 
 ## 1. 随二进制分发的 Rust crate
 
-按许可证表达式分组（名称去重；同一 crate 可能有多个版本，例如 `windows-sys 0.52/0.60`）：
+按许可证表达式分组（名称去重；同一 crate 的多个版本只列一次）：
 
 | 许可证 | crate |
 |---|---|
-| `MIT OR Apache-2.0` | anyhow, asn1-rs, base64, cc, cfg-if, der-parser, deranged, displaydoc, getrandom, httparse, itoa, lazy_static, libc, log, num-bigint, num-conv, num-integer, num-traits, oid-registry, once_cell, powerfmt, proc-macro2, quote, rcgen, rustls-pki-types, serde, serde_json, shlex, syn, thiserror, time, windows-sys, windows-targets, windows-link, x509-parser, yasna 等 |
-| `Apache-2.0 OR MIT` | autocfg, bit-vec, fastrand, zeroize |
-| `Apache-2.0 OR ISC OR MIT` | rustls, rustls-pemfile |
+| `(MIT OR Apache-2.0) AND Unicode-3.0` | unicode-ident |
 | `Apache-2.0 AND ISC` | ring |
-| `ISC` | rustls-webpki, untrusted |
+| `Apache-2.0 OR ISC OR MIT` | rustls, rustls-pemfile |
+| `Apache-2.0 OR MIT` | atomic-waker, autocfg, bit-vec, fastrand, pin-project-lite, zeroize |
+| `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | wasi |
 | `BSD-3-Clause` | subtle |
 | `CDLA-Permissive-2.0` | webpki-roots |
-| `MIT` | data-encoding, nom, pem, synstructure, zmij |
-| `MIT OR Apache-2.0 AND Unicode-3.0` | unicode-ident |
+| `ISC` | rustls-webpki, untrusted |
+| `MIT` | bytes, data-encoding, http-body, http-body-util, hyper, hyper-util, mio, nom, pem, synstructure, tokio, try-lock, want, zmij |
+| `MIT OR Apache-2.0` | anyhow, asn1-rs, asn1-rs-derive, asn1-rs-impl, base64, cc, cfg-if, der-parser, deranged, displaydoc, find-msvc-tools, futures-core, getrandom, http, httparse, httpdate, itoa, lazy_static, libc, log, minimal-lexical, num-bigint, num-conv, num-integer, num-traits, oid-registry, once_cell, powerfmt, proc-macro2, quote, rcgen, rusticata-macros, rustls-pki-types, serde, serde_core, serde_derive, serde_json, shlex, smallvec, socket2, syn, thiserror, thiserror-impl, time, time-core, time-macros, tokio-io-timeout, tokio-rustls, windows-link, windows-sys, windows-targets, windows_aarch64_gnullvm, windows_aarch64_msvc, windows_i686_gnu, windows_i686_gnullvm, windows_i686_msvc, windows_x86_64_gnu, windows_x86_64_gnullvm, windows_x86_64_msvc, x509-parser, yasna |
 | `Unlicense OR MIT` | memchr |
-| `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` | wasi |
+
+`tokio-io-timeout` 的元数据使用旧写法 `MIT/Apache-2.0`，上表归为等价的双许可证选择。
 
 关键直接依赖及其作用（便于审计"为什么它在里面"）：
 
@@ -46,9 +45,14 @@ cargo metadata --format-version 1 | ConvertFrom-Json |
 | `webpki-roots` | 1 | 校验加速器证书的根证书集合 |
 | `ring` | 0.17 | `rustls`/`rcgen` 的加密后端（`aws-lc-rs` 被刻意排除，见 ADR-012） |
 | `x509-parser` / `asn1-rs` / `der-parser` / `yasna` | — | 解析证书有效期、读取 Name Constraints（测试与诊断） |
-| `windows-sys` | 0.60 | Win32 证书存储 API、本地时间 |
+| `windows-sys` | 0.61 | Win32 证书存储 API、本地时间 |
 | `serde` / `serde_json` | 1 | 配置与 `/health` 输出 |
-| `httparse` | 1 | HTTP/1.1 头部解析 |
+| `tokio` | 1.54 | 共享异步运行时、socket、计时器和同步 |
+| `hyper` / `hyper-util` | 1.12 / 0.1 | HTTP/1.1 客户端/服务端、CONNECT 升级、Tokio I/O 适配 |
+| `http-body-util` / `bytes` | 0.1 / 1 | 流式正文适配与缓冲 |
+| `tokio-rustls` | 0.26 | 现有 rustls 配置的异步 TLS 接入 |
+| `tokio-io-timeout` | 1.2 | 读写空闲超时 |
+| `httparse` | 1 | Hyper 的传递依赖，项目不再直接调用 |
 | `anyhow` | 1 | 错误上下文 |
 | `fastrand` | 2 | 加权随机选候选 |
 | `time` | 0.3 | 证书有效期计算 |

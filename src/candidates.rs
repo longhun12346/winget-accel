@@ -4,10 +4,9 @@
 //! 在六秒预算内选择候选数最多的有效结果，再缓存供离线使用。
 //! 获取到的候选仍须通过运行期资产验证，不能直接进入下载调度。
 
-use std::io::Read;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 /// 编译期嵌入的清单（来自仓库根的 candidates.json）。
@@ -228,90 +227,13 @@ fn fetch_best() -> Result<(String, Vec<Candidate>, String)> {
     }
     anyhow::bail!("所有上游都失败: {}", errors.join(" | "))
 }
-/// 极简 HTTPS GET（只要 200 的纯文本）。
-///
-/// 不复用 proxy 的转发逻辑：那套是"改写 + 转发"，这里是"直连取一个小文件"，
-/// 混在一起会让两边都变复杂。这里只要 rustls + webpki-roots。
+/// Same Hyper transport and total deadline as probes; decoded payload is bounded.
 fn http_get(url: &str, timeout_secs: u64) -> Result<String> {
-    use std::io::Write;
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
-
-    let (scheme, rest) = url.split_once("://").context("URL 缺少 scheme")?;
-    let use_tls = match scheme {
-        "https" => true,
-        "http" => false, // 仅用于本地验证与自建镜像
-        other => anyhow::bail!("不支持的 scheme: {other}"),
-    };
-    let (authority, path) = match rest.split_once('/') {
-        Some((a, p)) => (a, format!("/{p}")),
-        None => (rest, "/".to_string()),
-    };
-    let host = authority.split(':').next().unwrap_or(authority);
-    let port: u16 = authority
-        .split_once(':')
-        .and_then(|(_, p)| p.parse().ok())
-        .unwrap_or(if use_tls { 443 } else { 80 });
-
-    let timeout = Duration::from_secs(timeout_secs);
-    let addrs: Vec<_> = (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("解析不了 {host}"))?
-        .collect();
-    let mut stream = None;
-    for addr in addrs {
-        if let Ok(s) = TcpStream::connect_timeout(&addr, timeout) {
-            stream = Some(s);
-            break;
-        }
-    }
-    let tcp = stream.with_context(|| format!("连不上 {host}:{port}"))?;
-    tcp.set_read_timeout(Some(timeout)).ok();
-    tcp.set_write_timeout(Some(timeout)).ok();
-
-    if !use_tls {
-        let mut tcp = tcp;
-        let req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: winget-accel/{}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-            env!("CARGO_PKG_VERSION")
-        );
-        tcp.write_all(req.as_bytes()).context("发送请求失败")?;
-        return read_http_body(&mut tcp);
-    }
-
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let cfg = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let name: rustls::pki_types::ServerName<'static> = host
-        .to_string()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("非法主机名: {host}"))?;
-    let conn = rustls::ClientConnection::new(std::sync::Arc::new(cfg), name)
-        .context("建立 TLS 连接失败")?;
-    let mut tls = rustls::StreamOwned::new(conn, tcp);
-
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: winget-accel/{}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-        env!("CARGO_PKG_VERSION")
-    );
-    tls.write_all(req.as_bytes()).context("发送请求失败")?;
-    tls.flush().ok();
-
-    read_http_body(&mut tls)
-}
-
-/// 按 HTTP 消息边界读取候选清单，分帧与大小限制复用共用读取逻辑。
-fn read_http_body<R: Read>(stream: &mut R) -> Result<String> {
-    let head = crate::http::read_head(stream).context("读取候选清单响应头失败")?;
-    let status = crate::http::status_code(&head).context("候选清单响应头非法")?;
-    if status != 200 {
-        bail!("HTTP {status}");
-    }
-    let body =
-        crate::http::read_body(stream, &head, 1024 * 1024).context("读取候选清单正文失败")?;
-    String::from_utf8(body).context("响应不是 UTF-8")
+    crate::http::get_text(
+        url,
+        std::time::Duration::from_secs(timeout_secs),
+        1024 * 1024,
+    )
 }
 
 fn parse(text: &str) -> Result<Vec<Candidate>> {
@@ -365,6 +287,22 @@ fn parse(text: &str) -> Result<Vec<Candidate>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn read_http_body<R: std::io::Read>(reader: &mut R) -> Result<String> {
+        use std::io::{Read, Write};
+        let mut raw = Vec::new();
+        reader.read_to_end(&mut raw)?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(&raw);
+        });
+        let result = http_get(&format!("http://{address}/"), 2);
+        server.join().unwrap();
+        result
+    }
 
     #[test]
     fn embedded_list_parses_and_has_entries() {
@@ -495,13 +433,23 @@ mod tests {
 
     #[test]
     fn response_handles_chunked() {
+        use std::io::{Read, Write};
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: \tChUnKeD\r\n\r\n5\r\nhello\r\n3\r\nabc\r\n0\r\nX-Tag: test\r\n\r\n";
-        let mut input = raw.to_vec();
-        input.extend_from_slice(b"next-response");
-        let mut up = std::io::Cursor::new(input);
-        let body = read_http_body(&mut up).unwrap();
-        assert_eq!(body, "helloabc");
-        assert_eq!(up.position(), raw.len() as u64, "不能在终止块后继续等 EOF");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (finished, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 4096];
+            let _ = stream.read(&mut buf);
+            stream.write_all(raw).unwrap();
+            // Keep the connection open until the client has consumed the message.
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(3));
+        });
+        let result = http_get(&format!("http://{address}/"), 1);
+        let _ = finished.send(());
+        server.join().unwrap();
+        assert_eq!(result.unwrap(), "helloabc");
     }
 
     #[test]

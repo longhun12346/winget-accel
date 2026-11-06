@@ -36,6 +36,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($Requests -lt 1) { throw '-Requests 必须 >= 1' }
 
 trap {
     Write-Host "::error::压测脚本异常终止：$($_.Exception.Message)"
@@ -113,15 +114,23 @@ while ($true) {
 
     $proxyProc = Start-Process $exe -ArgumentList '--config', $cfgPath, '--no-env' -PassThru -WindowStyle Hidden
 
-    # 等 CA 生成 + 监听就绪（最多 15 秒）
+    # 等 CA 和本地 HTTP 端点均就绪，不能把“证书已生成”当成启动完成。
     $caPath = Join-Path $certDir 'ca-cert.pem'
-    $deadline = (Get-Date).AddSeconds(15)
+    $deadline = (Get-Date).AddSeconds(40)
+    $ready = $false
     while ((Get-Date) -lt $deadline) {
-        if ((Test-Path $caPath) -and -not $proxyProc.HasExited) { break }
+        if ($proxyProc.HasExited) { break }
+        if (Test-Path -LiteralPath $caPath) {
+            try {
+                $health = (Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -NoProxy -TimeoutSec 1).Content | ConvertFrom-Json
+                if ($health.status -eq 'ok') { $ready = $true; break }
+            }
+            catch { }
+        }
         Start-Sleep -Milliseconds 200
     }
     if ($proxyProc.HasExited) { throw "代理启动失败（退出码 $($proxyProc.ExitCode)）" }
-    if (-not (Test-Path $caPath)) { throw "15 秒内没有生成 CA：$caPath" }
+    if (-not $ready) { throw "40 秒内代理未就绪：$(Get-Content -LiteralPath $logPath -Raw -ErrorAction SilentlyContinue)" }
 
     Write-Host "代理: 127.0.0.1:$Port   模拟加速器: 127.0.0.1:$upstreamPort   请求数: $Requests"
 
@@ -156,10 +165,16 @@ while ($true) {
     $perBatch = [Math]::Max(1, [int]($Requests / 4))
     $batch = 0
     for ($i = 1; $i -le $Requests; $i++) {
-        $code = & curl.exe -sS --max-time 30 -x "http://127.0.0.1:$Port" --ssl-no-revoke `
-            --cacert $caPath -r 0-65535 -o NUL -w '%{http_code}' `
-            "https://github.com/o/r/f$i.bin" 2>&1
-        if ($code -eq '206' -or $code -eq '200') { $ok++ } else { $bad++ }
+        $code = & curl.exe -sS --max-time 30 --noproxy 'localhost,127.0.0.1' `
+            -x "http://127.0.0.1:$Port" --ssl-no-revoke `
+            --cacert $caPath -r 0-65535 -o NUL -w '%{http_code}:%{size_download}' `
+            "https://github.com/o/r/releases/download/v1/f$i.bin" 2>&1
+        $curlExit = $LASTEXITCODE
+        if ($curlExit -eq 0 -and "$code" -eq '206:65536') { $ok++ }
+        else {
+            $bad++
+            if ($bad -eq 1) { Write-Host "首个失败：curl exit=$curlExit response=$code" }
+        }
 
         if ($i % $perBatch -eq 0) {
             $batch++
@@ -171,7 +186,7 @@ while ($true) {
     }
 
     # ---- 结论 ----
-    $health = (Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 5).Content | ConvertFrom-Json
+    $health = (Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -NoProxy -TimeoutSec 5).Content | ConvertFrom-Json
     $final = Get-Process -Id $proxyProc.Id
     $failures = @()
 
@@ -199,6 +214,9 @@ while ($true) {
 
     if ($failures.Count -gt 0) {
         foreach ($f in $failures) { Write-Host "::error::$f" }
+        Select-String -LiteralPath $logPath -Pattern 'ALL-ACCEL-DOWN|ACCEL-COOLDOWN|RELAY-ERR|UPSTREAM-FAIL' |
+            ForEach-Object { Write-Host $_.Line }
+        Get-Content -LiteralPath $logPath -Tail 12 -ErrorAction SilentlyContinue | Write-Host
         exit 1
     }
     Write-Host '通过：无失败请求、计数精确、线程与内存平稳' -ForegroundColor Green
@@ -209,5 +227,9 @@ finally {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
         }
     }
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    $resolvedTemp = [System.IO.Path]::GetFullPath($tmp)
+    if ((Split-Path -Parent $resolvedTemp) -eq [System.IO.Path]::GetTempPath().TrimEnd('\', '/') -and
+        (Split-Path -Leaf $resolvedTemp).StartsWith('wg-soak-')) {
+        Remove-Item -LiteralPath $resolvedTemp -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }

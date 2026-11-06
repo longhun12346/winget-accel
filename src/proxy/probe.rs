@@ -1,19 +1,13 @@
 //! 候选可达性、资产测速与后台健康探测。
 
-use std::io::{self, Read, Write};
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use rustls::{ClientConnection, StreamOwned};
-
-use crate::ca::upstream_client_config;
 use crate::http;
 use crate::log::Level;
 use crate::rewrite;
 
-use super::{connect_tcp_timeout, Proxy};
+use super::Proxy;
 
 /// 启动阶段验证候选的总预算。超过就先去监听，剩余候选交给后台探测。
 const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(30);
@@ -52,50 +46,6 @@ fn should_stop_probing(stop_when_healthy: bool, healthy: usize) -> bool {
 /// 从 15 秒降到 5 秒：候选池有 43 个后，15 秒意味着个别挂住的域名
 /// 能拖垮整轮探测。5 秒足够拿到 64 KiB（实测最快 30 ms、最慢约 3 秒）。
 const PROBE_SPEED_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 把剩余预算应用到每次底层 socket I/O；TLS 握手也通过这层读写。
-struct ProbeSocket {
-    stream: TcpStream,
-    deadline: Instant,
-}
-
-impl ProbeSocket {
-    fn connect(accel: &rewrite::Accel, timeout: Duration) -> Option<Self> {
-        let deadline = Instant::now().checked_add(timeout)?;
-        let stream = connect_tcp_timeout(&accel.host, accel.port, timeout).ok()?;
-        Some(Self { stream, deadline })
-    }
-
-    fn remaining(&self) -> io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "探测 I/O 总时间预算耗尽"))
-    }
-}
-
-impl Read for ProbeSocket {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        let count = self.stream.read(buf)?;
-        self.remaining()?;
-        Ok(count)
-    }
-}
-
-impl Write for ProbeSocket {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        let count = self.stream.write(buf)?;
-        self.remaining()?;
-        Ok(count)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.remaining()?;
-        self.stream.flush()
-    }
-}
 
 impl Proxy {
     /// 周期探测所有候选。**单候选也探**——否则一旦被判死就永久 502，没有任何恢复路径。
@@ -293,118 +243,96 @@ const PROBE_BYTES: u64 = 64 * 1024;
 ///
 /// `pub(crate)`：`config` 加载 `health.probeUrl` 时用它做校验，避免两处各写一套。
 pub(crate) fn split_asset(asset: &str) -> Option<(String, String)> {
-    let rest = asset.strip_prefix("https://")?;
-    let (host, path) = rest.split_once('/')?;
-    if host.is_empty() || path.is_empty() {
+    let uri: hyper::Uri = asset.parse().ok()?;
+    if uri.scheme_str()? != "https" {
         return None;
     }
-    Some((host.to_string(), format!("/{path}")))
+    let authority = uri.authority()?;
+    let path = uri.path_and_query()?;
+    if path.path() == "/" {
+        return None;
+    }
+    Some((authority.as_str().to_string(), path.to_string()))
 }
 
-/// 测速请求的请求行/头（明文与 TLS 两条路径共用）。
-fn probe_request(accel: &rewrite::Accel, asset: &str) -> Option<String> {
+pub(crate) fn probe_speed(accel: &rewrite::Accel, duration: Duration, asset: &str) -> Option<f64> {
     let (host, path) = split_asset(asset)?;
-    Some(format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nRange: bytes=0-{}\r\nUser-Agent: winget-accel-probe\r\nConnection: close\r\n\r\n",
-        rewrite::rewrite_path(accel, &host, &path),
-        rewrite::host_header(accel.scheme, &accel.host, accel.port),
-        PROBE_BYTES - 1
-    ))
-}
-
-/// 通过加速器取一段固定资产，量出吞吐（KB/s）。
-///
-/// 返回 None 表示拿不到（非 206、正文不足或超过采样上限）。
-///
-/// `ProbeSocket` 按剩余预算控制每次 I/O，持续有少量数据也不会续长测速。
-///
-/// `pub(crate)`：`--doctor` 用它单独验证"测速资产还取得到吗"——
-/// 那个资产是整条链路唯一的版本绑定依赖，失效时表现是"chain 全 OK 但所有下载 502"。
-pub(crate) fn probe_speed(accel: &rewrite::Accel, timeout: Duration, asset: &str) -> Option<f64> {
-    let started = std::time::Instant::now();
-    let request = probe_request(accel, asset)?;
-
-    match accel.scheme {
-        rewrite::Scheme::Http => {
-            let mut upstream = ProbeSocket::connect(accel, timeout)?;
-            upstream.write_all(request.as_bytes()).ok()?;
-            upstream.flush().ok()?;
-            read_probe_response(&mut upstream, started)
-        }
-        rewrite::Scheme::Https => {
-            let cfg = upstream_client_config();
-            let name: Result<rustls::pki_types::ServerName<'static>, _> =
-                accel.host.clone().try_into();
-            let Ok(name) = name else { return None };
-            let Ok(conn) = ClientConnection::new(cfg, name) else {
+    http::block_on(async {
+        tokio::time::timeout(duration, async {
+            let started = Instant::now();
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert(
+                "host",
+                rewrite::host_header(accel.scheme, &accel.host, accel.port)
+                    .parse()
+                    .ok()?,
+            );
+            headers.insert("user-agent", "winget-accel-probe".parse().ok()?);
+            headers.insert(
+                "range",
+                format!("bytes=0-{}", PROBE_BYTES - 1).parse().ok()?,
+            );
+            let request =
+                http::request("GET", &rewrite::rewrite_path(accel, &host, &path), headers).ok()?;
+            let response = http::send(accel.scheme, &accel.host, accel.port, request, duration)
+                .await
+                .ok()?;
+            if response.status() != 206 {
                 return None;
-            };
-            let stream = ProbeSocket::connect(accel, timeout)?;
-            let mut tls = StreamOwned::new(conn, stream);
-            tls.write_all(request.as_bytes()).ok()?;
-            tls.flush().ok()?;
-            read_probe_response(&mut tls, started)
-        }
-    }
-}
-
-fn read_probe_response<R: Read>(up: &mut R, started: std::time::Instant) -> Option<f64> {
-    let head = http::read_head(up).ok()?;
-    if http::status_code(&head) != Some(206) {
-        return None;
-    }
-    let copied = http::measure_body(up, &head, PROBE_BYTES).ok()?;
-    let secs = started.elapsed().as_secs_f64();
-    if copied < PROBE_BYTES / 2 || secs <= 0.0 {
-        return None;
-    }
-    Some((copied as f64 / 1024.0) / secs)
-}
-/// 探测加速器是否可达：打它自己的根路径，收到任意 HTTP 响应就算通。
-pub fn probe(accel: &rewrite::Accel, timeout: Duration) -> bool {
-    let Some(stream) = ProbeSocket::connect(accel, timeout) else {
-        return false;
-    };
-    let request = format!(
-        "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: winget-accel-health\r\nConnection: close\r\n\r\n",
-        rewrite::host_header(accel.scheme, &accel.host, accel.port)
-    );
-
-    match accel.scheme {
-        rewrite::Scheme::Http => {
-            let mut stream = stream;
-            if stream.write_all(request.as_bytes()).is_err() {
-                return false;
             }
-            read_any(&mut stream)
-        }
-        rewrite::Scheme::Https => {
-            let cfg = upstream_client_config();
-            let name: Result<rustls::pki_types::ServerName<'static>, _> =
-                accel.host.clone().try_into();
-            let Ok(name) = name else {
-                return false;
-            };
-            let Ok(conn) = ClientConnection::new(cfg, name) else {
-                return false;
-            };
-            let mut tls = StreamOwned::new(conn, stream);
-            if tls.write_all(request.as_bytes()).is_err() || tls.flush().is_err() {
-                return false;
+            let body = http::read_body(response, PROBE_BYTES as usize).await.ok()?;
+            if body.len() < PROBE_BYTES as usize / 2 {
+                return None;
             }
-            read_any(&mut tls)
-        }
-    }
+            Some((body.len() as f64 / 1024.0) / started.elapsed().as_secs_f64().max(f64::EPSILON))
+        })
+        .await
+        .ok()
+        .flatten()
+    })
 }
 
-fn read_any<R: Read>(src: &mut R) -> bool {
-    let mut buf = [0u8; 64];
-    matches!(src.read(&mut buf), Ok(n) if n > 0)
+/// Root reachability alone never qualifies a candidate for download scheduling.
+pub fn probe(accel: &rewrite::Accel, duration: Duration) -> bool {
+    http::block_on(async {
+        let result = async {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert(
+                "host",
+                rewrite::host_header(accel.scheme, &accel.host, accel.port).parse()?,
+            );
+            headers.insert("user-agent", "winget-accel-health".parse()?);
+            let request = http::request("GET", "/", headers)?;
+            http::send(accel.scheme, &accel.host, accel.port, request, duration).await
+        }
+        .await;
+        result.is_ok()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+
+    fn sample(response: Vec<u8>) -> Option<f64> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(&response);
+        });
+        let result = probe_speed(
+            &http_accel(port),
+            Duration::from_secs(2),
+            "https://example.com/x.bin",
+        );
+        server.join().unwrap();
+        result
+    }
 
     fn http_accel(port: u16) -> rewrite::Accel {
         rewrite::Accel {
@@ -505,64 +433,41 @@ mod tests {
     }
 
     #[test]
-    fn probe_rejects_oversized_body_before_reading_it() {
-        use std::io::Cursor;
-        for framing in [
-            format!("Content-Length: {}", PROBE_BYTES + 1),
-            "Transfer-Encoding: chunked".to_string(),
-        ] {
-            let mut response = format!("HTTP/1.1 206 Partial Content\r\n{framing}\r\n\r\n");
-            if framing.starts_with("Transfer-Encoding") {
-                response.push_str("10001\r\n");
-            }
-            let body_start = response.len() as u64;
-            response.push_str(&"x".repeat(PROBE_BYTES as usize + 1));
-            let mut up = Cursor::new(response);
-            assert!(read_probe_response(&mut up, std::time::Instant::now()).is_none());
-            assert_eq!(up.position(), body_start, "不能读取超出采样上限的正文");
+    fn probe_rejects_oversized_payload() {
+        for head in ["Content-Length: 65537", "Transfer-Encoding: chunked", ""] {
+            let body = "x".repeat(PROBE_BYTES as usize + 1);
+            let response = if head.starts_with("Transfer") {
+                format!(
+                    "HTTP/1.1 206 Partial Content\r\n{head}\r\n\r\n10001\r\n{body}\r\n0\r\n\r\n"
+                )
+            } else if head.is_empty() {
+                format!("HTTP/1.1 206 Partial Content\r\n\r\n{body}")
+            } else {
+                format!("HTTP/1.1 206 Partial Content\r\n{head}\r\n\r\n{body}")
+            };
+            assert!(sample(response.into_bytes()).is_none());
         }
     }
 
     #[test]
     fn probe_accepts_full_samples_with_each_body_framing() {
-        use std::io::Cursor;
         for framing in ["Content-Length: 65536", "Transfer-Encoding: chunked", ""] {
-            let mut response = "HTTP/1.1 206 Partial Content\r\n".to_string();
-            if !framing.is_empty() {
-                response.push_str(framing);
-                response.push_str("\r\n");
-            }
-            response.push_str("\r\n");
-            if framing.starts_with("Transfer-Encoding") {
-                response.push_str("10000;ext=sample\r\n");
-            }
-            response.push_str(&"x".repeat(PROBE_BYTES as usize));
-            if framing.starts_with("Transfer-Encoding") {
-                response.push_str("\r\n0\r\nX-Tag: sample\r\n\r\n");
-            }
-            let mut up = Cursor::new(response);
-            assert!(
-                read_probe_response(&mut up, std::time::Instant::now()).is_some(),
-                "应支持完整样本的 {framing}"
-            );
+            let body = "x".repeat(PROBE_BYTES as usize);
+            let response = if framing.starts_with("Transfer") {
+                format!("HTTP/1.1 206 Partial Content\r\n{framing}\r\n\r\n10000;ext=sample\r\n{body}\r\n0\r\nX-Tag: sample\r\n\r\n")
+            } else if framing.is_empty() {
+                format!("HTTP/1.1 206 Partial Content\r\n\r\n{body}")
+            } else {
+                format!("HTTP/1.1 206 Partial Content\r\n{framing}\r\n\r\n{body}")
+            };
+            assert!(sample(response.into_bytes()).is_some(), "{framing}");
         }
-        let mut too_long = Cursor::new(format!(
-            "HTTP/1.1 206 Partial Content\r\n\r\n{}",
-            "x".repeat(PROBE_BYTES as usize + 1)
-        ));
-        assert!(read_probe_response(&mut too_long, std::time::Instant::now()).is_none());
     }
 
     #[test]
     fn probe_does_not_count_chunk_metadata_as_downloaded_data() {
-        use std::io::Cursor;
-        let response = format!(
-            "HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\n\r\n\
-             1;{}\r\nx\r\n0\r\nX-Tag: sample\r\n\r\n",
-            "p".repeat(PROBE_BYTES as usize / 2 - 16)
-        );
-        let mut up = Cursor::new(response);
-        assert!(read_probe_response(&mut up, std::time::Instant::now()).is_none());
+        let response = format!("HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\n\r\n1;{}\r\nx\r\n0\r\nX-Tag: sample\r\n\r\n", "p".repeat(PROBE_BYTES as usize / 2 - 16));
+        assert!(sample(response.into_bytes()).is_none());
     }
 
     #[test]

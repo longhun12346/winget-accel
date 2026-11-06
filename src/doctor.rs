@@ -472,27 +472,15 @@ fn check_pac(app: &App) -> Check {
 
 /// 从本机代理取它正在提供的 PAC 文本；没有实例在监听时返回 `None`。
 ///
-/// 用裸 TCP 而不是引入 HTTP 客户端：目标就是自己，请求固定，响应也就几百字节。
+/// 复用 Hyper 客户端，按消息边界读取，并限制总期限和正文大小。
 fn fetch_pac_text(port: u16) -> Option<String> {
-    use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
-
-    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
-    let mut stream = TcpStream::connect_timeout(&addr.into(), Duration::from_millis(500)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
-    stream
-        .write_all(
-            b"GET /winget-accel.pac HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-        )
-        .ok()?;
-
-    let mut raw = Vec::new();
-    let _ = stream.read_to_end(&mut raw);
-    let text = String::from_utf8_lossy(&raw);
-    let body = text.split_once("\r\n\r\n")?.1;
-    Some(body.to_string())
+    crate::http::get_text(
+        &format!("http://127.0.0.1:{port}/winget-accel.pac"),
+        Duration::from_secs(2),
+        1024 * 1024,
+    )
+    .ok()
 }
-
 /// 纯逻辑部分（便于单测）：运行中实例提供的 PAC 是否与当前配置一致。
 fn pac_live_verdict(expected: &str, served: Option<&str>) -> (Verdict, String) {
     match served {
