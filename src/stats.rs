@@ -1,7 +1,6 @@
 //! 运行期计数器与 `/health` 输出。
 //!
-//! 键名与 Python 原型保持一致，这样 `prototype/tests/` 的 LCL-02 用例
-//! 可以直接复用（同一套断言，换二进制）。
+//! 键名是协议的一部分，Rust 协议集成测试直接比较 `/health` 返回的 JSON。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

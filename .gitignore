@@ -27,17 +27,5 @@ config.local.json
 .idea/
 *.swp
 
-# Python 原型（docs/prototype）
-/prototype/.venv/
-/prototype/certs/
-/prototype/state.json
-__pycache__/
-/prototype/.pytest_cache/
-/prototype/*.stdout.txt
-/prototype/*.stderr.txt
-/prototype/*.out
-/prototype/*.err
-/prototype/wg-*.txt
-
 # DSH 工具自己的暂存目录
 /.dsh/

@@ -32,8 +32,8 @@ Windows API 和随机选择各自使用专门依赖，理由写在 `Cargo.toml`�
 
 ## ADR-015：交付形态
 
-交付物是 x64 Windows 单文件 Rust 二进制，启用静态 CRT 和 MSVC `/Brepro`。Python
-原型只用于协议验证，不进入发布包，也不作为用户运行时依赖。发布 zip 必须包含 exe、
+交付物是 x64 Windows 单文件 Rust 二进制，启用静态 CRT 和 MSVC `/Brepro`。协议夹具和
+集成测试也使用 Rust，不进入发布包，也不引入额外脚本运行时依赖。发布 zip 必须包含 exe、
 QUICKSTART、许可证文件、第三方声明和 `SHA256.txt`，并通过解压后的独立运行检查。
 
 ## ADR-016：候选全挂时快速失败

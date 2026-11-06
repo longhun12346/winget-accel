@@ -31,10 +31,10 @@ jobs:
       #   3. 日志标签：文档提到 → src 里必须有
       #   4. ADR 引用：不许悬空、不许编号复用
       #   5. 源码卫生：`#[test]` 不能被注释挤开（我犯过 5 次以上的错）
-      #   6. 行尾统一 + 乱码扫描：遍历全部 57 个受版本控制的文本文件
+      #   6. 行尾统一 + 乱码扫描：遍历全部受版本控制的文本文件
       #
       # 第 6 组取代了原来那条只查「src\*.rs + docs\*.md + README.md」（19 个文件）的乱码检查——
-      # 它漏掉了 CHANGELOG.md（本仓库中文最多的地方）、packaging\*.ps1、prototype\**，
+      # 它漏掉了 CHANGELOG.md（本仓库中文最多的地方）和 packaging\*.ps1，
       # 恰恰是改动最频繁的地方。历史事故：一次编码往返把中文日志替换成 '?'（0x3F）并随 v0.1.6 发布。
       - name: 文档与代码一致性（含行尾与乱码）
         shell: pwsh
@@ -43,11 +43,14 @@ jobs:
       - name: clippy（警告即失败）
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: 单元测试
-        run: cargo test --all-targets
+      - name: Rust 单元测试
+        run: cargo test --bin winget-accel --offline
 
       - name: 构建 release
-        run: cargo build --release
+        run: cargo build --release --offline
+
+      - name: Rust 协议集成测试（无网、不改系统状态）
+        run: cargo test --test protocol --offline -- --test-threads=1
 
       # README 承诺"同一源码两次构建逐字节相同"，但此前 CI **从不验证**这条：
       # 万一 rustc/MSVC 或 /Brepro 失效，只有用户自己去比 SHA256 才会发现。
@@ -110,30 +113,3 @@ jobs:
           "SHA256: " + (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
           & $exe --version
           & $exe --help | Select-Object -First 2
-
-  protocol:
-    name: 协议用例（Python 驱动二进制）
-    runs-on: windows-latest
-    needs: rust
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust (msvc)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Build release
-        run: cargo build --release
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: 安装 pytest 与 cryptography
-        run: python -m pip install --disable-pip-version-check pytest cryptography
-
-      - name: 协议用例（无网、不改系统状态）
-        working-directory: prototype
-        run: python -m pytest tests --target-binary "${{ github.workspace }}\target\release\winget-accel.exe" -q

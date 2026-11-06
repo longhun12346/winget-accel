@@ -16,7 +16,7 @@ const COPY_BUF: usize = 32 * 1024;
 ///
 /// **必须逐字节**：CONNECT 的响应发出后，客户端会立刻开始 TLS 握手，
 /// 一次性多读一个缓冲区就会把 ClientHello 吞掉，握手永远等不到数据。
-/// Python 原型踩过这个坑，这里用类型和用例把它钉住。
+/// 这里用类型和用例把这个边界钉住。
 pub fn read_head<R: Read>(stream: &mut R) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(512);
     let mut byte = [0u8; 1];

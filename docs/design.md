@@ -192,16 +192,18 @@ Delivery Optimization 不读取当前用户 PAC；如果保持默认下载器，
 
 ## 11. 测试和发布
 
-Rust 单测覆盖解析、证书约束、PAC、健康状态、重试和恢复逻辑。Python 协议用例启动真实
-Rust 二进制并使用本地假上游，覆盖 TLS、改写、Range、响应定界、并发、PAC 语义和多进程
-看门狗。真实网络用例需要显式开启，因为公共服务的存活会变化。
+Rust 单测覆盖解析、证书约束、PAC、健康状态、重试和恢复逻辑；Rust 协议集成测试启动
+真实二进制并使用本地假上游，覆盖改写、Range、响应定界、并发、PAC 端点和连接边界。
+客户端调用 Windows 自带的 `curl.exe` 验证 Schannel 与 CONNECT 行为。真实公共服务不作为
+离线回归的固定依赖，因为服务的存活和限流会变化。
 
 发布前执行：
 
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo test --bin winget-accel --offline
+cargo test --test protocol --offline -- --test-threads=1
 .\packaging\check-docs-sync.ps1
 .\packaging\verify.ps1
 .\packaging\make-release.ps1

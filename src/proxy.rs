@@ -408,7 +408,7 @@ impl Proxy {
                     );
                     let _ = stream.flush();
                     // 写完要先**排空对端还在发的数据**再关，否则内核会发 RST，
-                    // 客户端那边连 431 都读不到（实测：python 侧直接 ConnectionResetError，
+                    // 某些客户端连 431 都读不到（实测：直接 ConnectionResetError，
                     // 而用 curl 手工写同样的字节却能看到 431——差别就在收尾方式）。
                     drain_briefly(&mut stream, MAX_DRAIN, Duration::from_millis(300));
                 }

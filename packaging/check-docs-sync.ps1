@@ -35,7 +35,7 @@ try {
     $failures = [System.Collections.Generic.List[string]]::new()
 
     # ---------------------------------------------------------------- 1) CLI 参数
-    # 只收集本程序自己的参数（--config/--doctor…），排除 cargo/curl/pytest 的参数。
+    # 只收集本程序自己的参数（--config/--doctor…），排除 cargo/curl 的参数。
     #
     # 必须**去掉 `#[cfg(test)]` 之后的部分**：那里有一份"已删除参数"的列表
     # （`rejects_removed_flags` 挨个断言它们被拒绝），如果把它们也算成"代码支持"，
@@ -57,7 +57,7 @@ try {
     # 代码里有而文档没有是允许的——`--watchdog` 就是程序自己拉起子进程用的内部参数，
     # 不该出现在用户文档里。所以别为了"齐全"去补它。
     $external = @(
-        '--all', '--check', '--all-targets', '--release', '--target-binary', '--network', '--tb', '--nocapture',
+        '--all', '--check', '--all-targets', '--release', '--bin', '--offline', '--test', '--test-threads', '--tb', '--nocapture',
         '--ssl-no-revoke', '--max-time', '--output', '--no-run', '--collect-only', '--id',
         '--download-directory', '--version-check', '--help-docs',
         # curl 与 winget 自己的参数（design.md §12 的对比实验里会写到）
@@ -206,7 +206,7 @@ try {
         $binaryExt -notcontains $ext
     }
     # 顺手做乱码扫描：CI 里原来只查 src\*.rs + docs\*.md + README.md（19 个文件），
-    # 而 CHANGELOG.md（本仓库中文最多的地方）、packaging\*.ps1、prototype\** 都没查——
+    # 而 CHANGELOG.md（本仓库中文最多的地方）和 packaging\*.ps1 都没查——
     # 恰恰是我改得最多的地方。既然这里已经遍历了全部文本文件，就一起查掉。
     $mojibake = @()
     foreach ($file in $tracked) {

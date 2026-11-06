@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    本地一键复跑：格式 / clippy / 单元测试 / 文档一致性 / 协议用例 / 可复现构建。
+    本地一键复跑：格式 / clippy / Rust 测试 / 文档一致性 / 可复现构建。
 
 .DESCRIPTION
     为什么需要它：这些检查我每轮都手敲一遍，敲漏一项就可能放过问题
@@ -9,7 +9,7 @@
     把它们固化成一条命令，顺序与 CI 一致，任何一项失败就停。
 
     有意**不**包含的（避免给人"跑过了就万事大吉"的错觉）：
-    - 真实网络用例（`pytest --network`）：依赖第三方加速器存活，适合单独跑
+    - 真实公共加速服务：依赖第三方服务存活，适合手动排障
     - 真实 `winget` 端到端：需要真的装 CA、改系统 PAC
     - 长跑压测：用 `-Soak` 显式开启（默认不跑，几十秒起）
 
@@ -90,8 +90,8 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'clippy 有警告' }
     }
 
-    Invoke-Step 'cargo test' {
-        $out = cargo test --offline 2>&1
+    Invoke-Step 'Rust 单元测试' {
+        $out = cargo test --bin winget-accel --offline 2>&1
         $out | Select-String -Pattern 'test result' | ForEach-Object { Write-Host $_.Line }
         if ($LASTEXITCODE -ne 0) { throw '单元测试失败' }
     }
@@ -117,13 +117,9 @@ try {
         }
     }
 
-    Invoke-Step '协议用例（离线）' {
-        Push-Location prototype
-        try {
-            & .\.venv\Scripts\python.exe -m pytest tests --target-binary ../target/release/winget-accel.exe -q
-            if ($LASTEXITCODE -ne 0) { throw '协议用例失败' }
-        }
-        finally { Pop-Location }
+    Invoke-Step 'Rust 协议集成测试（离线）' {
+        cargo test --test protocol --offline -- --test-threads=1
+        if ($LASTEXITCODE -ne 0) { throw '协议用例失败' }
     }
 
     if (-not $SkipRepro) {
@@ -192,8 +188,8 @@ finally {
     }
     Write-Host '全部通过' -ForegroundColor Green
     Write-Host ''
-    Write-Host '注意：这里不包含「真实网络用例」(pytest --network) 与真实 winget 端到端——' -ForegroundColor Yellow
-    Write-Host '      前者依赖第三方加速器存活，后者需要真的装 CA 并改系统 PAC。' -ForegroundColor Yellow
+    Write-Host '注意：这里不包含真实公共加速服务与真实 winget 端到端——' -ForegroundColor Yellow
+    Write-Host '      前者依赖第三方服务存活，后者需要真的装 CA 并改系统 PAC。' -ForegroundColor Yellow
     Pop-Location
     exit 0
 }

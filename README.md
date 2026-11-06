@@ -140,7 +140,8 @@ CA 私钥以明文保存在 `certs\ca-key.pem`。不要把包含 `certs` 的目�
 ```powershell
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo test --bin winget-accel --offline
+cargo test --test protocol --offline -- --test-threads=1
 cargo build --release
 
 .\packaging\check-docs-sync.ps1
@@ -152,17 +153,12 @@ cargo build --release
 协议测试使用本地假上游，默认不访问外网：
 
 ```powershell
-cd prototype
-.\.venv\Scripts\python.exe -m pytest tests --target-binary ..\target\release\winget-accel.exe
+cargo test --test protocol --offline -- --test-threads=1
 ```
 
-真实公共加速服务测试需要显式开启：
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest tests --network --target-binary ..\target\release\winget-accel.exe
-```
-
-真实服务会变化，网络测试失败不一定表示代码回归。交付包中的 `SHA256.txt` 记录 exe 哈希；
+协议测试由 Rust 负责启动代理、假上游和临时目录，客户端调用 Windows 自带的
+`curl.exe` 验证 Schannel、CONNECT、Range 和 HTTPS 下载行为。真实公共服务会变化，
+不能作为离线回归的固定依赖。交付包中的 `SHA256.txt` 记录 exe 哈希；
 构建使用 MSVC 静态 CRT 和 `/Brepro`，相同源码、工具链、Cargo 缓存和构建路径条件下可以
 重复生成相同二进制。
 
