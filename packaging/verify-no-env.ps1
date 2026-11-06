@@ -95,16 +95,24 @@ try {
         health       = @{ enabled = $false }
     } | ConvertTo-Json -Depth 6 | Set-Content -Path $cfgPath -Encoding UTF8
 
-    $proxyProc = Start-Process $exe -ArgumentList '--config', $cfgPath, '--no-env' -PassThru -WindowStyle Hidden
+    $proxyProc = Start-Process $exe -ArgumentList '--config', ('"{0}"' -f $cfgPath), '--no-env' -PassThru -WindowStyle Hidden
 
     $caPath = Join-Path $certDir 'ca-cert.pem'
-    $deadline = (Get-Date).AddSeconds(15)
+    $deadline = (Get-Date).AddSeconds(40)
+    $ready = $false
     while ((Get-Date) -lt $deadline) {
-        if ((Test-Path $caPath) -and -not $proxyProc.HasExited) { break }
+        if ($proxyProc.HasExited) { break }
+        if (Test-Path $caPath) {
+            try {
+                $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -NoProxy -TimeoutSec 1
+                if ($health.version) { $ready = $true; break }
+            }
+            catch { }
+        }
         Start-Sleep -Milliseconds 200
     }
     if ($proxyProc.HasExited) { throw "代理启动失败（退出码 $($proxyProc.ExitCode)）" }
-    if (-not (Test-Path $caPath)) { throw "15 秒内没有生成 CA：$caPath" }
+    if (-not $ready) { throw "40 秒内代理未就绪；等待 CA 和 /health 失败" }
 
     # 施加真实负载：证明它确实在干活，而不是"没跑起来所以没改系统"。
     #
@@ -114,15 +122,24 @@ try {
     $ok = 0
     $codes = @()
     for ($i = 1; $i -le $Requests; $i++) {
-        $code = & curl.exe -sS --max-time 30 -x "http://127.0.0.1:$Port" --ssl-no-revoke `
-            --cacert $caPath -r 0-65535 -o NUL -w '%{http_code}' `
+        # 显式覆盖 NO_PROXY，确保 GitHub 负载不会绕过本次代理。
+        $response = & curl.exe -sS --max-time 30 --noproxy 'localhost,127.0.0.1' `
+            -x "http://127.0.0.1:$Port" --ssl-no-revoke `
+            --cacert $caPath -r 0-65535 -o NUL -w '%{http_code}:%{size_download}' `
             $asset 2>&1
+        $curlExit = $LASTEXITCODE
+        $code = ($response | Out-String).Trim()
         $codes += $code
-        if ($code -eq '206' -or $code -eq '200') { $ok++ }
+        if ($curlExit -eq 0 -and $code -eq '206:65536') { $ok++ }
     }
-    Write-Host ("负载：{0}/{1} 次请求成功（状态码 {2}）" -f $ok, $Requests, ($codes -join ','))
+    Write-Host ("负载：{0}/{1} 次请求成功（状态码:字节数 {2}）" -f $ok, $Requests, ($codes -join ','))
     if ($ok -ne $Requests) {
         $failures.Add("只有 $ok/$Requests 次请求成功（状态码 $($codes -join ',')），无法证明链路跑通")
+    }
+    $proxyLog = Get-Content -LiteralPath (Join-Path $work 'proxy.log') -Raw
+    $rewrites = [regex]::Matches($proxyLog, '(?m) INF REWRITE .* -> 206 ').Count
+    if ($rewrites -lt $Requests) {
+        $failures.Add("代理只记录了 $rewrites 次成功改写，少于 $Requests 次负载，无法证明请求经过代理")
     }
 
     $during = Read-State

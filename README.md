@@ -169,6 +169,10 @@ cargo test --test protocol --offline -- --test-threads=1
 构建使用 MSVC 静态 CRT 和 `/Brepro`，相同源码、工具链、Cargo 缓存和构建路径条件下可以
 重复生成相同二进制。
 
+需要验证真实公共服务时，可运行 `.\packaging\verify-no-env.ps1`。它要求两次 Range 请求
+均通过代理取得完整的 64 KiB，并检查成功改写日志，以及运行前、运行中和退出后的
+PAC、受信任根、恢复日志与锁的状态。
+
 ## 当前验证边界
 
 已经自动验证：PAC 语义、TLS MITM、URL 改写、Range、分片重组、响应定界、候选切换、
