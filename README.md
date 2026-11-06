@@ -137,6 +137,9 @@ CA 私钥以明文保存在 `certs\ca-key.pem`。不要把包含 `certs` 的目�
 
 ## 验证和开发
 
+构建需要 Windows MSVC 工具链和 Rust 1.88 或更新版本。CI 同时检查最低版本的编译兼容性，
+并在 stable 工具链上执行完整测试。
+
 ```powershell
 cargo fmt --all -- --check
 cargo fetch --locked
