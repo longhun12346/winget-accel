@@ -17,329 +17,14 @@
     "用「内嵌兜底 + 实测验证」两层把它的失效影响限制在『候选池不再增长』。"
   ],
   "version": 2,
-  "updated": "2026-11-05",
+  "updated": "2026-11-06",
   "candidates": [
-    {
-      "name": "gh-proxy",
-      "template": "https://gh-proxy.com/{url}",
-      "builtin": true,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "ghfast",
-      "template": "https://ghfast.top/{url}",
-      "builtin": true,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "imciel",
-      "template": "https://ghproxy.imciel.com/{url}",
-      "builtin": true,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "ghproxy-site",
-      "template": "https://ghproxy.site/{url}",
-      "builtin": true,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-qfmc0721-cc",
-      "template": "https://gh.qfmc0721.cc.cd/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-chjina",
-      "template": "https://gh.chjina.com/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "fastgit",
-      "template": "https://fastgit.cc/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "github-tbap",
-      "template": "https://github.tbap.top/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-monlor",
-      "template": "https://gh.monlor.com/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "free-cn-eu",
-      "template": "https://free.cn.eu.org/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gg-z321-cc",
-      "template": "https://gg.z321.cc.cd/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-geekertao",
-      "template": "https://gh.geekertao.top/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "ghgo-de5",
-      "template": "https://ghgo.de5.net/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-acmsz",
-      "template": "https://gh.acmsz.top/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "ghm-078465",
-      "template": "https://ghm.078465.xyz/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-beimengvv",
-      "template": "https://gh.beimengvv.xyz/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "tvv",
-      "template": "https://tvv.tw/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "github-mxw-qzz",
-      "template": "https://github.mxw.qzz.io/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "github-chenc",
-      "template": "https://github.chenc.dev/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "g-z321-cc",
-      "template": "https://g.z321.cc.cd/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "github-ednovas",
-      "template": "https://github.ednovas.xyz/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "ghproxy",
-      "template": "https://ghproxy.icu/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "down-mxw-xx",
-      "template": "https://down.mxw.xx.kg/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "ghp-keleyaa",
-      "template": "https://ghp.keleyaa.com/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
     {
       "name": "cdn-akaere",
       "template": "https://cdn.akaere.online/{url}",
       "builtin": false,
       "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-dpik",
-      "template": "https://gh.dpik.top/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "jiashu-1win-eu",
-      "template": "https://jiashu.1win.eu.org/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-my-website-ccwu",
-      "template": "https://gh.my-website.ccwu.cc/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-inkchills",
-      "template": "https://gh.inkchills.cn/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-jjj-gv",
-      "template": "https://gh.jjj.gv.uy/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "ghfile-geekertao",
-      "template": "https://ghfile.geekertao.top/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-07150721",
-      "template": "https://gh.07150721.xyz/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-sixyin",
-      "template": "https://gh.sixyin.com/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "ghproxy-felicity",
-      "template": "https://ghproxy.felicity.land/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "git-yylx",
-      "template": "https://git.yylx.win/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "ghproxy",
-      "template": "https://ghproxy.net/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
+        "date": "2026-11-06",
         "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
@@ -348,34 +33,7 @@
       "template": "https://cdn.gh-proxy.com/{url}",
       "builtin": false,
       "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "gh-noki",
-      "template": "https://gh.noki.icu/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "g-blfrp",
-      "template": "https://g.blfrp.cn/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
-        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
-      }
-    },
-    {
-      "name": "xsadwsd-kdns",
-      "template": "https://xsadwsd.kdns.fr/{url}",
-      "builtin": false,
-      "verified": {
-        "date": "2026-11-05",
+        "date": "2026-11-06",
         "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
@@ -384,260 +42,380 @@
       "template": "https://down.mxw.qzz.io/{url}",
       "builtin": false,
       "verified": {
-        "date": "2026-11-05",
+        "date": "2026-11-06",
         "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
-      "name": "git-669966",
-      "template": "https://git.669966.xyz/{url}",
+      "name": "down-mxw-xx",
+      "template": "https://down.mxw.xx.kg/{url}",
       "builtin": false,
       "verified": {
-        "date": "2026-11-05",
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "fastgit",
+      "template": "https://fastgit.cc/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "free-cn-eu",
+      "template": "https://free.cn.eu.org/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "g-blfrp",
+      "template": "https://g.blfrp.cn/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "g-z321-cc",
+      "template": "https://g.z321.cc.cd/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gg-z321-cc",
+      "template": "https://gg.z321.cc.cd/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-proxy",
+      "template": "https://gh-proxy.com/{url}",
+      "builtin": true,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-07150721",
+      "template": "https://gh.07150721.xyz/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-acmsz",
+      "template": "https://gh.acmsz.top/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-beimengvv",
+      "template": "https://gh.beimengvv.xyz/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-chjina",
+      "template": "https://gh.chjina.com/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-dpik",
+      "template": "https://gh.dpik.top/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-geekertao",
+      "template": "https://gh.geekertao.top/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-inkchills",
+      "template": "https://gh.inkchills.cn/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-jjj-gv",
+      "template": "https://gh.jjj.gv.uy/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-monlor",
+      "template": "https://gh.monlor.com/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-my-website-ccwu",
+      "template": "https://gh.my-website.ccwu.cc/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-noki",
+      "template": "https://gh.noki.icu/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-qfmc0721-cc",
+      "template": "https://gh.qfmc0721.cc.cd/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "gh-sixyin",
+      "template": "https://gh.sixyin.com/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "ghfast",
+      "template": "https://ghfast.top/{url}",
+      "builtin": true,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "ghfile-geekertao",
+      "template": "https://ghfile.geekertao.top/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "ghgo-de5",
+      "template": "https://ghgo.de5.net/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "ghm-078465",
+      "template": "https://ghm.078465.xyz/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "ghp-keleyaa",
+      "template": "https://ghp.keleyaa.com/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "ghproxy-felicity",
+      "template": "https://ghproxy.felicity.land/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "ghproxy",
+      "template": "https://ghproxy.icu/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "imciel",
+      "template": "https://ghproxy.imciel.com/{url}",
+      "builtin": true,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "ghproxy",
+      "template": "https://ghproxy.net/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "ghproxy-site",
+      "template": "https://ghproxy.site/{url}",
+      "builtin": true,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "git-yylx",
+      "template": "https://git.yylx.win/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "github-chenc",
+      "template": "https://github.chenc.dev/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "github-ednovas",
+      "template": "https://github.ednovas.xyz/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "github-mxw-qzz",
+      "template": "https://github.mxw.qzz.io/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "github-tbap",
+      "template": "https://github.tbap.top/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "jiashu-1win-eu",
+      "template": "https://jiashu.1win.eu.org/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "proxy-yaoyaoling",
+      "template": "https://proxy.yaoyaoling.net/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "tvv",
+      "template": "https://tvv.tw/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
+      }
+    },
+    {
+      "name": "xsadwsd-kdns",
+      "template": "https://xsadwsd.kdns.fr/{url}",
+      "builtin": false,
+      "verified": {
+        "date": "2026-11-06",
         "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     }
   ],
   "watchlist": [
     {
-      "name": "proxy-yaoyaoling",
-      "template": "https://proxy.yaoyaoling.net/{url}",
-      "reason": "曾通过实测，本轮 dead（状态 0）；连续失败 1 次，达 3 次移除",
+      "name": "git-669966",
+      "template": "https://git.669966.xyz/{url}",
+      "reason": "本轮 dead（状态 502）；连续失败 1 次，达 3 次移除",
       "failures": 1
     },
     {
       "name": "github-xxlab",
       "template": "https://github.xxlab.tech/{url}",
-      "reason": "曾通过实测，本轮 dead（状态 0）；连续失败 1 次，达 3 次移除",
+      "reason": "本轮 dead（状态 0）；连续失败 2 次，达 3 次移除",
+      "failures": 2
+    },
+    {
+      "name": "githubproxy-gohj99",
+      "template": "https://githubproxy.gohj99.site/{url}",
+      "reason": "本轮 dead（状态 403）；连续失败 1 次，达 3 次移除",
       "failures": 1
-    },
-    {
-      "name": "github-dpik",
-      "template": "https://github.dpik.top/{url}",
-      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
-      "failures": 2
-    },
-    {
-      "name": "github-proxy-memory-echoes",
-      "template": "https://github-proxy.memory-echoes.cn/{url}",
-      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
-      "failures": 2
-    },
-    {
-      "name": "gh-felicity-ac",
-      "template": "https://gh.felicity.ac.cn/{url}",
-      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
-      "failures": 2
-    },
-    {
-      "name": "gh-ddlc",
-      "template": "https://gh.ddlc.top/{url}",
-      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
-      "failures": 2
-    },
-    {
-      "name": "gitproxy-mrhjx",
-      "template": "https://gitproxy.mrhjx.cn/{url}",
-      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
-      "failures": 2
-    },
-    {
-      "name": "ghproxy-cxkpro",
-      "template": "https://ghproxy.cxkpro.top/{url}",
-      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
-      "failures": 2
-    },
-    {
-      "name": "gh-idayer",
-      "template": "https://gh.idayer.com/{url}",
-      "reason": "实测限流（状态 429）。429 是『活着但拒绝』，不永久剔除；连续失败 2 次",
-      "failures": 2
-    },
-    {
-      "name": "j-1lin-dpdns",
-      "template": "https://j.1lin.dpdns.org/{url}",
-      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "github-starrlzy",
-      "template": "https://github.starrlzy.cn/{url}",
-      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "gh-bugdey-us",
-      "template": "https://gh.bugdey.us.kg/{url}",
-      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "j-1win-ggff",
-      "template": "https://j.1win.ggff.net/{url}",
-      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "gitproxy-127731",
-      "template": "https://gitproxy.127731.xyz/{url}",
-      "reason": "实测不可用（状态 521）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "gh-catmak",
-      "template": "https://gh.catmak.name/{url}",
-      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "slink",
-      "template": "https://slink.ltd/{url}",
-      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "ghpr",
-      "template": "https://ghpr.cc/{url}",
-      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "github-tmby",
-      "template": "https://github.tmby.shop/{url}",
-      "reason": "实测不可用（状态 401）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "gitproxy",
-      "template": "https://gitproxy.click/{url}",
-      "reason": "实测不可用（状态 401）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "gh-tryxd",
-      "template": "https://gh.tryxd.cn/{url}",
-      "reason": "实测不可用（状态 206）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "ghpxy-hwinzniej",
-      "template": "https://ghpxy.hwinzniej.top/{url}",
-      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "gh-jasonzeng",
-      "template": "https://gh.jasonzeng.dev/{url}",
-      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "github-geekery",
-      "template": "https://github.geekery.cn/{url}",
-      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "gp-zkitefly-eu",
-      "template": "https://gp.zkitefly.eu.org/{url}",
-      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "ghproxy-1888866",
-      "template": "https://ghproxy.1888866.xyz/{url}",
-      "reason": "实测不可用（状态 525）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "ghp-arslantu",
-      "template": "https://ghp.arslantu.xyz/{url}",
-      "reason": "实测不可用（状态 525）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "githubdog",
-      "template": "https://githubdog.com/{url}",
-      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "gh-meali",
-      "template": "https://gh.meali.top/{url}",
-      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "ghproxy-monkeyray",
-      "template": "https://ghproxy.monkeyray.net/{url}",
-      "reason": "实测不可用（状态 404）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "777-z321-cc",
-      "template": "https://777.z321.cc.cd/{url}",
-      "reason": "实测不可用（状态 200）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "js-jiangss",
-      "template": "https://js.jiangss.shop/{url}",
-      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "gap-andyjin",
-      "template": "https://gap.andyjin.website/{url}",
-      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "github-ikgy",
-      "template": "https://github.ikgy.top/{url}",
-      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "cfgh-ikgy",
-      "template": "https://cfgh.ikgy.top/{url}",
-      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "github-nswrz",
-      "template": "https://github.nswrz.cn/{url}",
-      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "github-cf-947563",
-      "template": "https://github-cf.947563.xyz/{url}",
-      "reason": "实测不可用（状态 521）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "github-gohj99",
-      "template": "https://github.gohj99.site/{url}",
-      "reason": "实测不可用（状态 403）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "gh-927223",
-      "template": "https://gh.927223.xyz/{url}",
-      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "gh-ruan-dpdns",
-      "template": "https://gh.ruan.dpdns.org/{url}",
-      "reason": "实测不可用（状态 522）；连续失败 2 次，达 3 次移除",
-      "failures": 2
-    },
-    {
-      "name": "gh-zhai-edu",
-      "template": "https://gh.zhai.edu.pl/{url}",
-      "reason": "实测不可用（状态 0）；连续失败 2 次，达 3 次移除",
-      "failures": 2
     }
   ]
 }
