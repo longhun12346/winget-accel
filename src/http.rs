@@ -10,8 +10,6 @@ pub const MAX_HEAD: usize = 32 * 1024;
 /// httparse 需要预先分配的头部槽位数。
 const MAX_HEADERS: usize = 64;
 
-const COPY_BUF: usize = 32 * 1024;
-
 /// 逐字节读到 `\r\n\r\n` 为止。
 ///
 /// **必须逐字节**：CONNECT 的响应发出后，客户端会立刻开始 TLS 握手，
@@ -173,16 +171,25 @@ pub fn content_length(head: &[u8]) -> Option<u64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
-/// 响应头里是否有某个头（大小写不敏感）。
-fn has_header(head: &[u8], name: &str) -> bool {
+/// 最后一个传输编码决定消息边界；多个 TE 头按出现顺序合并。
+fn final_transfer_encoding(head: &[u8]) -> Option<&str> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut res = httparse::Response::new(&mut headers);
     if !matches!(res.parse(head), Ok(httparse::Status::Complete(_))) {
-        return false;
+        return None;
     }
     res.headers
         .iter()
-        .any(|h| h.name.eq_ignore_ascii_case(name))
+        .rev()
+        .find(|h| h.name.eq_ignore_ascii_case("transfer-encoding"))
+        .map(|h| {
+            std::str::from_utf8(h.value)
+                .unwrap_or("")
+                .rsplit(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+        })
 }
 
 /// 按响应头决定如何转发正文，返回正文字节数。
@@ -192,9 +199,9 @@ fn has_header(head: &[u8], name: &str) -> bool {
 ///
 /// **`Transfer-Encoding` 优先于 `Content-Length`**（RFC 7230 §3.3.3）：
 /// 两者同时出现时客户端会按分块解析，我们却按 `Content-Length` 读固定长度，
-/// 就会切在 chunk 中间——客户端解析分块直接失败。这种响应本身可疑
-/// （RFC 要求对这种消息视为错误并关闭连接），但转发方唯一正确的做法是
-/// 按接收方将采用的口径读：读到 EOF，把分块帧原样给出去。
+/// 就会切在 chunk 中间——客户端解析分块直接失败。分块响应在终止块和 trailer
+/// 结束后收尾，不能继续等 EOF；其它传输编码仍以连接关闭为边界。
+/// 分块帧始终原样转发，不解码或重新分帧。
 pub fn forward_body<R: Read, W: Write>(
     up: &mut R,
     dst: &mut W,
@@ -205,12 +212,16 @@ pub fn forward_body<R: Read, W: Write>(
     if no_body || status == 204 || status == 304 {
         return Ok(0);
     }
-    let copied = if has_header(head, "transfer-encoding") {
-        copy_to_eof(up, dst)?
+    let copied = if let Some(encoding) = final_transfer_encoding(head) {
+        if encoding.eq_ignore_ascii_case("chunked") {
+            copy_chunked(up, dst)?
+        } else {
+            io::copy(up, dst)?
+        }
     } else {
         match content_length(head) {
             Some(len) => copy_exact(up, dst, len)?,
-            None => copy_to_eof(up, dst)?,
+            None => io::copy(up, dst)?,
         }
     };
     dst.flush()?;
@@ -223,40 +234,76 @@ pub fn is_rate_limited(status: u16) -> bool {
 }
 
 fn copy_exact<R: Read, W: Write>(src: &mut R, dst: &mut W, len: u64) -> io::Result<u64> {
-    let mut buf = vec![0u8; COPY_BUF];
-    let mut left = len;
-    while left > 0 {
-        let want = std::cmp::min(left, buf.len() as u64) as usize;
-        let n = match src.read(&mut buf[..want]) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "上游提前关闭，正文不完整",
-                ))
-            }
-            Ok(n) => n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        dst.write_all(&buf[..n])?;
-        left -= n as u64;
+    let copied = io::copy(&mut src.take(len), dst)?;
+    if copied != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "上游提前关闭，正文不完整",
+        ));
     }
-    Ok(len)
+    Ok(copied)
 }
 
-fn copy_to_eof<R: Read, W: Write>(src: &mut R, dst: &mut W) -> io::Result<u64> {
-    let mut buf = vec![0u8; COPY_BUF];
-    let mut total = 0u64;
-    loop {
-        match src.read(&mut buf) {
-            Ok(0) => return Ok(total),
-            Ok(n) => {
-                dst.write_all(&buf[..n])?;
-                total += n as u64;
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+/// 只读取分帧行，正文仍由 copy_exact 搬运。限制扩展行及整个 trailer 的大小。
+fn read_crlf_line<R: Read>(src: &mut R, limit: usize) -> io::Result<Vec<u8>> {
+    let mut line = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    while line.len() < limit {
+        src.read_exact(&mut byte)?;
+        line.push(byte[0]);
+        if line.ends_with(b"\r\n") {
+            return Ok(line);
         }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "分块扩展或 trailer 过大",
+    ))
+}
+
+fn copy_chunked<R: Read, W: Write>(src: &mut R, dst: &mut W) -> io::Result<u64> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "上游分块帧格式错误");
+    let mut copied = 0;
+    loop {
+        let line = read_crlf_line(src, MAX_HEAD)?;
+        // httparse 接受空的大小行；这里额外要求至少一个十六进制数字。
+        if !line[0].is_ascii_hexdigit() {
+            return Err(invalid());
+        }
+        let size = match httparse::parse_chunk_size(&line) {
+            Ok(httparse::Status::Complete((used, size))) if used == line.len() => size,
+            _ => return Err(invalid()),
+        };
+        dst.write_all(&line)?;
+        copied += line.len() as u64;
+        if size == 0 {
+            let mut trailers = Vec::new();
+            loop {
+                let line = read_crlf_line(src, MAX_HEAD - trailers.len())?;
+                let done = line == b"\r\n";
+                trailers.extend_from_slice(&line);
+                if done {
+                    break;
+                }
+            }
+            let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+            if !matches!(
+                httparse::parse_headers(&trailers, &mut headers),
+                Ok(httparse::Status::Complete((used, _))) if used == trailers.len()
+            ) {
+                return Err(invalid());
+            }
+            dst.write_all(&trailers)?;
+            return Ok(copied + trailers.len() as u64);
+        }
+        copied += copy_exact(src, dst, size)?;
+        let mut crlf = [0u8; 2];
+        src.read_exact(&mut crlf)?;
+        if crlf != *b"\r\n" {
+            return Err(invalid());
+        }
+        dst.write_all(&crlf)?;
+        copied += 2;
     }
 }
 
@@ -381,6 +428,56 @@ mod tests {
         assert_eq!(out, response, "chunked 必须原样转发，不能重新分帧");
     }
 
+    #[test]
+    fn chunked_body_stops_after_trailers_without_waiting_for_eof() {
+        let body = b"8;name=value\r\n\r\n0\r\n\r\nx\r\n00;done=yes\r\nX-Checksum: test\r\n\r\n";
+        let head =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: ChUnKeD\r\n\r\n";
+        let mut wire = body.to_vec();
+        wire.extend_from_slice(b"next-response");
+        let mut up = Cursor::new(wire);
+        let mut out = Vec::new();
+
+        let count = forward_body(&mut up, &mut out, head, false).unwrap();
+
+        assert_eq!(out, body, "块扩展、正文与 trailer 必须原样保留");
+        assert_eq!(count, body.len() as u64);
+        assert_eq!(up.position(), body.len() as u64, "终止块后不能再读取上游");
+    }
+
+    #[test]
+    fn chunked_body_rejects_incomplete_or_malformed_framing() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let oversized_extension = format!("1;{}\r\nx\r\n0\r\n\r\n", "x".repeat(MAX_HEAD));
+        let oversized_trailers = format!("0\r\n{}\r\n", "X: v\r\n".repeat(MAX_HEAD / 6 + 1));
+        for body in [
+            &b"3\r\nabc\r\n"[..],
+            &b"3\r\nab"[..],
+            &b"3\r\nabcXX0\r\n\r\n"[..],
+            &b"not-hex\r\nabc\r\n0\r\n\r\n"[..],
+            &b"\r\n\r\n"[..],
+            &b"10000000000000000\r\n"[..],
+            &b"0\r\nnot-a-header\r\n\r\n"[..],
+            &b"0\r\nX-Checksum: unfinished\r\n"[..],
+            oversized_extension.as_bytes(),
+            oversized_trailers.as_bytes(),
+        ] {
+            let result = forward_body(&mut Cursor::new(body), &mut Vec::new(), head, false);
+            assert!(result.is_err(), "不能把畸形分块流当成功：{body:?}");
+        }
+    }
+
+    #[test]
+    fn non_chunked_final_transfer_encoding_uses_eof() {
+        let head =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\nContent-Length: 1\r\n\r\n";
+        let body = b"encoded-body";
+        let mut out = Vec::new();
+        let count = forward_body(&mut Cursor::new(body), &mut out, head, false).unwrap();
+        assert_eq!(out, body);
+        assert_eq!(count, body.len() as u64);
+    }
+
     /// `Transfer-Encoding` 与 `Content-Length` 同时出现时，以 TE 为准（RFC 7230 §3.3.3）。
     ///
     /// 回归：此前 `forward_body` 先看 `Content-Length`，于是按 CL 读固定字节数：
@@ -401,7 +498,7 @@ mod tests {
 
         assert_eq!(status, 200);
         assert_eq!(out, response, "必须把完整的分块帧原样转发出去");
-        assert_eq!(bytes, body_len, "应按分块流读取到 EOF，而不是按 CL 截断");
+        assert_eq!(bytes, body_len, "应完整读取分块流，而不是按 CL 截断");
     }
 
     #[test]

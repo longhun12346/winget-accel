@@ -718,8 +718,7 @@ impl Proxy {
                 Err(err) => {
                     Stats::bump(&self.stats.errors);
                     // `kind=` 让两种完全不同的情况不再长得一样：
-                    // - timeout：上游不再发数据（chunked 收尾后没关连接时很常见，
-                    //   此时客户端多半已经拿全了内容）
+                    // - timeout：上游在完整消息结束前不再发数据
                     // - early-eof：上游提前断开，正文真的不完整
                     // 以前它们都只是"RELAY-ERR + 一句 err"，排障时容易误判成下载失败。
                     self.log.warn(&format!(
@@ -1220,8 +1219,7 @@ fn is_retryable_status(status: u16) -> bool {
 /// 把中继失败的 IO 类型归成三类，写进 `RELAY-ERR` 的 `kind=` 字段。
 ///
 /// 为什么值得区分（实测，design.md §6）：
-/// - `timeout`：上游不再发数据。chunked 响应里**上游没按 `Connection: close` 关闭**时
-///   就会这样——客户端其实已经拿到终端块、内容完整，只是我们还在等 EOF；
+/// - `timeout`：上游在完整消息结束前不再发数据；
 /// - `early-eof`：上游提前断开，声明了 `Content-Length` 却没给够，是真的正文不完整；
 /// - `other`：其它 IO 错误（连接被重置等）。
 ///
@@ -1531,9 +1529,7 @@ mod tests {
 
     /// `RELAY-ERR` 的 `kind=` 必须能分开"上游不发数据了"与"正文真的不完整"。
     ///
-    /// 实测依据（design.md §6）：chunked 响应且上游不按 `Connection: close` 关闭时，
-    /// 代理会等到读超时（20.01 s）才收尾，而客户端 0.1 s 就拿到了完整内容。
-    /// 这两种情况以前在日志里一模一样，很容易把"其实成功了"读成失败。
+    /// 超时和截断意味着不同的上游故障，日志必须保留这个区别。
     #[test]
     fn relay_error_kind_separates_timeout_from_truncation() {
         let blocking: anyhow::Error =

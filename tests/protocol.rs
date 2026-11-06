@@ -36,6 +36,7 @@ enum UpstreamMode {
     Normal,
     IgnoreRange,
     Truncate,
+    TruncateChunked,
 }
 
 struct HttpUpstream {
@@ -144,12 +145,21 @@ fn handle_http_connection(
         write_response(&mut stream, 200, &[], &[b'Q'; 65_536]);
         return;
     }
-    if matches!(mode, UpstreamMode::Truncate) {
+    if matches!(mode, UpstreamMode::Truncate | UpstreamMode::TruncateChunked) {
+        let framing = if matches!(mode, UpstreamMode::TruncateChunked) {
+            "Transfer-Encoding: chunked"
+        } else {
+            "Content-Length: 100"
+        };
         let _ = write!(
             stream,
-            "HTTP/1.1 206 Partial Content\r\nContent-Length: 100\r\n\
-             Content-Range: bytes 0-99/1024\r\nConnection: close\r\n\r\n0123456789"
+            "HTTP/1.1 206 Partial Content\r\n{framing}\r\n\
+             Content-Range: bytes 0-99/1024\r\nConnection: close\r\n\r\n"
         );
+        if matches!(mode, UpstreamMode::TruncateChunked) {
+            let _ = stream.write_all(b"64\r\n");
+        }
+        let _ = stream.write_all(b"0123456789");
         let _ = stream.flush();
         let _ = stream.shutdown(Shutdown::Write);
         return;
@@ -169,6 +179,17 @@ fn handle_http_connection(
              Connection: close\r\n\r\n3\r\nabc\r\n4\r\ndefg\r\n1\r\nh\r\n0\r\n\r\n"
         );
         let _ = stream.flush();
+        return;
+    }
+    if path.contains("chunked-keepalive") {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n\
+             3;ext=test\r\nabc\r\n0\r\nX-Checksum: test\r\n\r\n"
+        );
+        let _ = stream.flush();
+        // 等代理主动关闭；不先发 EOF，暴露“客户端已收完，代理还在等”的死锁。
+        let _ = stream.read(&mut [0u8; 1]);
         return;
     }
     if path.contains("chunked") {
@@ -664,6 +685,17 @@ fn preserves_ranges_and_response_boundaries() {
     let no_length = curl(&proxy, &asset("nolength"), &[]);
     assert_curl_ok(&no_length);
     assert_eq!(no_length.body, b"no-length-body");
+
+    let keepalive = curl(&proxy, &asset("chunked-keepalive"), &[]);
+    assert_curl_ok(&keepalive);
+    assert_eq!(keepalive.body, b"abc");
+    let log = proxy.wait_log(|text| {
+        rewrite_lines(text)
+            .iter()
+            .any(|line| line.contains("chunked-keepalive"))
+    });
+    assert!(!log.contains("RELAY-ERR"), "{log}");
+    assert_eq!(proxy.health()["errors"], 0);
 }
 
 #[test]
@@ -750,6 +782,12 @@ fn fails_over_from_bad_candidate_to_good_candidate() {
 
 #[test]
 fn truncated_upstream_body_fails_and_clears_pin() {
+    for mode in [UpstreamMode::Truncate, UpstreamMode::TruncateChunked] {
+        assert_truncated_body_clears_pin(mode);
+    }
+}
+
+fn assert_truncated_body_clears_pin(mode: UpstreamMode) {
     let first = HttpUpstream::start(UpstreamMode::Normal);
     let second = HttpUpstream::start(UpstreamMode::Normal);
     let proxy = Proxy::start(
@@ -761,7 +799,7 @@ fn truncated_upstream_body_fails_and_clears_pin() {
     );
     let url = asset("truncated-range.zip");
     let (pinned, other) = prime_file_pin(&proxy, &first, &second, &url);
-    pinned.set_mode(UpstreamMode::Truncate);
+    pinned.set_mode(mode);
     let result = curl(&proxy, &url, &["-r", "0-99"]);
     assert!(
         !result.output.status.success(),
