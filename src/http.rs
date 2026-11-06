@@ -212,7 +212,7 @@ pub fn forward_body<R: Read, W: Write>(
     if no_body || status == 204 || status == 304 {
         return Ok(0);
     }
-    let (wire, _) = copy_body(up, dst, head, u64::MAX)?;
+    let (wire, _) = copy_body(up, dst, head, u64::MAX, true)?;
     dst.flush()?;
     Ok(wire)
 }
@@ -220,24 +220,33 @@ pub fn forward_body<R: Read, W: Write>(
 /// 测速只累计有效载荷，分块扩展与 trailer 不算下载样本，并限制正文总量。
 /// 另给分帧留出八倍正文加两组头部上限的读取预算，避免用极长扩展拖住探测。
 pub fn measure_body<R: Read>(up: &mut R, head: &[u8], limit: u64) -> io::Result<u64> {
-    let wire_limit = limit
-        .saturating_mul(8)
-        .saturating_add((MAX_HEAD * 2) as u64);
-    let mut bounded = up.take(wire_limit);
-    let (_, payload) = copy_body(&mut bounded, &mut io::sink(), head, limit)?;
+    let (_, payload) = copy_body(up, &mut io::sink(), head, limit, false)?;
     Ok(payload)
 }
 
-/// 返回 (原样写出的字节数, 不含分块帧的正文大小)。
+/// 读取一个有大小上限的响应正文，移除分块帧，用于候选清单等小文件。
+pub fn read_body<R: Read>(up: &mut R, head: &[u8], limit: u64) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    copy_body(up, &mut body, head, limit, false)?;
+    Ok(body)
+}
+
+/// 返回 (包含分块帧的读取字节数, 不含分块帧的正文大小)。
 fn copy_body<R: Read, W: Write>(
     up: &mut R,
     dst: &mut W,
     head: &[u8],
     limit: u64,
+    preserve_framing: bool,
 ) -> io::Result<(u64, u64)> {
+    let wire_limit = limit
+        .saturating_mul(8)
+        .saturating_add((MAX_HEAD * 2) as u64);
+    let mut bounded = up.take(wire_limit);
+    let up = &mut bounded;
     let copied = if let Some(encoding) = final_transfer_encoding(head) {
         if encoding.eq_ignore_ascii_case("chunked") {
-            return copy_chunked(up, dst, limit);
+            return copy_chunked(up, dst, limit, preserve_framing);
         } else {
             io::copy(&mut up.take(limit.saturating_add(1)), dst)?
         }
@@ -255,7 +264,7 @@ fn copy_body<R: Read, W: Write>(
 }
 
 fn body_too_large() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "上游正文超过采样上限")
+    io::Error::new(io::ErrorKind::InvalidData, "上游正文超过大小上限")
 }
 
 /// 429 / 503：被限流或暂时不可用，值得换一个候选重试。
@@ -291,7 +300,12 @@ fn read_crlf_line<R: Read>(src: &mut R, limit: usize) -> io::Result<Vec<u8>> {
     ))
 }
 
-fn copy_chunked<R: Read, W: Write>(src: &mut R, dst: &mut W, limit: u64) -> io::Result<(u64, u64)> {
+fn copy_chunked<R: Read, W: Write>(
+    src: &mut R,
+    dst: &mut W,
+    limit: u64,
+    preserve_framing: bool,
+) -> io::Result<(u64, u64)> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "上游分块帧格式错误");
     let mut copied = 0;
     let mut payload = 0u64;
@@ -309,7 +323,9 @@ fn copy_chunked<R: Read, W: Write>(src: &mut R, dst: &mut W, limit: u64) -> io::
             .checked_add(size)
             .filter(|total| *total <= limit)
             .ok_or_else(body_too_large)?;
-        dst.write_all(&line)?;
+        if preserve_framing {
+            dst.write_all(&line)?;
+        }
         copied += line.len() as u64;
         if size == 0 {
             let mut trailers = Vec::new();
@@ -328,7 +344,9 @@ fn copy_chunked<R: Read, W: Write>(src: &mut R, dst: &mut W, limit: u64) -> io::
             ) {
                 return Err(invalid());
             }
-            dst.write_all(&trailers)?;
+            if preserve_framing {
+                dst.write_all(&trailers)?;
+            }
             return Ok((copied + trailers.len() as u64, payload));
         }
         copied += copy_exact(src, dst, size)?;
@@ -337,7 +355,9 @@ fn copy_chunked<R: Read, W: Write>(src: &mut R, dst: &mut W, limit: u64) -> io::
         if crlf != *b"\r\n" {
             return Err(invalid());
         }
-        dst.write_all(&crlf)?;
+        if preserve_framing {
+            dst.write_all(&crlf)?;
+        }
         copied += 2;
     }
 }
@@ -388,7 +408,7 @@ mod tests {
     #[test]
     fn read_head_rejects_oversized_head() {
         let mut data = b"GET / HTTP/1.1\r\n".to_vec();
-        data.extend(std::iter::repeat(b'X').take(MAX_HEAD + 16));
+        data.extend(std::iter::repeat_n(b'X', MAX_HEAD + 16));
         let mut cursor = Cursor::new(data);
         assert!(read_head(&mut cursor).is_err());
     }

@@ -172,9 +172,9 @@ impl Tracker {
     /// 首页可达不能证明能下载；新候选和被排除的候选都须重新取样验证。
     pub fn needs_verification(&self, idx: usize) -> bool {
         let states = self.states.lock().expect("健康状态锁中毒");
-        states.get(idx).map_or(true, |state| {
-            state.health != Health::Healthy || state.samples == 0
-        })
+        states
+            .get(idx)
+            .is_none_or(|state| state.health != Health::Healthy || state.samples == 0)
     }
     pub fn snapshot(&self) -> Vec<(String, Health)> {
         let states = self.states.lock().expect("健康状态锁中毒");

@@ -115,7 +115,7 @@ fn append_line_to(path: &std::path::Path, line: &str) {
 
 fn maybe_rotate(path: &std::path::Path) {
     let count = WRITE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if count % ROTATE_CHECK_EVERY == 0 {
+    if count.is_multiple_of(ROTATE_CHECK_EVERY) {
         rotate_if_too_big(path, MAX_LOG_BYTES);
     }
 }

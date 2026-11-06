@@ -1,16 +1,8 @@
-//! 候选加速器清单：首次运行时从上游获取一次，缓存到本地，与内置清单合并。
+//! 候选清单：启动时刷新，网络失败时回退缓存与编译期内置清单。
 //!
-//! 设计取舍（2026-11-02 与用户对齐，含一次纠正）：
-//!
-//! - **首次运行时获取一次**。用户明确要求动态获取；此前我实现成"编译期嵌入 +
-//!   本地文件覆盖"，没有任何网络获取，等于把需求换掉了。这条注释就是为了
-//!   避免以后再次误读。
-//! - 之后走缓存，不再每次启动都联网（公共站点不该被每次启动打扰）。
-//! - 多个上游端点按顺序回退：`raw.githubusercontent.com` 在国内可能不通，
-//!   所以再挂 jsDelivr 与加速器两条备路。全失败就用内置清单，程序照常启动。
-//! - **获取到的候选不直接信任**：它们只是"待测"，启动探测（206 + 64 KiB + 速度）
-//!   没通过的一律不进调度池。清单来源不可信，实测结果才可信。
-//! - 内嵌清单永远保留，作为离线兜底（上游全挂、断网、缓存损坏都能启动）。
+//! 用户手放的 candidates.json 优先。自动获取并发请求权威源与公共加速器，
+//! 在六秒预算内选择候选数最多的有效结果，再缓存供离线使用。
+//! 获取到的候选仍须通过运行期资产验证，不能直接进入下载调度。
 
 use std::io::Read;
 use std::path::Path;
@@ -26,19 +18,8 @@ pub const FILE_NAME: &str = "candidates.json";
 /// 获取结果的缓存文件名。机器写入，用户不必编辑。
 pub const CACHE_FILE_NAME: &str = "candidates.cache.json";
 
-/// 上游端点，按顺序尝试。任一成功即止。
-///
-/// 为什么多个：
-/// - `raw.githubusercontent.com` 最直接，但国内经常不通；
-/// - jsDelivr 服务 GitHub 公开仓库文件（实测 cdn/fastly/gcore/testingcf 四个域都 200，
-///   其中 testingcf 最快 893 ms）；
-/// - 最后一条走公共加速器，是"用被加速的对象去取加速器清单"的自举，
-///   聊胜于无。
-///
-/// **注意**：本仓库当前是私有的，jsDelivr 与 githack 都取不到私有仓库的文件，
-/// 所以第 2、3 条现在必然失败——只有在仓库转公开、或清单另存到公开位置后才有效。
-/// 保留它们是因为那是最可能的后续形态，失败时只是回退下一条。
-/// 可用环境变量 `WINGET_ACCEL_CANDIDATES_URL` 覆盖（自建镜像、或本地验证用）。
+/// 并发获取的上游：权威源与公共加速器。环境变量 WINGET_ACCEL_CANDIDATES_URL
+/// 可覆盖为自建镜像或本地验证地址。
 const UPSTREAM_URLS: [&str; 2] = [
     // 权威源。直连不通时靠下面的加速器。
     "https://raw.githubusercontent.com/longhun12346/winget-accel/main/candidates.json",
@@ -51,7 +32,7 @@ const UPSTREAM_URLS: [&str; 2] = [
 /// 实测踩过：jsDelivr 对 `@branch` 有约 12 小时缓存。我们刚把清单从 4 条
 /// 更新到 43 条，`cdn.jsdelivr.net` 与 `fastly.jsdelivr.net` 仍返回旧的 4 条，
 /// 而 `raw.githubusercontent.com` 与加速器已是 43 条。
-/// 由于 `fetch_best` 取"最快成功"的那个，而 jsDelivr 响应更快，
+/// 当时 `fetch_best` 取"最快成功"的那个，而 jsDelivr 响应更快，
 /// 结果就是**拿到了过期数据**。
 ///
 /// 教训："最快"不等于"最新"。宁可多等 300 ms 拿权威源，也不要秒回旧数据。
@@ -93,7 +74,7 @@ impl Candidate {
 
 /// 读取清单。
 ///
-/// 优先级：用户手放的 `candidates.json` > 网络缓存 > 首次获取 > 内嵌清单。
+/// 优先级：用户手放的 `candidates.json` > 网络刷新 > 网络缓存 > 内嵌清单。
 ///
 /// `allow_fetch` 为 false 时不联网（测试或用户显式关闭）。
 pub fn load(dir: &Path, allow_fetch: bool) -> (Vec<Candidate>, String) {
@@ -121,8 +102,7 @@ pub fn load(dir: &Path, allow_fetch: bool) -> (Vec<Candidate>, String) {
     let cache = dir.join(CACHE_FILE_NAME);
 
     // 2) **每次运行都从上游获取**（用户明确要求）。
-    //    并发请求所有端点、取最快成功的那个，总预算 6 秒——
-    //    串行等 4 个端点超时会把启动拖到十几秒，用户会以为程序卡住。
+    //    并发请求所有端点，在六秒预算内取候选数最多的有效结果。
     if allow_fetch {
         let started = std::time::Instant::now();
         match fetch_best() {
@@ -169,13 +149,7 @@ pub fn load(dir: &Path, allow_fetch: bool) -> (Vec<Candidate>, String) {
     }
 }
 
-/// 并发请求所有上游端点，返回**最快成功**的那份（正文 + 解析结果）。
-///
-/// 为什么要并发：串行时若 `raw.githubusercontent.com` 在国内挂住，
-/// 要等它超时才能试下一个，4 个端点能把启动拖到十几秒。
-/// 并发后总耗时约等于最快那个端点的响应时间（实测 351 ms – 1.7 s）。
-///
-/// 总预算 6 秒；超时或全部失败则报错，由调用方回退缓存/内置清单。
+/// 并发获取上游，六秒内选择候选数最多的有效结果；全部失败则回退本地清单。
 fn fetch_best() -> Result<(String, Vec<Candidate>, String)> {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -328,85 +302,16 @@ fn http_get(url: &str, timeout_secs: u64) -> Result<String> {
     read_http_body(&mut tls)
 }
 
-/// 从已建立的连接读取完整响应并校验状态码。
+/// 按 HTTP 消息边界读取候选清单，分帧与大小限制复用共用读取逻辑。
 fn read_http_body<R: Read>(stream: &mut R) -> Result<String> {
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                raw.extend_from_slice(&buf[..n]);
-                // 防御：清单不该超过 1 MB，超过说明取到的不是我们要的东西
-                if raw.len() > 1024 * 1024 {
-                    anyhow::bail!("响应过大（>1 MB），可能不是候选清单");
-                }
-            }
-            Err(err) => {
-                // Connection: close 下服务端关闭可能表现为错误；已收到内容就不算失败
-                if raw.is_empty() {
-                    return Err(err).context("读取响应失败");
-                }
-                break;
-            }
-        }
-    }
-
-    let (head, body) = split_http_response(&raw)?;
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
+    let head = crate::http::read_head(stream).context("读取候选清单响应头失败")?;
+    let status = crate::http::status_code(&head).context("候选清单响应头非法")?;
     if status != 200 {
-        anyhow::bail!("HTTP {status}");
+        bail!("HTTP {status}");
     }
+    let body =
+        crate::http::read_body(stream, &head, 1024 * 1024).context("读取候选清单正文失败")?;
     String::from_utf8(body).context("响应不是 UTF-8")
-}
-
-/// 拆出响应头与正文；处理 `Transfer-Encoding: chunked`。
-fn split_http_response(raw: &[u8]) -> Result<(String, Vec<u8>)> {
-    let pos = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .context("响应里没有头部结束标记")?;
-    let head = String::from_utf8_lossy(&raw[..pos]).to_string();
-    let body = &raw[pos + 4..];
-
-    if head
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
-    {
-        let mut out = Vec::new();
-        let mut rest = body;
-        let mut saw_last = false;
-        while let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") {
-            let size_text = String::from_utf8_lossy(&rest[..line_end]);
-            let size_str = size_text.split(';').next().unwrap_or("").trim();
-            let size = usize::from_str_radix(size_str, 16)
-                .with_context(|| format!("非法 chunk 大小: {size_str:?}"))?;
-            if size == 0 {
-                saw_last = true;
-                break;
-            }
-            let start = line_end + 2;
-            let end = start.checked_add(size).context("chunk 大小溢出")?;
-            if end + 2 > rest.len() {
-                bail!("chunked 响应中的 chunk 数据不完整");
-            }
-            out.extend_from_slice(&rest[start..end]);
-            if &rest[end..end + 2] != b"\r\n" {
-                bail!("chunk 数据后缺少 CRLF");
-            }
-            rest = &rest[end + 2..];
-        }
-        if !saw_last {
-            bail!("chunked 响应缺少终止块");
-        }
-        return Ok((head, out));
-    }
-
-    Ok((head, body.to_vec()))
 }
 
 fn parse(text: &str) -> Result<Vec<Candidate>> {
@@ -582,47 +487,68 @@ mod tests {
     }
 
     #[test]
-    fn split_response_handles_plain_body() {
+    fn response_handles_plain_body() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        let (head, body) = split_http_response(raw).unwrap();
-        assert!(head.starts_with("HTTP/1.1 200"));
-        assert_eq!(body, b"hello");
+        let body = read_http_body(&mut std::io::Cursor::new(raw)).unwrap();
+        assert_eq!(body, "hello");
     }
 
     #[test]
-    fn split_response_handles_chunked() {
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n3\r\nabc\r\n0\r\n\r\n";
-        let (_head, body) = split_http_response(raw).unwrap();
-        assert_eq!(body, b"helloabc");
+    fn response_handles_chunked() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: \tChUnKeD\r\n\r\n5\r\nhello\r\n3\r\nabc\r\n0\r\nX-Tag: test\r\n\r\n";
+        let mut input = raw.to_vec();
+        input.extend_from_slice(b"next-response");
+        let mut up = std::io::Cursor::new(input);
+        let body = read_http_body(&mut up).unwrap();
+        assert_eq!(body, "helloabc");
+        assert_eq!(up.position(), raw.len() as u64, "不能在终止块后继续等 EOF");
     }
 
     #[test]
-    fn split_response_without_blank_line_is_error() {
-        assert!(split_http_response(b"HTTP/1.1 200 OK").is_err());
+    fn response_without_blank_line_is_error() {
+        assert!(read_http_body(&mut std::io::Cursor::new(b"HTTP/1.1 200 OK")).is_err());
     }
     #[test]
-    fn split_response_handles_chunk_extensions() {
+    fn response_handles_chunk_extensions() {
         let raw =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;foo=bar\r\nhello\r\n0\r\n\r\n";
-        let (_, body) = split_http_response(raw).unwrap();
-        assert_eq!(body, b"hello");
+        let body = read_http_body(&mut std::io::Cursor::new(raw)).unwrap();
+        assert_eq!(body, "hello");
     }
 
     #[test]
-    fn split_response_rejects_invalid_chunk_size() {
+    fn response_rejects_invalid_chunk_size() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n";
-        assert!(split_http_response(raw).is_err());
+        assert!(read_http_body(&mut std::io::Cursor::new(raw)).is_err());
     }
 
     #[test]
-    fn split_response_rejects_truncated_chunk() {
+    fn response_rejects_truncated_chunk() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel";
-        assert!(split_http_response(raw).is_err());
+        assert!(read_http_body(&mut std::io::Cursor::new(raw)).is_err());
     }
 
     #[test]
-    fn split_response_rejects_missing_terminal_chunk() {
+    fn response_rejects_missing_terminal_chunk() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
-        assert!(split_http_response(raw).is_err());
+        assert!(read_http_body(&mut std::io::Cursor::new(raw)).is_err());
+    }
+
+    #[test]
+    fn response_rejects_overflowing_chunk_length_without_panicking() {
+        let size = usize::MAX - (usize::BITS as usize / 4 + 2);
+        let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{size:x}\r\n");
+        assert!(read_http_body(&mut std::io::Cursor::new(raw)).is_err());
+    }
+
+    #[test]
+    fn response_rejects_incomplete_length_or_trailers() {
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{}"[..],
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 1048577\r\n\r\n{}"[..],
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n"[..],
+        ] {
+            assert!(read_http_body(&mut std::io::Cursor::new(raw)).is_err());
+        }
     }
 }
