@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::windows::io::{AsHandle, AsRawHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,10 +35,12 @@ struct RequestRecord {
 enum UpstreamMode {
     Normal,
     IgnoreRange,
+    Truncate,
 }
 
 struct HttpUpstream {
     addr: SocketAddr,
+    mode: Arc<Mutex<UpstreamMode>>,
     records: Arc<Mutex<Vec<RequestRecord>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -50,15 +53,18 @@ impl HttpUpstream {
         listener
             .set_nonblocking(true)
             .expect("set fake upstream nonblocking");
+        let mode = Arc::new(Mutex::new(mode));
         let records = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_records = Arc::clone(&records);
+        let thread_mode = Arc::clone(&mode);
         let thread_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let records = Arc::clone(&thread_records);
+                        let mode = Arc::clone(&thread_mode);
                         thread::spawn(move || handle_http_connection(stream, mode, records));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -70,6 +76,7 @@ impl HttpUpstream {
         });
         Self {
             addr,
+            mode,
             records,
             stop,
             thread: Some(thread),
@@ -82,6 +89,10 @@ impl HttpUpstream {
 
     fn records(&self) -> Vec<RequestRecord> {
         self.records.lock().expect("records lock").clone()
+    }
+
+    fn set_mode(&self, mode: UpstreamMode) {
+        *self.mode.lock().expect("upstream mode lock") = mode;
     }
 }
 
@@ -97,10 +108,12 @@ impl Drop for HttpUpstream {
 
 fn handle_http_connection(
     mut stream: TcpStream,
-    mode: UpstreamMode,
+    mode: Arc<Mutex<UpstreamMode>>,
     records: Arc<Mutex<Vec<RequestRecord>>>,
 ) {
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let Some((path, headers)) = read_request(&mut stream) else {
         return;
     };
@@ -125,8 +138,20 @@ fn handle_http_connection(
         headers: headers.clone(),
     });
 
+    // 探测始终正常；故障开关只影响下载，避免后台探测改变候选选择。
+    let mode = *mode.lock().expect("upstream mode lock");
     if matches!(mode, UpstreamMode::IgnoreRange) && headers.contains_key("range") {
         write_response(&mut stream, 200, &[], &[b'Q'; 65_536]);
+        return;
+    }
+    if matches!(mode, UpstreamMode::Truncate) {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: 100\r\n\
+             Content-Range: bytes 0-99/1024\r\nConnection: close\r\n\r\n0123456789"
+        );
+        let _ = stream.flush();
+        let _ = stream.shutdown(Shutdown::Write);
         return;
     }
     if path.contains("boom") {
@@ -240,17 +265,24 @@ fn read_request(stream: &mut TcpStream) -> Option<(String, HashMap<String, Strin
 }
 
 struct Proxy {
-    child: Child,
+    child: ChildGuard,
     port: u16,
-    dir: TestDir,
     cert_dir: PathBuf,
     log: PathBuf,
-    _stdout: std::fs::File,
-    _stderr: std::fs::File,
+    // 字段按声明顺序释放：先终止并回收进程、关闭其日志句柄，最后删目录。
+    _dir: TestDir,
 }
 
 impl Proxy {
     fn start(upstreams: &[(&str, UpstreamMode)], mitm_extra: &[&str]) -> Self {
+        let mut proxy = Self::launch(upstreams, mitm_extra);
+        if let Err(error) = proxy.wait_ready(Duration::from_secs(20)) {
+            panic!("{error}");
+        }
+        proxy
+    }
+
+    fn launch(upstreams: &[(&str, UpstreamMode)], mitm_extra: &[&str]) -> Self {
         let dir = TestDir::new();
         let cert_dir = dir.path().join("certs");
         let log = dir.path().join("proxy.log");
@@ -290,44 +322,68 @@ impl Proxy {
         let stderr_path = dir.path().join("stderr.log");
         let stdout = std::fs::File::create(&stdout_path).expect("create stdout log");
         let stderr = std::fs::File::create(&stderr_path).expect("create stderr log");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_winget-accel"))
-            .args([
-                "--config",
-                config_path.to_str().expect("config path"),
-                "--no-env",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout.try_clone().expect("clone stdout")))
-            .stderr(Stdio::from(stderr.try_clone().expect("clone stderr")))
-            .spawn()
-            .expect("start proxy");
-
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Ok(response) = raw_http(port, "GET", "/health", &[]) {
-                if response.starts_with(b"HTTP/1.1") {
-                    break;
-                }
-            }
-            if let Some(status) = child.try_wait().expect("poll proxy") {
-                let error = std::fs::read_to_string(&stderr_path).unwrap_or_default();
-                panic!("proxy exited during startup ({status}): {error}");
-            }
-            if Instant::now() >= deadline {
-                let error = std::fs::read_to_string(&stderr_path).unwrap_or_default();
-                panic!("proxy did not become ready: {error}");
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
+        let child = ChildGuard(
+            Command::new(env!("CARGO_BIN_EXE_winget-accel"))
+                .args([
+                    "--config",
+                    config_path.to_str().expect("config path"),
+                    "--no-env",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr))
+                .spawn()
+                .expect("start proxy"),
+        );
         Self {
             child,
             port,
-            dir,
             cert_dir,
             log,
-            _stdout: stdout,
-            _stderr: stderr,
+            _dir: dir,
         }
+    }
+
+    fn wait_ready(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.0.try_wait().map_err(|error| error.to_string())? {
+                return Err(self.startup_error(&format!("proxy exited during startup ({status})")));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(self.startup_error("proxy did not become ready"));
+            }
+            if let Ok(response) = raw_http_with_timeout(
+                self.port,
+                "GET",
+                "/health",
+                &[],
+                remaining.min(Duration::from_millis(200)),
+            ) {
+                let health = serde_json::from_slice::<Value>(&http_body(&response));
+                if response.starts_with(b"HTTP/1.1 200 ")
+                    && health.is_ok_and(|value| value["version"] == env!("CARGO_PKG_VERSION"))
+                    && self.ca_path().is_file()
+                {
+                    return Ok(());
+                }
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(50)),
+            );
+        }
+    }
+
+    fn startup_error(&self, reason: &str) -> String {
+        let mut message = format!("{reason}\n");
+        for name in ["stdout.log", "stderr.log", "proxy.log"] {
+            let text = std::fs::read_to_string(self._dir.path().join(name)).unwrap_or_default();
+            message.push_str(&format!("--- {name} ---\n{text}\n"));
+        }
+        message
     }
 
     fn ca_path(&self) -> PathBuf {
@@ -344,17 +400,33 @@ impl Proxy {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
+    fn wait_log(&self, matches: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let text = self.log_text();
+            if matches(&text) {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "proxy log condition not met:\n{text}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn pac(&self) -> Vec<u8> {
         let response = raw_http(self.port, "GET", "/winget-accel.pac", &[]).expect("pac");
         http_body(&response)
     }
 }
 
-impl Drop for Proxy {
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = &self.dir;
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -402,8 +474,19 @@ fn raw_http(
     path: &str,
     headers: &[(&str, &str)],
 ) -> std::io::Result<Vec<u8>> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    raw_http_with_timeout(port, method, path, headers, Duration::from_secs(10))
+}
+
+fn raw_http_with_timeout(
+    port: u16,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+) -> std::io::Result<Vec<u8>> {
+    let mut stream = TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     write!(stream, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n")?;
     for (name, value) in headers {
         write!(stream, "{name}: {value}\r\n")?;
@@ -480,6 +563,49 @@ fn assert_curl_ok(result: &CurlResult) {
         result.output.status.success(),
         "curl failed: {}",
         String::from_utf8_lossy(&result.output.stderr)
+    );
+}
+
+#[test]
+fn startup_timeout_cleans_up_process_and_files() {
+    let proxy = Proxy::launch(&[("http://127.0.0.1:9", UpstreamMode::Normal)], &[]);
+    let dir = proxy._dir.path().to_path_buf();
+    let process = proxy
+        .child
+        .0
+        .as_handle()
+        .try_clone_to_owned()
+        .expect("retain process handle for cleanup check");
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut proxy = proxy;
+        let error = proxy
+            .wait_ready(Duration::ZERO)
+            .expect_err("force startup timeout");
+        panic!("{error}");
+    }));
+    let failure = failure.expect_err("startup timeout must unwind");
+    let message = failure
+        .downcast_ref::<String>()
+        .expect("startup error text");
+    assert!(
+        message.starts_with("proxy did not become ready"),
+        "{message}"
+    );
+    for name in ["stdout.log", "stderr.log", "proxy.log"] {
+        assert!(
+            message.contains(name),
+            "missing startup diagnostics: {message}"
+        );
+    }
+    // 保留原进程句柄来核对退出，避免 PID 复用造成误判。
+    let status = unsafe {
+        windows_sys::Win32::System::Threading::WaitForSingleObject(process.as_raw_handle(), 0)
+    };
+    assert_eq!(status, windows_sys::Win32::Foundation::WAIT_OBJECT_0);
+    assert!(
+        !dir.exists(),
+        "startup failure left test files in {}",
+        dir.display()
     );
 }
 
@@ -589,6 +715,110 @@ fn fails_over_when_all_candidates_ignore_range() {
     assert_curl_ok(&result);
     assert_eq!(result.status, 502);
     assert!(result.body.is_empty());
+}
+
+#[test]
+fn fails_over_from_bad_candidate_to_good_candidate() {
+    let first = HttpUpstream::start(UpstreamMode::Normal);
+    let second = HttpUpstream::start(UpstreamMode::Normal);
+    let proxy = Proxy::start(
+        &[
+            (&first.url(), UpstreamMode::Normal),
+            (&second.url(), UpstreamMode::Normal),
+        ],
+        &[],
+    );
+    let url = asset("failover-range.zip");
+    let (pinned, other) = prime_file_pin(&proxy, &first, &second, &url);
+    pinned.set_mode(UpstreamMode::IgnoreRange);
+
+    // 同一条请求必须先命中已有绑定，再由另一个候选完成；不依赖初次随机选中谁。
+    let result = curl(&proxy, &url, &["-r", "0-99"]);
+    assert_curl_ok(&result);
+    assert_eq!(result.status, 206);
+    assert_eq!(result.body, (0u8..100).collect::<Vec<_>>());
+    let bad_records = pinned.records();
+    let good_records = other.records();
+    assert_eq!(bad_records.len(), 3);
+    assert_eq!(good_records.len(), 1);
+    assert_eq!(bad_records[2].path, format!("/{url}"));
+    assert_eq!(good_records[0].path, bad_records[2].path);
+    assert_eq!(good_records[0].headers["range"], "bytes=0-99");
+    let log = proxy.wait_log(|text| rewrite_lines(text).len() == 3);
+    assert!(rewrite_lines(&log)[2].contains("pick retry=1 "), "{log}");
+}
+
+#[test]
+fn truncated_upstream_body_fails_and_clears_pin() {
+    let first = HttpUpstream::start(UpstreamMode::Normal);
+    let second = HttpUpstream::start(UpstreamMode::Normal);
+    let proxy = Proxy::start(
+        &[
+            (&first.url(), UpstreamMode::Normal),
+            (&second.url(), UpstreamMode::Normal),
+        ],
+        &[],
+    );
+    let url = asset("truncated-range.zip");
+    let (pinned, other) = prime_file_pin(&proxy, &first, &second, &url);
+    pinned.set_mode(UpstreamMode::Truncate);
+    let result = curl(&proxy, &url, &["-r", "0-99"]);
+    assert!(
+        !result.output.status.success(),
+        "上游正文截断时 curl 不应报告成功: {}",
+        String::from_utf8_lossy(&result.output.stderr)
+    );
+    assert_eq!(result.status, 206);
+    assert_eq!(result.body, b"0123456789");
+    assert_eq!(pinned.records().len(), 3);
+    assert!(
+        other.records().is_empty(),
+        "响应已开始发送，不能拼接另一候选的正文"
+    );
+    let log = proxy.wait_log(|text| text.contains("kind=early-eof"));
+    assert!(log.contains("RELAY-ERR"), "{log}");
+    assert!(log.contains("pin_cleared=true"), "{log}");
+
+    // 候选恢复后仍全部健康：若 pin 没有真正删除，这次会显示 bind，而非重新 pick。
+    pinned.set_mode(UpstreamMode::Normal);
+    let recovered = curl(&proxy, &url, &["-r", "0-99"]);
+    assert_curl_ok(&recovered);
+    assert_eq!(recovered.status, 206);
+    assert_eq!(recovered.body, (0u8..100).collect::<Vec<_>>());
+    let log = proxy.wait_log(|text| rewrite_lines(text).len() == 3);
+    assert!(rewrite_lines(&log)[2].contains("pick retry=0 "), "{log}");
+}
+
+fn rewrite_lines(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|line| line.contains(" INF REWRITE "))
+        .collect()
+}
+
+fn prime_file_pin<'a>(
+    proxy: &Proxy,
+    first: &'a HttpUpstream,
+    second: &'a HttpUpstream,
+    url: &str,
+) -> (&'a HttpUpstream, &'a HttpUpstream) {
+    for count in 1..=2 {
+        let result = curl(proxy, url, &["-r", "0-99"]);
+        assert_curl_ok(&result);
+        assert_eq!(result.status, 206);
+        assert_eq!(result.body, (0u8..100).collect::<Vec<_>>());
+        let log = proxy.wait_log(|text| rewrite_lines(text).len() == count);
+        if count == 2 {
+            assert!(rewrite_lines(&log)[1].contains("bind retry=0 "), "{log}");
+        }
+    }
+    let (pinned, other) = if first.records().is_empty() {
+        (second, first)
+    } else {
+        (first, second)
+    };
+    assert_eq!(pinned.records().len(), 2, "同一文件应复用已建立的绑定");
+    assert!(other.records().is_empty());
+    (pinned, other)
 }
 
 #[test]

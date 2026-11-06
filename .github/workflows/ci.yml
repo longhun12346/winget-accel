@@ -40,8 +40,11 @@ jobs:
         shell: pwsh
         run: ./packaging/check-docs-sync.ps1
 
+      - name: 获取锁定依赖（兼容空缓存）
+        run: cargo fetch --locked
+
       - name: clippy（警告即失败）
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --offline -- -D warnings
 
       - name: Rust 单元测试
         run: cargo test --bin winget-accel --offline
@@ -70,7 +73,7 @@ jobs:
           # 两者常落在同一秒，而 cargo 按秒比较 mtime，会认为源码没更新、跳过重编。
           # 实测 2026-11-04 与 2026-11-05 各因此误报一次（"没有真正重编"）。
           (Get-Item src\main.rs).LastWriteTime = (Get-Date).AddMinutes(2)
-          $out = cargo build --release 2>&1
+          $out = cargo build --release --offline 2>&1
           $out | Select-String -Pattern 'Compiling|Finished' | ForEach-Object { $_.Line }
           if (-not ($out | Select-String -Pattern 'Compiling winget-accel')) {
             throw "没有真正重编（cargo 认为已是最新），这次的比较无效"

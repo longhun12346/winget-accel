@@ -6,6 +6,8 @@
 .DESCRIPTION
     本地和 CI 共用这一个脚本，避免两边产出的包结构不一致。
 
+    构建始终离线。首次使用先执行 cargo fetch --locked，或运行 packaging/verify.ps1。
+
     包内容：
       winget-accel.exe          单文件二进制（静态 CRT，无运行时依赖）
       QUICKSTART.txt            三步上手 + 排障
@@ -41,7 +43,7 @@ try {
 
     if (-not $SkipBuild) {
         Write-Host '构建 release...'
-        & cargo build --release
+        & cargo build --release --offline
         if ($LASTEXITCODE -ne 0) { throw "cargo build 失败（退出码 $LASTEXITCODE）" }
     }
 

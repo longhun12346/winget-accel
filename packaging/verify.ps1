@@ -26,6 +26,9 @@
     额外验证**交付物**：`dist` 里的 zip 解压后能否独立运行、哈希是否自洽、运行产物是否
     落在包目录（约 20 秒，含重新打包）。
 
+.PARAMETER Offline
+    使用已缓存的 Cargo 依赖，跳过联网获取。其余构建和测试始终离线执行。
+
 .EXAMPLE
     ./packaging/verify.ps1
     ./packaging/verify.ps1 -Soak
@@ -36,7 +39,8 @@ param(
     [switch]$Soak,
     [switch]$SkipRepro,
     [switch]$NoEnv,
-    [switch]$Package
+    [switch]$Package,
+    [switch]$Offline
 )
 
 $ErrorActionPreference = 'Stop'
@@ -83,6 +87,13 @@ try {
     Invoke-Step 'cargo fmt --check' {
         cargo fmt --all -- --check
         if ($LASTEXITCODE -ne 0) { throw "格式不一致（执行 cargo fmt --all）" }
+    }
+
+    if (-not $Offline) {
+        Invoke-Step '获取锁定依赖' {
+            cargo fetch --locked
+            if ($LASTEXITCODE -ne 0) { throw '依赖获取失败；已有缓存可用 -Offline 跳过' }
+        }
     }
 
     Invoke-Step 'cargo clippy -D warnings' {

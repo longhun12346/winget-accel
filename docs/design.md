@@ -201,7 +201,8 @@ Rust 单测覆盖解析、证书约束、PAC、健康状态、重试和恢复逻
 
 ```powershell
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+cargo fetch --locked
+cargo clippy --all-targets --offline -- -D warnings
 cargo test --bin winget-accel --offline
 cargo test --test protocol --offline -- --test-threads=1
 .\packaging\check-docs-sync.ps1

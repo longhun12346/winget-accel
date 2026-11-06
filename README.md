@@ -139,16 +139,20 @@ CA 私钥以明文保存在 `certs\ca-key.pem`。不要把包含 `certs` 的目�
 
 ```powershell
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+cargo fetch --locked
+cargo clippy --all-targets --offline -- -D warnings
 cargo test --bin winget-accel --offline
 cargo test --test protocol --offline -- --test-threads=1
-cargo build --release
+cargo build --release --offline
 
 .\packaging\check-docs-sync.ps1
 .\packaging\verify.ps1
 .\packaging\make-release.ps1
 .\packaging\verify-package.ps1
 ```
+
+首次构建先用 `cargo fetch --locked` 下载锁文件中的依赖，之后测试和构建离线执行。
+`verify.ps1` 默认先获取依赖；已有缓存且需要全程离线时，使用 `verify.ps1 -Offline`。
 
 协议测试使用本地假上游，默认不访问外网：
 

@@ -57,7 +57,7 @@ try {
     # 代码里有而文档没有是允许的——`--watchdog` 就是程序自己拉起子进程用的内部参数，
     # 不该出现在用户文档里。所以别为了"齐全"去补它。
     $external = @(
-        '--all', '--check', '--all-targets', '--release', '--bin', '--offline', '--test', '--test-threads', '--tb', '--nocapture',
+        '--all', '--check', '--all-targets', '--release', '--bin', '--offline', '--locked', '--test', '--test-threads', '--tb', '--nocapture',
         '--ssl-no-revoke', '--max-time', '--output', '--no-run', '--collect-only', '--id',
         '--download-directory', '--version-check', '--help-docs',
         # curl 与 winget 自己的参数（design.md §12 的对比实验里会写到）
