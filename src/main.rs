@@ -174,8 +174,10 @@ fn main() -> Result<()> {
     logger.info(
         "正在检查直连路由和加速器候选。此间系统代理尚未接管，请等下面的「已就绪」再开始下载。",
     );
-    proxy.routing.refresh(&logger);
-    proxy.bootstrap_health();
+    std::thread::scope(|scope| {
+        scope.spawn(|| proxy.routing.refresh(&logger));
+        proxy.bootstrap_health();
+    });
     let _env_guard = if let Some(lock) = &pac_lock {
         Some(autoenv::EnvGuard::enable(
             &app.cert_dir,

@@ -224,6 +224,7 @@ pub struct Proxy {
     started: std::time::Instant,
     /// 运行期学到的"某候选对某 host 不可用"（见 `learned` 模块的文件头说明）。
     learned: crate::learned::LearnedCaps,
+    probes: probe::Scheduler,
 }
 
 impl Proxy {
@@ -236,6 +237,7 @@ impl Proxy {
     ) -> Self {
         Self {
             routing: Arc::new(crate::routing::Router::new(&app)),
+            probes: probe::Scheduler::new(app.accels.len()),
             app,
             ca,
             stats,
@@ -617,6 +619,12 @@ impl Proxy {
         let mut pins = self.pins.lock().expect("pin 锁中毒");
         pins.remove(&key);
     }
+    fn usable_for(&self, idx: usize, host: &str) -> bool {
+        self.app.accel_supports(idx, host)
+            && !self.learned.is_blocked(idx, host)
+            && !self.cooldowns.is_blocked_for(idx, host)
+    }
+
     /// 选候选：优先复用同一文件的 pin，否则加权随机。
     fn pick_for(
         &self,
@@ -667,6 +675,9 @@ impl Proxy {
                 );
             }
         }
+        if picked.is_none() {
+            self.probes.request(host);
+        }
         picked.map(|(i, a)| (i, a, false))
     }
     /// 记一次加速器失败；跨过阈值时打一条告警（便于用户从日志判断是否被切换）。
@@ -697,6 +708,7 @@ impl Proxy {
                 accel.host
             ));
         }
+        self.probes.wake();
         self.report_health_state();
     }
 
@@ -704,7 +716,10 @@ impl Proxy {
     ///
     /// 只在状态翻转时报：否则每个失败请求都会刷一条，日志里真正那条反而被埋掉。
     fn report_health_state(&self) {
-        let down = self.health.all_unhealthy();
+        let down = self
+            .health
+            .ranked_verified_where(|idx| !self.cooldowns.is_service_blocked(idx))
+            .is_empty();
         let was_down = self.down.swap(down, Ordering::Relaxed);
 
         if down && !was_down {

@@ -1,226 +1,272 @@
-//! 候选可达性、资产测速与后台健康探测。
+//! 本机候选验证：有界异步竞争、小运行池、轮换探索和失败退避。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::Proxy;
+use crate::health::POOL_CANDIDATES;
 use crate::http;
 use crate::log::Level;
 use crate::rewrite;
 
-use super::Proxy;
-
-/// 启动阶段验证候选的总预算。超过就先去监听，剩余候选交给后台探测。
-const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(30);
-/// 一轮探测的并发数。6 是折中：43 个候选串行要 120 秒，全开对第三方不礼貌。
-const PROBE_CONCURRENCY: usize = 6;
-
-/// 全挂状态下的重探间隔。
-///
-/// 比 `health.intervalSeconds`（默认 300 s）短得多：全挂时每个请求都立刻 502，
-/// 用户唯一能做的是等，所以恢复必须在一分钟内被尝试，不能等满一个周期。
-const RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
-
-/// 未启用例行探测时的空闲巡检间隔：只用来发现"是不是变成全挂了"。
-const DISABLED_IDLE_CHECK: Duration = Duration::from_secs(60);
-
-/// 这一轮要不要探测？
-///
-/// 例行探测由 `health.enabled` 控制；**恢复探测不受它控制**——
-/// 全挂状态下必须继续探，否则没有任何路径能让候选恢复
-/// （所有请求都 502，成功样本永远不会产生）。
-fn should_probe(enabled: bool, all_unhealthy: bool) -> bool {
-    enabled || all_unhealthy
-}
-
-/// 恢复探测是否该提前结束？
-///
-/// 只有"这轮是恢复探测"且"已经有候选恢复"时提前收工。
-/// 例行探测不提前结束：它的作用是把**所有**候选的状态刷新一遍，
-/// 中途停会让后面那些候选永远停在旧状态。
-fn should_stop_probing(stop_when_healthy: bool, healthy: usize) -> bool {
-    stop_when_healthy && healthy > 0
-}
-
-/// 单个候选的测速超时。
-///
-/// 从 15 秒降到 5 秒：候选池有 43 个后，15 秒意味着个别挂住的域名
-/// 能拖垮整轮探测。5 秒足够拿到 64 KiB（实测最快 30 ms、最慢约 3 秒）。
+const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(8);
+const PROBE_CONCURRENCY: usize = 4;
+const BACKGROUND_CONCURRENCY: usize = 2;
+const BOOTSTRAP_TARGET: usize = 2;
 const PROBE_SPEED_TIMEOUT: Duration = Duration::from_secs(5);
+const RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+const SCHEDULER_TICK: Duration = Duration::from_secs(5);
+
+struct Retry {
+    next: Instant,
+    failures: u32,
+}
+struct Schedule {
+    entries: Vec<Retry>,
+    cursor: usize,
+    next_explore: Instant,
+}
+
+/// 取消任务不记录失败；只有完整结束的探测才推进退避。
+pub(super) struct Scheduler {
+    state: Mutex<Schedule>,
+    demand: Mutex<Vec<String>>,
+    wake: tokio::sync::Notify,
+}
+impl Scheduler {
+    pub(super) fn new(count: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            state: Mutex::new(Schedule {
+                entries: (0..count)
+                    .map(|_| Retry {
+                        next: now,
+                        failures: 0,
+                    })
+                    .collect(),
+                cursor: 0,
+                next_explore: now,
+            }),
+            demand: Mutex::new(Vec::new()),
+            wake: tokio::sync::Notify::new(),
+        }
+    }
+    pub(super) fn request(&self, host: &str) {
+        let mut demand = self.demand.lock().expect("probe demand lock");
+        if !demand.iter().any(|h| h == host) {
+            demand.push(host.to_owned());
+            self.wake.notify_one();
+        }
+    }
+    pub(super) fn wake(&self) {
+        self.wake.notify_one();
+    }
+    fn completed(&self, idx: usize, success: bool, interval: Duration) {
+        let mut state = self.state.lock().expect("probe schedule lock");
+        let entry = &mut state.entries[idx];
+        let delay = if success {
+            entry.failures = 0;
+            interval
+        } else {
+            entry.failures = entry.failures.saturating_add(1);
+            RECOVERY_INTERVAL
+                .saturating_mul(1 << entry.failures.saturating_sub(1).min(6))
+                .min(Duration::from_secs(30 * 60))
+        };
+        entry.next = Instant::now() + delay;
+    }
+}
 
 impl Proxy {
-    /// 周期探测所有候选。**单候选也探**——否则一旦被判死就永久 502，没有任何恢复路径。
-    ///
-    /// 只探各自 origin 的根路径，收到任意 HTTP 响应（含 404）即视为可达；
-    /// 不能拿 GitHub 资产路径去探，受限网络下那里本身就不通，会把候选全部误判。
-    ///
-    /// `health.enabled = false` 只关掉**例行**探测，恢复探测照跑（见 [`should_probe`]）：
-    /// 否则启动那轮把候选全判死之后就没有任何恢复路径了——所有请求都 502，
-    /// `record_success` 永远等不到一次成功，等于永久失效。
     pub(super) fn spawn_health_prober(self: &Arc<Self>) {
-        let proxy = Arc::clone(self);
-
-        std::thread::spawn(move || loop {
-            let enabled = proxy.app.health_enabled;
-            let down = proxy.health.all_unhealthy();
-
-            if should_probe(enabled, down) {
-                // 全挂恢复时提前收工：有一个候选能用就够，不必扫完 43 个。
-                // 周期性巡检仅对已验证且仍健康的候选省略测速。
-                proxy.probe_round(down, false);
-                proxy.report_health_state();
-            }
-
-            // 全挂时缩短重试间隔，让恢复更快被发现
-            let wait = if proxy.health.all_unhealthy() {
-                RECOVERY_INTERVAL
-            } else if enabled {
-                proxy.app.health_interval
-            } else {
-                // 没开例行探测、也没全挂：只定期看一眼"是不是变成全挂了"
-                DISABLED_IDLE_CHECK
-            };
-            std::thread::sleep(wait);
+        let proxy = self.clone();
+        // 复用已有 Tokio 运行时；异步任务在 block_on 返回后仍由共享运行时驱动。
+        http::block_on(async move {
+            tokio::spawn(async move {
+                loop {
+                    let notified = proxy.probes.wake.notified();
+                    let (candidates, target) = proxy.maintenance_candidates();
+                    if !candidates.is_empty() {
+                        proxy
+                            .verify_candidates(
+                                candidates,
+                                target,
+                                BACKGROUND_CONCURRENCY,
+                                BOOTSTRAP_BUDGET,
+                            )
+                            .await;
+                        proxy.report_health_state();
+                    }
+                    let _ = tokio::time::timeout(SCHEDULER_TICK, notified).await;
+                }
+            });
         });
     }
 
-    /// Verify a small seed set before any download can use a candidate.
-    /// Unknown candidates are intentionally not eligible for downloads.
-    pub fn bootstrap_health(&self) {
-        let list: Vec<(usize, rewrite::Accel)> =
-            self.health.accels().iter().cloned().enumerate().collect();
-        if list.is_empty() {
-            self.log
-                .error("NO-VERIFIED-ACCEL 没有配置任何加速器候选，下载会立即返回 502");
-            return;
-        }
-        // 启动验证：逐批（每批 PROBE_CONCURRENCY 个）探测，**一旦有一批通过就停**。
-        //
-        // 早期只探第一批（`.take(1)`）：前 6 个候选恰好都挂、第 7 个可用时，
-        // 要等后台整轮探测跑完才可能恢复，期间所有下载都被 502 挡掉。
-        // 现在向后继续探，同时用 BOOTSTRAP_BUDGET 兜住启动时长。
-        let deadline = std::time::Instant::now() + BOOTSTRAP_BUDGET;
-        let mut probed = 0usize;
-        for chunk in list.chunks(PROBE_CONCURRENCY) {
-            if self.health.healthy_count() > 0 || std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::scope(|scope| {
-                for (idx, accel) in chunk {
-                    // 启动时**要**测速：初始权重需要一份速度基准
-                    scope.spawn(move || self.probe_one(*idx, accel, true));
-                }
-            });
-            probed += chunk.len();
-        }
+    /// 找到两个可用候选即可就绪；达到总期限时取消剩余 I/O，不把取消记成失败。
+    pub fn bootstrap_health(self: &Arc<Self>) {
+        let candidates = (0..self.app.accels.len()).collect();
+        let started = Instant::now();
+        let probed = http::block_on(self.verify_candidates(
+            candidates,
+            Some(BOOTSTRAP_TARGET),
+            PROBE_CONCURRENCY,
+            BOOTSTRAP_BUDGET,
+        ));
         let healthy = self.health.healthy_count();
         if healthy > 0 {
-            self.log.info(&format!(
-                "HEALTH-READY 已有 {healthy} 个候选通过验证（本轮探测 {probed} 个）"
-            ));
+            self.log.info(&format!("HEALTH-READY 已有 {healthy} 个候选通过验证（完成 {probed} 个，{:.2}s），后台按需补充", started.elapsed().as_secs_f64()));
         } else {
-            self.log.error(&format!(
-                "NO-VERIFIED-ACCEL 启动批次（{probed} 个候选）均未通过验证，后台继续探测；期间请求返回 502"
-            ));
-            // 自定义测速资产是"全部失败"的常见原因之一，而且从
-            // `SPEED … 实测失败（非 206 或数据不足）` 看不出这一点：
-            // 加速器大多只代理 GitHub 域，把 probeUrl 指到别处会让**每个**候选都失败。
-            // 实测过：probeUrl 设为 https://example.com/64k.bin 时，gh-proxy.com 直接判死。
+            self.log.error(
+                "NO-VERIFIED-ACCEL 启动验证未找到可用候选，后台继续轮换恢复；加速请求暂时返回 502",
+            );
             if self.app.health_probe_custom {
                 self.log.warn(&format!(
-                    "提示：当前用的是自定义测速资产 {}。加速器一般只代理 GitHub 域的地址，\
-                     指向其它域名会让所有候选都「实测失败」。可以去掉 health.probeUrl 用默认值，\
-                     或先跑 --doctor 看 probe 这一项",
+                    "提示：请检查自定义 health.probeUrl {}；候选必须能代理这个 HTTPS GitHub 资产",
                     self.app.health_probe
                 ));
             }
         }
     }
 
-    /// 一轮完整探测：**分批并发**，每批 [`PROBE_CONCURRENCY`] 个。
-    ///
-    /// 为什么要并发：候选池从 4 个涨到 43 个后，串行一轮要 120 秒
-    /// （实测 5 个 14 秒）。这段时间内大部分候选是 `Unknown`，
-    /// 权重只能按乐观值给，前几分钟的下载可能反复打到死候选。
-    ///
-    /// 为什么限 6 路而不是全开：
-    /// - 这些是第三方免费服务，43 个一起打过去不礼貌，也容易触发 429；
-    /// - 6 路 × 64 KiB 的瞬时流量对用户网络负担可忽略。
-    ///
-    /// 用分块 + `thread::scope` 而不是线程池：块内线程在 scope 结束时自动 join，
-    /// 不需要额外的池实现，也不会泄漏线程。
-    ///
-    /// `stop_when_healthy` 为真时（全挂恢复场景），一旦有候选恢复就结束这一轮：
-    /// 43 个候选全探完约 90 秒，而恢复只需要"有一个能用"——
-    /// 剩下的候选留给下一轮，用户不必为别人的失败继续等待。
-    ///
-    /// `with_speed` 为真则所有候选测速。周期性巡检用 `false`：
-    /// 只对已验证且仍健康的候选省略 64 KiB 资产下载，其速度由真实下载样本更新；
-    /// 未验证或被排除的候选仍须测速，根路径可达不足以恢复下载资格。
-    fn probe_round(&self, stop_when_healthy: bool, with_speed: bool) {
-        // 快照一份候选，避免持有锁跨线程
-        let list: Vec<(usize, rewrite::Accel)> =
-            self.health.accels().iter().cloned().enumerate().collect();
-
-        for chunk in list.chunks(PROBE_CONCURRENCY) {
-            // 检查点放在每批之间：批内是并发探测，无法中断单个候选
-            if should_stop_probing(stop_when_healthy, self.health.healthy_count()) {
+    async fn verify_candidates(
+        self: &Arc<Self>,
+        candidates: Vec<usize>,
+        target: Option<usize>,
+        concurrency: usize,
+        budget: Duration,
+    ) -> usize {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut queue = candidates.into_iter();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut completed = 0;
+        loop {
+            if target.is_some_and(|target| self.health.healthy_count() >= target)
+                || tokio::time::Instant::now() >= deadline
+            {
                 break;
             }
-            std::thread::scope(|scope| {
-                for (idx, accel) in chunk {
-                    scope.spawn(move || self.probe_one(*idx, accel, with_speed));
+            while tasks.len() < concurrency {
+                let Some(idx) = queue.next() else {
+                    break;
+                };
+                let accel = self.app.accels[idx].clone();
+                let asset = self.app.health_probe.clone();
+                let duration = PROBE_SPEED_TIMEOUT
+                    .min(self.app.health_timeout)
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                // 游标在派发时推进，取消的慢节点不会永远挡在后续候选之前。
+                self.probes
+                    .state
+                    .lock()
+                    .expect("probe schedule lock")
+                    .cursor = (idx + 1) % self.app.accels.len();
+                tasks
+                    .spawn(async move { (idx, probe_speed_async(&accel, duration, &asset).await) });
+            }
+            if tasks.is_empty() {
+                break;
+            }
+            match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+                Ok(Some(Ok((idx, result)))) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    completed += 1;
+                    match result {
+                        Some(kbps) => self.health.seed_speed(idx, kbps),
+                        None => self.health.mark(idx, false),
+                    }
+                    let success = self.health.is_healthy(idx);
+                    self.probes
+                        .completed(idx, success, self.app.health_interval);
+                    self.log.log(
+                        if success { Level::Debug } else { Level::Warn },
+                        &format!(
+                            "SPEED {} -> {}",
+                            self.app.accels[idx].host,
+                            result.map_or_else(
+                                || "实测失败（非 206、范围错误、超时或数据不足），已排除".into(),
+                                |kbps| format!("{kbps:.0} KB/s 本机短测 healthy={success}")
+                            ),
+                        ),
+                    );
                 }
-            });
+                Ok(Some(Err(error))) => self.log.warn(&format!("HEALTH 探测任务异常: {error}")),
+                _ => break,
+            }
         }
+        tasks.shutdown().await;
+        completed
     }
 
-    /// 探测单个候选：先判可达；`with_speed` 为真时再量吞吐。
-    ///
-    /// 周期性巡检用 `with_speed = false`，已验证且仍健康的候选只打根路径；
-    /// 其余候选必须重新通过资产验证，首页可达不能直接恢复下载资格。
-    fn probe_one(&self, idx: usize, accel: &rewrite::Accel, with_speed: bool) {
-        let needs_speed = with_speed || self.health.needs_verification(idx);
-        let ok = probe(accel, self.app.health_timeout);
-        if !ok {
-            self.health.mark(idx, false);
-            self.log
-                .log(Level::Debug, &format!("HEALTH {} -> fail", accel.host));
-            return;
+    fn maintenance_candidates(&self) -> (Vec<usize>, Option<usize>) {
+        let eligible = |idx| !self.cooldowns.is_service_blocked(idx);
+        let pool: Vec<_> = self
+            .health
+            .ranked_verified_where(eligible)
+            .into_iter()
+            .take(POOL_CANDIDATES)
+            .collect();
+        let mut demand = self.probes.demand.lock().expect("probe demand lock");
+        demand.retain(|host| {
+            self.health
+                .ranked_verified_where(|idx| self.usable_for(idx, host))
+                .is_empty()
+        });
+        if !self.app.health_enabled && !pool.is_empty() && demand.is_empty() {
+            return (Vec::new(), None);
         }
-        if !needs_speed {
-            self.health.mark(idx, true);
-            self.log.log(
-                Level::Debug,
-                &format!("HEALTH {} -> ok（本轮不测速）", accel.host),
-            );
-            return;
+        let now = Instant::now();
+        let mut schedule = self.probes.state.lock().expect("probe schedule lock");
+        let count = schedule.entries.len();
+        if count == 0 {
+            return (Vec::new(), None);
         }
-
-        // 只判"明显不可用/太慢"，不做排序（排序靠真实下载样本）
-        match probe_speed(accel, PROBE_SPEED_TIMEOUT, &self.app.health_probe) {
-            Some(kbps) => {
-                self.health.seed_speed(idx, kbps);
-                self.log.log(
-                    Level::Debug,
-                    &format!("SPEED {} -> {:.0} KB/s", accel.host, kbps),
-                );
+        let due = |idx: usize| schedule.entries[idx].next <= now && eligible(idx);
+        let mut candidates: Vec<_> = pool
+            .iter()
+            .copied()
+            .filter(|idx| {
+                due(*idx)
+                    && (demand.is_empty() || demand.iter().any(|host| self.usable_for(*idx, host)))
+                    && !self
+                        .health
+                        .recently_succeeded(*idx, self.app.health_interval)
+            })
+            .collect();
+        let fill = pool.len() < POOL_CANDIDATES;
+        // 满池后每个配置周期仅探索两个节点；有下载时让出带宽。
+        let explore = fill
+            || !demand.is_empty()
+            || (now >= schedule.next_explore
+                && self.active.load(std::sync::atomic::Ordering::Relaxed) == 0);
+        let mut explored = 0;
+        if explore {
+            for offset in 0..count {
+                let idx = (schedule.cursor + offset) % count;
+                if candidates.contains(&idx) || pool.contains(&idx) || !due(idx) {
+                    continue;
+                }
+                if !demand.is_empty() && !demand.iter().any(|host| self.usable_for(idx, host)) {
+                    continue;
+                }
+                candidates.push(idx);
+                explored += 1;
+                if !fill && demand.is_empty() && explored >= 2 {
+                    break;
+                }
             }
-            None => {
-                // 拿不到探测资产就是"没通过实测"，一律排除，内置的也一样。
-                //
-                // 这里曾经写成"内置候选保留可用"，理由是"探测资产不可达
-                // 不代表服务不可用"。那个理由是错的，而且动机更错：
-                // 当时是为了让协议用例通过才把生产逻辑改弱（夹具对探测请求
-                // 返回 200 而不是 206，导致探测必然失败）。
-                // 正确做法是让夹具正确响应，而不是放宽生产判据——
-                // 没通过实测的候选不该进下载路径，内置的也一样。
-                self.health.mark(idx, false);
-                self.log.warn(&format!(
-                    "SPEED {} -> 实测失败（非 206 或数据不足），已排除",
-                    accel.host
-                ));
-            }
         }
+        if explored > 0 {
+            schedule.next_explore = now + self.app.health_interval;
+        }
+        let target = if fill && demand.is_empty() {
+            Some(POOL_CANDIDATES)
+        } else {
+            None
+        };
+        (candidates, target)
     }
 }
 
@@ -231,11 +277,10 @@ impl Proxy {
 ///
 /// **它绑着一个具体版本号，这是已知弱点**：上游一旦删掉该资产，所有候选都会
 /// "测速失败"→ 全部判死 → 全站 502。所以该值可通过配置 `health.probeUrl` 覆盖
-/// （见 `docs/design.md` §7），并且 `probe_one` 会在整轮测速全失败时给出提示。
+/// （见 docs/design.md）；启动验证没有可用结果时会提示检查自定义资产。
 pub const DEFAULT_PROBE_ASSET: &str =
     "https://github.com/git-for-windows/git/releases/download/v2.43.0.windows.1/Git-2.43.0-64-bit.exe";
-/// 探测采样量。64 KB 实测约 1.6–1.9 秒（256 KB 要 5–7 秒），
-/// 分批并发才不会把启动拖到半分钟以上，且仍能分辨速度量级。
+/// 本机粗测采样量。要求完整 64 KiB，DNS/TLS/响应头和正文共用单次期限。
 const PROBE_BYTES: u64 = 64 * 1024;
 
 /// 把基准资产拆成 (host, path+query)。只接受 https，避免把 http 资产
@@ -256,40 +301,50 @@ pub(crate) fn split_asset(asset: &str) -> Option<(String, String)> {
 }
 
 pub(crate) fn probe_speed(accel: &rewrite::Accel, duration: Duration, asset: &str) -> Option<f64> {
+    http::block_on(probe_speed_async(accel, duration, asset))
+}
+
+async fn probe_speed_async(accel: &rewrite::Accel, duration: Duration, asset: &str) -> Option<f64> {
     let (host, path) = split_asset(asset)?;
-    http::block_on(async {
-        tokio::time::timeout(duration, async {
-            let started = Instant::now();
-            let mut headers = hyper::HeaderMap::new();
-            headers.insert(
-                "host",
-                rewrite::host_header(accel.scheme, &accel.host, accel.port)
-                    .parse()
-                    .ok()?,
-            );
-            headers.insert("user-agent", "winget-accel-probe".parse().ok()?);
-            headers.insert(
-                "range",
-                format!("bytes=0-{}", PROBE_BYTES - 1).parse().ok()?,
-            );
-            let request =
-                http::request("GET", &rewrite::rewrite_path(accel, &host, &path), headers).ok()?;
-            let response = http::send(accel.scheme, &accel.host, accel.port, request, duration)
-                .await
-                .ok()?;
-            if response.status() != 206 {
-                return None;
-            }
-            let body = http::read_body(response, PROBE_BYTES as usize).await.ok()?;
-            if body.len() < PROBE_BYTES as usize / 2 {
-                return None;
-            }
-            Some((body.len() as f64 / 1024.0) / started.elapsed().as_secs_f64().max(f64::EPSILON))
-        })
-        .await
-        .ok()
-        .flatten()
+    tokio::time::timeout(duration, async {
+        let started = Instant::now();
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "host",
+            rewrite::host_header(accel.scheme, &accel.host, accel.port)
+                .parse()
+                .ok()?,
+        );
+        headers.insert("user-agent", "winget-accel-probe".parse().ok()?);
+        headers.insert(
+            "range",
+            format!("bytes=0-{}", PROBE_BYTES - 1).parse().ok()?,
+        );
+        let request =
+            http::request("GET", &rewrite::rewrite_path(accel, &host, &path), headers).ok()?;
+        let response = http::send(accel.scheme, &accel.host, accel.port, request, duration)
+            .await
+            .ok()?;
+        if response.status() != 206 {
+            return None;
+        }
+        let mut requested = hyper::HeaderMap::new();
+        requested.insert(
+            "range",
+            format!("bytes=0-{}", PROBE_BYTES - 1).parse().ok()?,
+        );
+        if !super::range_response_matches(&requested, response.headers()) {
+            return None;
+        }
+        let body = http::read_body(response, PROBE_BYTES as usize).await.ok()?;
+        if body.len() != PROBE_BYTES as usize {
+            return None;
+        }
+        Some((body.len() as f64 / 1024.0) / started.elapsed().as_secs_f64().max(f64::EPSILON))
     })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Root reachability alone never qualifies a candidate for download scheduling.
@@ -314,6 +369,211 @@ pub fn probe(accel: &rewrite::Accel, duration: Duration) -> bool {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    struct Fixture {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+    impl Fixture {
+        async fn start(delay: Duration, status: u16) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = requests.clone();
+            let task = tokio::spawn(async move {
+                let mut clients = tokio::task::JoinSet::new();
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    while clients.try_join_next().is_some() {}
+                    let recorded = recorded.clone();
+                    clients.spawn(async move {
+                        let mut head = Vec::new();
+                        while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
+                            let mut byte = [0];
+                            if socket.read_exact(&mut byte).await.is_err() { return; }
+                            head.push(byte[0]);
+                        }
+                        recorded.lock().unwrap().push(String::from_utf8(head).unwrap());
+                        tokio::time::sleep(delay).await;
+                        let head = format!("HTTP/1.1 {status} Result\r\nContent-Length: 65536\r\nContent-Range: bytes 0-65535/1048576\r\nConnection: close\r\n\r\n");
+                        if socket.write_all(head.as_bytes()).await.is_ok() {
+                            let _ = socket.write_all(&vec![b'P'; PROBE_BYTES as usize]).await;
+                        }
+                    });
+                }
+            });
+            Self {
+                url,
+                requests,
+                task,
+            }
+        }
+    }
+    struct Sandbox {
+        proxy: Arc<Proxy>,
+        root: std::path::PathBuf,
+    }
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+    fn sandbox(urls: &[&str]) -> Sandbox {
+        let root = std::env::temp_dir().join(format!("wg-scheduler-{:016x}", fastrand::u64(..)));
+        let app = Arc::new(
+            crate::config::App::new(crate::config::FileConfig {
+                accelerators: urls
+                    .iter()
+                    .enumerate()
+                    .map(|(i, url)| crate::config::AcceleratorCfg {
+                        name: format!("fixture-{i}"),
+                        template: url.to_string(),
+                        priority: i as u32,
+                        hosts: Vec::new(),
+                    })
+                    .collect(),
+                ..crate::config::FileConfig::default()
+            })
+            .unwrap(),
+        );
+        let ca = Arc::new(
+            crate::ca::CertAuthority::load_or_create(&root, &app.rewrite_hosts, false).unwrap(),
+        );
+        let tracker = Arc::new(crate::health::Tracker::new(app.accels.clone(), 2));
+        let proxy = Arc::new(Proxy::new(
+            app,
+            ca,
+            Arc::new(crate::stats::Stats::default()),
+            Arc::new(crate::log::Logger::new(Level::Error, root.join("test.log"))),
+            tracker,
+        ));
+        Sandbox { proxy, root }
+    }
+
+    #[test]
+    fn completed_results_bypass_stalled_peers_and_cancellation_is_not_failure() {
+        http::block_on(async {
+            let slow = Fixture::start(Duration::from_secs(3), 206).await;
+            let fast = Fixture::start(Duration::ZERO, 206).await;
+            let bad = Fixture::start(Duration::ZERO, 503).await;
+            let next = Fixture::start(Duration::from_millis(20), 206).await;
+            let later = Fixture::start(Duration::ZERO, 206).await;
+            let sandbox = sandbox(&[&slow.url, &fast.url, &bad.url, &next.url, &later.url]);
+            let proxy = &sandbox.proxy;
+            let started = Instant::now();
+            let completed = proxy
+                .verify_candidates((0..5).collect(), Some(2), 2, Duration::from_secs(2))
+                .await;
+            assert_eq!(completed, 3);
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "不能等待同批的慢候选"
+            );
+            assert_eq!(proxy.health.snapshot()[0].1, crate::health::Health::Unknown);
+            assert_eq!(proxy.probes.state.lock().unwrap().entries[0].failures, 0);
+            assert_eq!(proxy.health.healthy_count(), 2);
+            assert!(later.requests.lock().unwrap().is_empty());
+            let request = &fast.requests.lock().unwrap()[0];
+            assert!(
+                request.starts_with("GET /https://"),
+                "直接请求资产，不访问首页: {request}"
+            );
+        });
+    }
+
+    #[test]
+    fn total_deadline_cancels_io_and_does_not_launch_the_entire_catalog() {
+        http::block_on(async {
+            let slow = Fixture::start(Duration::from_secs(3), 206).await;
+            let sandbox = sandbox(&[slow.url.as_str(); 10]);
+            let proxy = &sandbox.proxy;
+            let started = Instant::now();
+            proxy
+                .verify_candidates((0..10).collect(), Some(2), 4, Duration::from_millis(150))
+                .await;
+            assert!(started.elapsed() < Duration::from_millis(800));
+            assert_eq!(slow.requests.lock().unwrap().len(), 4);
+            assert_eq!(proxy.health.healthy_count(), 0);
+            assert!(
+                proxy
+                    .probes
+                    .state
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .all(|entry| entry.failures == 0),
+                "总期限取消不能累计失败"
+            );
+            // 未派发的项始终保留为 Unknown；没有按清单长度放大等待期限。
+            for (_, health) in proxy.health.snapshot().into_iter().skip(4) {
+                assert_eq!(health, crate::health::Health::Unknown);
+            }
+        });
+    }
+
+    #[test]
+    fn full_pool_reuses_downloads_rotates_discovery_and_backs_off_failures() {
+        http::block_on(async {
+            let bad = Fixture::start(Duration::ZERO, 503).await;
+            let sandbox = sandbox(&[bad.url.as_str(); 12]);
+            let proxy = &sandbox.proxy;
+            for i in 0..8 {
+                proxy.health.seed_speed(i, 100.0);
+            }
+            let (candidates, target) = proxy.maintenance_candidates();
+            assert_eq!(
+                candidates,
+                vec![8, 9],
+                "只探索两项，已有近期成功的八项不重复测速"
+            );
+            proxy
+                .verify_candidates(candidates, target, 2, Duration::from_secs(1))
+                .await;
+            assert!(
+                proxy.maintenance_candidates().0.is_empty(),
+                "不能每五秒都探索或重试失败项"
+            );
+            proxy.probes.state.lock().unwrap().next_explore = Instant::now();
+            assert_eq!(
+                proxy.maintenance_candidates().0,
+                vec![10, 11],
+                "下一轮继续向后探索"
+            );
+            proxy.probes.completed(8, false, Duration::from_secs(300));
+            let state = proxy.probes.state.lock().unwrap();
+            assert_eq!(state.entries[8].failures, 2);
+            assert!(state.entries[8].next.duration_since(Instant::now()) > Duration::from_secs(55));
+        });
+    }
+
+    #[test]
+    fn missing_host_support_expands_beyond_pool_even_with_routine_checks_disabled() {
+        let mut sandbox = sandbox(&["http://127.0.0.1:9"; 10]);
+        let proxy = Arc::get_mut(&mut sandbox.proxy).unwrap();
+        let app = Arc::get_mut(&mut proxy.app).unwrap();
+        app.health_enabled = false;
+        // caps 由配置私有持有，使用已学到的不支持证据模拟特定目标的缺口。
+        for i in 0..8 {
+            proxy.health.seed_speed(i, 100.0);
+            proxy.learned.note_unsupported(i, "codeload.github.com");
+            proxy.learned.note_unsupported(i, "codeload.github.com");
+        }
+        assert!(proxy.maintenance_candidates().0.is_empty());
+        proxy.probes.request("codeload.github.com");
+        assert_eq!(proxy.maintenance_candidates().0, vec![8, 9]);
+        proxy.health.seed_speed(8, 100.0);
+        assert!(
+            proxy.maintenance_candidates().0.is_empty(),
+            "应急恢复成功后不能重新开启已关闭的例行巡检"
+        );
+    }
 
     fn sample(response: Vec<u8>) -> Option<f64> {
         use std::io::{Read, Write};
@@ -390,36 +650,6 @@ mod tests {
         assert!(!probe(&http_accel(port), Duration::from_millis(50)));
         assert!(started.elapsed() < Duration::from_millis(900));
         server.join().unwrap();
-    }
-    /// `health.enabled = false` 不能连"恢复探测"一起关掉。
-    ///
-    /// 否则存在一个真实的死锁：启动那轮 bootstrap 把候选全判死后，后台线程根本不转，
-    /// 所有下载立刻 502，`record_success` 永远等不到成功样本——永久失效且无法自愈。
-    #[test]
-    fn recovery_probe_survives_health_disabled() {
-        // 开了例行探测：总是探
-        assert!(should_probe(true, false));
-        assert!(should_probe(true, true));
-        // 关了例行探测：平时不探，但全挂时必须探
-        assert!(!should_probe(false, false), "关掉后不该做例行探测");
-        assert!(
-            should_probe(false, true),
-            "全挂时必须恢复探测，否则永久 502"
-        );
-    }
-
-    /// 恢复探测一旦有候选可用就提前结束；例行探测必须扫完。
-    ///
-    /// 动机是等待时间：一整轮 43 个候选约 90 秒（6 路并发 × 每次 8 s 可达 + 5 s 测速），
-    /// 而恢复只需要"有一个能用"。但例行探测不能提前停，否则后面的候选永远停在旧状态。
-    #[test]
-    fn recovery_probe_stops_at_first_healthy_but_routine_does_not() {
-        assert!(!should_stop_probing(true, 0), "还没有可用候选时继续探");
-        assert!(should_stop_probing(true, 1), "恢复场景：有一个就收工");
-        assert!(should_stop_probing(true, 7));
-        // 例行探测：无论多少候选健康都要扫完
-        assert!(!should_stop_probing(false, 0));
-        assert!(!should_stop_probing(false, 7), "例行探测不该半途而废");
     }
     #[test]
     fn splits_https_asset_into_host_and_path() {

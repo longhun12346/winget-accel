@@ -31,6 +31,10 @@ impl Proxy {
             ("GET", "/health") => {
                 // 计数器 + 每个候选的健康状态 + 总体状态，交给 serde_json 序列化
                 let speeds = self.health.speed_snapshot();
+                let ranked = self
+                    .health
+                    .ranked_verified_where(|idx| !self.cooldowns.is_service_blocked(idx));
+                let scores = self.health.selection_scores();
                 let accelerators: Vec<crate::stats::AccelHealth> = self
                     .health
                     .snapshot()
@@ -44,13 +48,17 @@ impl Proxy {
                             health: health.as_str(),
                             kbps: kbps.max(0.0) as u32,
                             samples,
+                            pool: match ranked.iter().position(|idx| *idx == i) {
+                                Some(rank) if rank < crate::health::ACTIVE_CANDIDATES => "active",
+                                Some(rank) if rank < crate::health::POOL_CANDIDATES => "standby",
+                                _ => "discovery",
+                            },
+                            selection_score: scores[i],
                         }
                     })
                     .collect();
                 let routing = self.routing.snapshot();
-                let status = if self.health.all_unhealthy()
-                    && !routing.hosts.iter().all(|host| host.direct)
-                {
+                let status = if ranked.is_empty() && !routing.hosts.iter().all(|host| host.direct) {
                     "down"
                 } else {
                     "ok"

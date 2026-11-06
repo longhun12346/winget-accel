@@ -30,9 +30,9 @@ impl Health {
 struct State {
     health: Health,
     failures: u32,
-    /// 实测吞吐的衰减滑动平均（KB/s）。样本不足时不可信，见 MIN_SAMPLES。
+    /// 本机吞吐 EMA（KiB/s）；真实样本出现前只是低置信度短测初值。
     ema_kbps: f64,
-    /// 累计样本数（启动粗筛也算，记满 MIN_SAMPLES）。
+    /// 真实下载样本数；短测只提供初值，不伪装成真实样本。
     samples: u32,
     /// 连续"低于绝对下限"的次数，用于决定是否排除。
     consecutive_slow: u32,
@@ -41,15 +41,18 @@ struct State {
     /// 相对门槛只该拿"最近的"数据当基准：EMA 不会随时间自己衰减，
     /// 拿一小时前的数字比现在，会把正在正常工作的候选判成"太慢"。
     last_sample: Option<std::time::Instant>,
+    last_success: Option<std::time::Instant>,
 }
 
-/// 真实样本的衰减系数：半衰期约 20 个样本。
-const EMA_DECAY: f64 = 0.966;
-/// 少于这个样本数时速度不可信，权重按乐观值处理。
-const MIN_SAMPLES: u32 = 3;
-/// 权重地板：最慢的候选也保留 20% 份额，避免流量全压一个。
+/// 真实下载 EMA：新样本占 20%，旧值约 3 个样本后权重减半。
+const EMA_DECAY: f64 = 0.8;
+/// 每个目标通常从本机评分最高的四个可用候选中选择。
+pub const ACTIVE_CANDIDATES: usize = 4;
+/// 常规维护四个常用和四个备用，其余低频探索。
+pub const POOL_CANDIDATES: usize = 8;
+/// 权重地板为最高分的 20%，并非流量占比，避免流量全压一个。
 const WEIGHT_FLOOR_RATIO: f64 = 0.2;
-/// 绝对下限（KB/s）：低于它说明这条链路基本没用（比直连还差）。
+/// 绝对下限（KB/s）：本机样本低于它时暂时不用于下载。
 ///
 /// 刻意设得很低。实测同一时刻五个候选可能全都只有 34–40 KB/s，
 /// 如果门槛设成 64 KB/s 会把所有候选一起判死，反而没有可用候选。
@@ -88,6 +91,7 @@ impl Tracker {
                 samples: 0,
                 consecutive_slow: 0,
                 last_sample: None,
+                last_success: None,
             })
             .collect();
         Self {
@@ -122,6 +126,7 @@ impl Tracker {
         if let Some(state) = states.get_mut(idx) {
             state.health = Health::Healthy;
             state.failures = 0;
+            state.last_success = Some(std::time::Instant::now());
         }
     }
 
@@ -132,8 +137,7 @@ impl Tracker {
     ///   只会让请求打到明明连不上的候选上，把失败推迟到用户那边；
     /// - `failuresBeforeUnhealthy` 只约束**真实下载**失败（单次抖动不该引发切换）。
     ///
-    /// 代价（见 design.md §7）：单轮网络抖动可能让全部候选同时判死
-    /// （`ALL-ACCEL-DOWN`，请求立即 502），恢复靠"全挂时 30 秒重探"兜住。
+    /// 下载验证失败会排除该项；后台轮换验证和逐项退避负责恢复。
     pub fn mark(&self, idx: usize, healthy: bool) {
         let mut states = self.states.lock().expect("健康状态锁中毒");
         if let Some(state) = states.get_mut(idx) {
@@ -143,6 +147,7 @@ impl Tracker {
                 Health::Unhealthy
             };
             if healthy {
+                state.last_success = Some(std::time::Instant::now());
                 state.failures = 0;
             }
         }
@@ -169,13 +174,18 @@ impl Tracker {
         let states = self.states.lock().expect("健康状态锁中毒");
         matches!(states.get(idx), Some(state) if state.health == Health::Healthy)
     }
-    /// 首页可达不能证明能下载；新候选和被排除的候选都须重新取样验证。
-    pub fn needs_verification(&self, idx: usize) -> bool {
-        let states = self.states.lock().expect("健康状态锁中毒");
-        states
+    /// 活跃下载可复用成功证据，避免与正文争抢带宽。
+    pub fn recently_succeeded(&self, idx: usize, duration: Duration) -> bool {
+        self.states
+            .lock()
+            .expect("健康状态锁中毒")
             .get(idx)
-            .is_none_or(|state| state.health != Health::Healthy || state.samples == 0)
+            .is_some_and(|s| {
+                s.health == Health::Healthy
+                    && s.last_success.is_some_and(|at| at.elapsed() < duration)
+            })
     }
+
     pub fn snapshot(&self) -> Vec<(String, Health)> {
         let states = self.states.lock().expect("健康状态锁中毒");
         self.accels
@@ -183,14 +193,6 @@ impl Tracker {
             .zip(states.iter())
             .map(|(accel, state)| (accel.host.clone(), state.health))
             .collect()
-    }
-
-    /// 所有候选都被判定为不健康。
-    ///
-    /// 单候选时这就是"唯一那条路断了"，必须显式报告，而不是等用户从 502 里猜。
-    pub fn all_unhealthy(&self) -> bool {
-        let states = self.states.lock().expect("健康状态锁中毒");
-        !states.is_empty() && states.iter().all(|s| s.health == Health::Unhealthy)
     }
 
     pub fn healthy_count(&self) -> usize {
@@ -213,13 +215,14 @@ impl Tracker {
         let now = std::time::Instant::now();
         let mut states = self.states.lock().expect("健康状态锁中毒");
         // 相对门槛比较“其它可用候选”。不能拿自己的启动瞬时速度淘汰自己，
-        // 也不能拿已不可用候选的旧峰值判死当前唯一可用的链路。
+        // 短测初值、过期值和不可用候选都不能作为相对淘汰基准。
         let best = states
             .iter()
             .enumerate()
             .filter(|(other, s)| {
                 *other != idx
                     && s.health == Health::Healthy
+                    && s.samples > 0
                     && s.last_sample
                         .is_some_and(|at| now.duration_since(at) <= BASELINE_WINDOW)
             })
@@ -255,18 +258,26 @@ impl Tracker {
         }
     }
 
-    /// 启动粗筛结果：只用来排除"明显不可用/太慢"，不用于排序。
+    /// 本机短测给低置信度初值；第一份真实下载样本将完全替换它。
     pub fn seed_speed(&self, idx: usize, kbps: f64) {
         let mut states = self.states.lock().expect("健康状态锁中毒");
         let Some(state) = states.get_mut(idx) else {
             return;
         };
-        state.ema_kbps = kbps;
-        state.samples = MIN_SAMPLES;
+        let now = std::time::Instant::now();
+        // 新鲜的真实下载样本优先；短测不能反复覆盖长下载结果。
+        if state.samples == 0
+            || state
+                .last_sample
+                .is_none_or(|at| now.duration_since(at) > BASELINE_WINDOW)
+        {
+            state.ema_kbps = kbps;
+            state.samples = 0;
+            state.last_sample = Some(now);
+        }
         state.consecutive_slow = 0;
         state.failures = 0;
-        // 启动粗筛也是"证据"，打上时间戳，让它能参与相对基准
-        state.last_sample = Some(std::time::Instant::now());
+        state.last_success = Some(now);
         state.health = if kbps < SLOW_FLOOR_KBPS {
             Health::Unhealthy
         } else {
@@ -277,7 +288,7 @@ impl Tracker {
     /// 按速度加权、随机选一个候选（排除 `exclude` 与不健康的）。
     ///
     /// 用加权随机而非"永远选最快"：流量全压一个更容易把它打到限流。
-    /// 样本不足的候选按当前最大值（乐观）参与，避免"还没数据"被永久压掉。
+    /// 本机短测置信度减半，真实下载优先；过期速度退回中性权重。
     #[allow(dead_code)] // 生产路径统一走 `_where` 版本；保留本方法供单测直接调用
     pub fn pick_verified_excluding(&self, exclude: &[usize]) -> Option<(usize, Accel)> {
         self.pick_verified_excluding_where(exclude, |_| true)
@@ -296,42 +307,21 @@ impl Tracker {
         F: Fn(usize) -> bool,
     {
         let states = self.states.lock().expect("健康状态锁中毒");
-        let cands: Vec<usize> = (0..states.len())
-            .filter(|&i| !exclude.contains(&i) && states[i].health == Health::Healthy && allow(i))
+        let now = std::time::Instant::now();
+        let cands: Vec<_> = ranked(&states, now, |i| !exclude.contains(&i) && allow(i))
+            .into_iter()
+            .take(ACTIVE_CANDIDATES)
             .collect();
         if cands.is_empty() {
             return None;
         }
-
-        let max_ema = cands
+        let max_score = cands
             .iter()
-            .map(|&i| {
-                if states[i].samples >= MIN_SAMPLES {
-                    states[i].ema_kbps
-                } else {
-                    0.0
-                }
-            })
-            .fold(0.0f64, f64::max);
-
-        let weights: Vec<f64> = cands
+            .map(|i| score(&states[*i], now))
+            .fold(1.0, f64::max);
+        let weights: Vec<_> = cands
             .iter()
-            .map(|&i| {
-                let s = &states[i];
-                let base = if s.samples >= MIN_SAMPLES && s.ema_kbps > 0.0 {
-                    // 有数据：用自己的速度
-                    s.ema_kbps
-                } else if s.samples == 0 {
-                    // 探测就失败/没测到：**不能给最高权重**。
-                    // 实测教训：给乐观值会让"探测失败但仍有 unknown 状态"的候选
-                    // 和最快的候选同权，结果流量全落到它身上、下载直接失败。
-                    max_ema * WEIGHT_FLOOR_RATIO
-                } else {
-                    // 有样本但不足 MIN_SAMPLES：轻微乐观
-                    max_ema * 0.5
-                };
-                base.max(max_ema * WEIGHT_FLOOR_RATIO).max(1.0)
-            })
+            .map(|i| score(&states[*i], now).max(max_score * WEIGHT_FLOOR_RATIO))
             .collect();
 
         let total: f64 = weights.iter().sum();
@@ -348,6 +338,27 @@ impl Tracker {
         Some((chosen, self.accels[chosen].clone()))
     }
 
+    /// 排名只使用本进程在当前机器取得的样本；不读取 CI 速度。
+    pub fn ranked_verified_where(&self, allow: impl Fn(usize) -> bool) -> Vec<usize> {
+        let states = self.states.lock().expect("健康状态锁中毒");
+        ranked(&states, std::time::Instant::now(), allow)
+    }
+
+    pub fn selection_scores(&self) -> Vec<u32> {
+        let states = self.states.lock().expect("健康状态锁中毒");
+        let now = std::time::Instant::now();
+        states
+            .iter()
+            .map(|state| {
+                if state.health == Health::Healthy {
+                    score(state, now) as u32
+                } else {
+                    0
+                }
+            })
+            .collect()
+    }
+
     /// 按索引取候选（pin 命中时用）。
     pub fn accel_at(&self, idx: usize) -> Option<Accel> {
         self.accels.get(idx).cloned()
@@ -362,6 +373,29 @@ impl Tracker {
             .map(|(a, s)| (a.host.clone(), s.ema_kbps, s.samples))
             .collect()
     }
+}
+
+fn score(state: &State, now: std::time::Instant) -> f64 {
+    if state
+        .last_sample
+        .is_none_or(|at| now.duration_since(at) > BASELINE_WINDOW)
+    {
+        return 1.0;
+    }
+    let confidence = if state.samples == 0 { 0.5 } else { 1.0 };
+    (state.ema_kbps * confidence / (1.0 + f64::from(state.failures))).max(1.0)
+}
+
+fn ranked(states: &[State], now: std::time::Instant, allow: impl Fn(usize) -> bool) -> Vec<usize> {
+    let mut indices: Vec<_> = (0..states.len())
+        .filter(|i| states[*i].health == Health::Healthy && allow(*i))
+        .collect();
+    indices.sort_by(|a, b| {
+        score(&states[*b], now)
+            .total_cmp(&score(&states[*a], now))
+            .then(a.cmp(b))
+    });
+    indices
 }
 
 #[cfg(test)]
@@ -385,45 +419,57 @@ mod tests {
         )
     }
 
-    /// 把 EMA 的时间常数**量化**下来——它是唯一没有被数字说明的调参。
-    ///
-    /// 半衰期 = ln(0.5)/ln(EMA_DECAY) ≈ 20 个样本：也就是"20 个真实样本之后，
-    /// 旧速度的权重降到一半"。这条测试把它钉住，改了常量就会红，强迫重新想一遍。
     #[test]
-    fn ema_half_life_is_about_twenty_samples() {
-        let half_life = 0.5f64.ln() / EMA_DECAY.ln();
+    fn real_download_replaces_seed_and_adapts_to_network_changes() {
+        let t = tracker(2);
+        t.seed_speed(0, 100_000.0);
+        t.seed_speed(1, 1_000_000.0);
+        for _ in 0..SLOW_STRIKES {
+            t.record_sample(0, 1024 * 1024, 10.0);
+        }
         assert!(
-            (half_life - 20.0).abs() < 1.0,
-            "半衰期应约 20 个样本，实际 {half_life:.1}（EMA_DECAY={EMA_DECAY}）"
+            t.is_healthy(0),
+            "另一个候选的短测峰值不能淘汰真实可用的下载链路"
         );
+        let first = t.speed_snapshot()[0].1;
+        assert!(
+            (first - 102.4).abs() < 0.1,
+            "短测不能污染第一份真实下载: {first}"
+        );
+        t.seed_speed(0, 1_000_000.0);
+        assert_eq!(
+            t.speed_snapshot()[0].1,
+            first,
+            "后续探测不能覆盖新鲜真实样本"
+        );
+        for _ in 0..12 {
+            t.record_sample(0, 4 * 1024 * 1024, 10.0);
+        }
+        assert!(t.speed_snapshot()[0].1 > 380.0, "网络变快后应及时提高权重");
     }
 
-    /// 阶跃响应：速度从 100 跳到 400 KB/s 后，需要多少个样本才追到新值的 90%？
-    ///
-    /// 实测（按 `EMA_DECAY` 逐样本迭代）：**59 个样本**。理论值是
-    /// ln(0.1)/ln(0.5) ≈ 3.32 个半衰期 ≈ 66 个样本，差异来自离散化
-    /// （第一步只走 3.4%，而连续指数衰减的头一小段更快）。
-    ///
-    /// 这个数字说明"候选变快后权重多久跟上"——大约 60 个真实样本。
-    /// 变慢也是同样的时间常数，所以**急性故障不靠 EMA**：由 `SLOW_STRIKES = 3`
-    /// （连续 3 个慢样本即判 Unhealthy）兜底。两者分工明确，不必把 EMA 调快。
     #[test]
-    fn ema_reaches_ninety_percent_after_one_half_life() {
-        // 用纯公式模拟，不依赖 Tracker：EMA 的更新就是一行线性插值。
-        let mut ema = 100.0f64;
-        let target = 400.0f64;
-        let mut samples = 0;
-        while ema < target * 0.9 && samples < 200 {
-            ema = ema * EMA_DECAY + target * (1.0 - EMA_DECAY);
-            samples += 1;
-        }
-        // 90% 需要约 3.3 个半衰期（ln(0.1)/ln(0.5)≈3.32 → 约 66 个样本）。
-        // 这里只断言"量级对"，避免把精确数字写死成脆弱的测试。
-        assert!(
-            (40..=80).contains(&samples),
-            "追到 90% 应在 40~80 个样本之间，实际 {samples}"
+    fn active_pool_promotes_reserves_and_ignores_stale_peaks() {
+        let t = Tracker::new(
+            (0..10).map(|i| accel("test.example", 4000 + i)).collect(),
+            2,
         );
+        for i in 0..10 {
+            t.seed_speed(i, (i + 1) as f64 * 100.0);
+        }
+        for _ in 0..100 {
+            assert!(t.pick_verified_excluding(&[]).unwrap().0 >= 6);
+        }
+        let excluded = [6, 7, 8, 9];
+        assert!((2..6).contains(&t.pick_verified_excluding(&excluded).unwrap().0));
+        assert_eq!(t.ranked_verified_where(|i| i < 2), vec![1, 0]);
+        t.states.lock().unwrap()[9].last_sample =
+            Some(std::time::Instant::now() - BASELINE_WINDOW - Duration::from_secs(1));
+        assert_ne!(t.ranked_verified_where(|_| true)[0], 9);
+        t.record_failure(8);
+        assert_eq!(t.ranked_verified_where(|_| true)[0], 7);
     }
+
     /// 加权随机必须**真的按权重分配**，不能退化成"总选第一个"或"均匀随机"。
     ///
     /// 此前完全没有分布测试：权重算错（遍历提前 break、remaining 初始化写错）
@@ -548,25 +594,15 @@ mod tests {
     }
 
     #[test]
-    fn all_unhealthy_only_when_every_candidate_is_down() {
-        let t = tracker(1);
-        assert!(!t.all_unhealthy(), "启动时是 Unknown，不该报全挂");
-        t.mark(0, false);
-        assert!(!t.all_unhealthy(), "还有一个 Unknown，不算全挂");
-        t.mark(1, false);
-        assert!(t.all_unhealthy());
-    }
-
-    #[test]
     fn recovers_from_total_outage() {
         // 单候选被判死之后，必须还能靠探测恢复——否则永久 502
         let single = Tracker::new(vec![accel("only.example", 443)], 1);
         single.mark(0, false);
-        assert!(single.all_unhealthy());
+        assert_eq!(single.healthy_count(), 0);
         assert!(single.current().is_none());
 
         single.mark(0, true);
-        assert!(!single.all_unhealthy());
+        assert_eq!(single.healthy_count(), 1);
         assert_eq!(single.current().unwrap().0, 0);
         assert_eq!(single.healthy_count(), 1);
     }
@@ -627,17 +663,15 @@ mod tests {
     }
 
     #[test]
-    fn homepage_success_does_not_replace_download_verification() {
+    fn unknown_and_slow_candidates_require_successful_asset_verification() {
         let t = tracker(2);
-        assert!(t.needs_verification(0));
-        t.mark(0, true);
-        assert!(t.needs_verification(0), "首页可达但没有下载样本");
-        t.seed_speed(0, 200.0);
-        assert!(!t.needs_verification(0));
-        t.mark(0, false);
-        assert!(t.needs_verification(0), "被排除后必须重新验证下载");
+        assert!(t.pick_verified_excluding(&[]).is_none());
         t.seed_speed(0, 1.0);
-        assert!(t.needs_verification(0), "太慢的候选不能靠首页可达复活");
+        assert!(t.pick_verified_excluding(&[]).is_none());
+        t.seed_speed(0, 200.0);
+        assert_eq!(t.pick_verified_excluding(&[]).unwrap().0, 0);
+        t.mark(0, false);
+        assert!(t.pick_verified_excluding(&[]).is_none());
     }
 
     #[test]
@@ -661,7 +695,7 @@ mod tests {
             t.pick_verified_excluding(&[]).is_none(),
             "全部未通过实测时应返回 None（由调用方回 502），不能拿坏候选凑数"
         );
-        assert!(t.all_unhealthy());
+        assert_eq!(t.healthy_count(), 0);
     }
     #[test]
     fn verified_picker_never_returns_unknown() {
@@ -707,13 +741,14 @@ mod tests {
 
     /// 相对门槛不能用**过期**样本当基准。
     ///
-    /// 实测过：A 启动时测出 500 KB/s、之后再也没有新样本（EMA 不会随时间衰减），
+    /// A 曾有 5000 KiB/s 的真实样本、之后再也没有新样本（EMA 不会随时间衰减），
     /// B 稳定跑 100 KB/s（比绝对下限 24 高 4 倍，完全可用）——
     /// 旧逻辑拿 A 的旧值当基准，3 个样本后把 B 判成 `Unhealthy`，直接从候选池里踢掉。
     #[test]
     fn stale_speed_samples_do_not_poison_the_relative_baseline() {
         let t = tracker(3);
-        t.seed_speed(0, 500.0);
+        t.seed_speed(0, 5000.0);
+        t.record_sample(0, 5000 * 1024, 1.0);
         t.seed_speed(1, 100.0);
 
         // 把 A 的样本时间戳改成"很久以前"（超过 BASELINE_WINDOW）
@@ -740,6 +775,7 @@ mod tests {
     fn moderately_slower_candidate_keeps_its_health() {
         let t = tracker(3);
         t.seed_speed(0, 400.0);
+        t.record_sample(0, 400 * 1024, 1.0);
         t.seed_speed(1, 100.0); // 4 倍慢，但完全可用
 
         for _ in 0..SLOW_STRIKES {
@@ -771,6 +807,7 @@ mod tests {
     fn order_of_magnitude_slower_is_still_excluded() {
         let t = tracker(3);
         t.seed_speed(0, 800.0);
+        t.record_sample(0, 800 * 1024, 1.0);
         t.seed_speed(1, 800.0);
         // B 掉到 40 KB/s：是 800 的 5%…… 但仍高于绝对下限 24
         for _ in 0..SLOW_STRIKES {

@@ -48,6 +48,10 @@ pub struct AccelHealth {
     pub kbps: u32,
     /// 真实下载样本数。
     pub samples: u32,
+    /// 常规维护角色；目标域名、冷却和文件绑定仍可调整实际选择。
+    pub pool: &'static str,
+    #[serde(rename = "selectionScore")]
+    pub selection_score: u32,
 }
 
 impl Stats {
@@ -212,6 +216,8 @@ mod tests {
             health: "unknown",
             kbps: 0,
             samples: 0,
+            pool: "discovery",
+            selection_score: 0,
         }];
         let json = stats.health_json("ok", accels, 7, Vec::new(), false, None);
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("必须是合法 JSON");
@@ -230,12 +236,16 @@ mod tests {
                 health: "healthy",
                 kbps: 500,
                 samples: 5,
+                pool: "active",
+                selection_score: 100,
             },
             AccelHealth {
                 host: "b.example".into(),
                 health: "unhealthy",
                 kbps: 0,
                 samples: 0,
+                pool: "discovery",
+                selection_score: 0,
             },
         ];
         let json = stats.health_json("ok", accels, 7, Vec::new(), false, None);
