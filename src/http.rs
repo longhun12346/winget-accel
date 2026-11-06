@@ -212,20 +212,50 @@ pub fn forward_body<R: Read, W: Write>(
     if no_body || status == 204 || status == 304 {
         return Ok(0);
     }
+    let (wire, _) = copy_body(up, dst, head, u64::MAX)?;
+    dst.flush()?;
+    Ok(wire)
+}
+
+/// 测速只累计有效载荷，分块扩展与 trailer 不算下载样本，并限制正文总量。
+/// 另给分帧留出八倍正文加两组头部上限的读取预算，避免用极长扩展拖住探测。
+pub fn measure_body<R: Read>(up: &mut R, head: &[u8], limit: u64) -> io::Result<u64> {
+    let wire_limit = limit
+        .saturating_mul(8)
+        .saturating_add((MAX_HEAD * 2) as u64);
+    let mut bounded = up.take(wire_limit);
+    let (_, payload) = copy_body(&mut bounded, &mut io::sink(), head, limit)?;
+    Ok(payload)
+}
+
+/// 返回 (原样写出的字节数, 不含分块帧的正文大小)。
+fn copy_body<R: Read, W: Write>(
+    up: &mut R,
+    dst: &mut W,
+    head: &[u8],
+    limit: u64,
+) -> io::Result<(u64, u64)> {
     let copied = if let Some(encoding) = final_transfer_encoding(head) {
         if encoding.eq_ignore_ascii_case("chunked") {
-            copy_chunked(up, dst)?
+            return copy_chunked(up, dst, limit);
         } else {
-            io::copy(up, dst)?
+            io::copy(&mut up.take(limit.saturating_add(1)), dst)?
         }
     } else {
         match content_length(head) {
+            Some(len) if len > limit => return Err(body_too_large()),
             Some(len) => copy_exact(up, dst, len)?,
-            None => io::copy(up, dst)?,
+            None => io::copy(&mut up.take(limit.saturating_add(1)), dst)?,
         }
     };
-    dst.flush()?;
-    Ok(copied)
+    if copied > limit {
+        return Err(body_too_large());
+    }
+    Ok((copied, copied))
+}
+
+fn body_too_large() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "上游正文超过采样上限")
 }
 
 /// 429 / 503：被限流或暂时不可用，值得换一个候选重试。
@@ -261,9 +291,10 @@ fn read_crlf_line<R: Read>(src: &mut R, limit: usize) -> io::Result<Vec<u8>> {
     ))
 }
 
-fn copy_chunked<R: Read, W: Write>(src: &mut R, dst: &mut W) -> io::Result<u64> {
+fn copy_chunked<R: Read, W: Write>(src: &mut R, dst: &mut W, limit: u64) -> io::Result<(u64, u64)> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "上游分块帧格式错误");
     let mut copied = 0;
+    let mut payload = 0u64;
     loop {
         let line = read_crlf_line(src, MAX_HEAD)?;
         // httparse 接受空的大小行；这里额外要求至少一个十六进制数字。
@@ -274,6 +305,10 @@ fn copy_chunked<R: Read, W: Write>(src: &mut R, dst: &mut W) -> io::Result<u64> 
             Ok(httparse::Status::Complete((used, size))) if used == line.len() => size,
             _ => return Err(invalid()),
         };
+        payload = payload
+            .checked_add(size)
+            .filter(|total| *total <= limit)
+            .ok_or_else(body_too_large)?;
         dst.write_all(&line)?;
         copied += line.len() as u64;
         if size == 0 {
@@ -294,7 +329,7 @@ fn copy_chunked<R: Read, W: Write>(src: &mut R, dst: &mut W) -> io::Result<u64> 
                 return Err(invalid());
             }
             dst.write_all(&trailers)?;
-            return Ok(copied + trailers.len() as u64);
+            return Ok((copied + trailers.len() as u64, payload));
         }
         copied += copy_exact(src, dst, size)?;
         let mut crlf = [0u8; 2];

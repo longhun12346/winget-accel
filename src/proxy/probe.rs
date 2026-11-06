@@ -1,8 +1,9 @@
 //! 候选可达性、资产测速与后台健康探测。
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rustls::{ClientConnection, StreamOwned};
@@ -51,6 +52,50 @@ fn should_stop_probing(stop_when_healthy: bool, healthy: usize) -> bool {
 /// 从 15 秒降到 5 秒：候选池有 43 个后，15 秒意味着个别挂住的域名
 /// 能拖垮整轮探测。5 秒足够拿到 64 KiB（实测最快 30 ms、最慢约 3 秒）。
 const PROBE_SPEED_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 把剩余预算应用到每次底层 socket I/O；TLS 握手也通过这层读写。
+struct ProbeSocket {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl ProbeSocket {
+    fn connect(accel: &rewrite::Accel, timeout: Duration) -> Option<Self> {
+        let deadline = Instant::now().checked_add(timeout)?;
+        let stream = connect_tcp_timeout(&accel.host, accel.port, timeout).ok()?;
+        Some(Self { stream, deadline })
+    }
+
+    fn remaining(&self) -> io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "探测 I/O 总时间预算耗尽"))
+    }
+}
+
+impl Read for ProbeSocket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        let count = self.stream.read(buf)?;
+        self.remaining()?;
+        Ok(count)
+    }
+}
+
+impl Write for ProbeSocket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        let count = self.stream.write(buf)?;
+        self.remaining()?;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.remaining()?;
+        self.stream.flush()
+    }
+}
 
 impl Proxy {
     /// 周期探测所有候选。**单候选也探**——否则一旦被判死就永久 502，没有任何恢复路径。
@@ -269,11 +314,9 @@ fn probe_request(accel: &rewrite::Accel, asset: &str) -> Option<String> {
 
 /// 通过加速器取一段固定资产，量出吞吐（KB/s）。
 ///
-/// 返回 None 表示拿不到（非 206、或读到的字节数明显不足）。
+/// 返回 None 表示拿不到（非 206、正文不足或超过采样上限）。
 ///
-/// **超时必须覆盖读**：`connect_tcp_timeout` 会把读超时设成 `IO_TIMEOUT`（60 s）。
-/// 早先这里只把 `timeout` 用于连接，于是"能连上但迟迟不响应"的候选会把
-/// 5 秒的测速预算拖成 60 秒（实测启动被拖到 60.4 s）。现在连接后立刻覆盖。
+/// `ProbeSocket` 按剩余预算控制每次 I/O，持续有少量数据也不会续长测速。
 ///
 /// `pub(crate)`：`--doctor` 用它单独验证"测速资产还取得到吗"——
 /// 那个资产是整条链路唯一的版本绑定依赖，失效时表现是"chain 全 OK 但所有下载 502"。
@@ -283,9 +326,7 @@ pub(crate) fn probe_speed(accel: &rewrite::Accel, timeout: Duration, asset: &str
 
     match accel.scheme {
         rewrite::Scheme::Http => {
-            let mut upstream = connect_tcp_timeout(&accel.host, accel.port, timeout).ok()?;
-            let _ = upstream.set_read_timeout(Some(timeout));
-            let _ = upstream.set_write_timeout(Some(timeout));
+            let mut upstream = ProbeSocket::connect(accel, timeout)?;
             upstream.write_all(request.as_bytes()).ok()?;
             upstream.flush().ok()?;
             read_probe_response(&mut upstream, started)
@@ -298,9 +339,7 @@ pub(crate) fn probe_speed(accel: &rewrite::Accel, timeout: Duration, asset: &str
             let Ok(conn) = ClientConnection::new(cfg, name) else {
                 return None;
             };
-            let stream = connect_tcp_timeout(&accel.host, accel.port, timeout).ok()?;
-            let _ = stream.set_read_timeout(Some(timeout));
-            let _ = stream.set_write_timeout(Some(timeout));
+            let stream = ProbeSocket::connect(accel, timeout)?;
             let mut tls = StreamOwned::new(conn, stream);
             tls.write_all(request.as_bytes()).ok()?;
             tls.flush().ok()?;
@@ -314,8 +353,7 @@ fn read_probe_response<R: Read>(up: &mut R, started: std::time::Instant) -> Opti
     if http::status_code(&head) != Some(206) {
         return None;
     }
-    let mut sink = std::io::sink();
-    let copied = http::forward_body(up, &mut sink, &head, false).ok()?;
+    let copied = http::measure_body(up, &head, PROBE_BYTES).ok()?;
     let secs = started.elapsed().as_secs_f64();
     if copied < PROBE_BYTES / 2 || secs <= 0.0 {
         return None;
@@ -324,12 +362,9 @@ fn read_probe_response<R: Read>(up: &mut R, started: std::time::Instant) -> Opti
 }
 /// 探测加速器是否可达：打它自己的根路径，收到任意 HTTP 响应就算通。
 pub fn probe(accel: &rewrite::Accel, timeout: Duration) -> bool {
-    let Ok(stream) = connect_tcp_timeout(&accel.host, accel.port, timeout) else {
+    let Some(stream) = ProbeSocket::connect(accel, timeout) else {
         return false;
     };
-    // 健康探测必须受 health.timeoutSeconds 约束，不能被普通转发 IO_TIMEOUT 放大。
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: winget-accel-health\r\nConnection: close\r\n\r\n",
         rewrite::host_header(accel.scheme, &accel.host, accel.port)
@@ -467,6 +502,97 @@ mod tests {
         assert!(split_asset("http://github.com/a").is_none());
         assert!(split_asset("https://github.com").is_none());
         assert!(split_asset("not-a-url").is_none());
+    }
+
+    #[test]
+    fn probe_rejects_oversized_body_before_reading_it() {
+        use std::io::Cursor;
+        for framing in [
+            format!("Content-Length: {}", PROBE_BYTES + 1),
+            "Transfer-Encoding: chunked".to_string(),
+        ] {
+            let mut response = format!("HTTP/1.1 206 Partial Content\r\n{framing}\r\n\r\n");
+            if framing.starts_with("Transfer-Encoding") {
+                response.push_str("10001\r\n");
+            }
+            let body_start = response.len() as u64;
+            response.push_str(&"x".repeat(PROBE_BYTES as usize + 1));
+            let mut up = Cursor::new(response);
+            assert!(read_probe_response(&mut up, std::time::Instant::now()).is_none());
+            assert_eq!(up.position(), body_start, "不能读取超出采样上限的正文");
+        }
+    }
+
+    #[test]
+    fn probe_accepts_full_samples_with_each_body_framing() {
+        use std::io::Cursor;
+        for framing in ["Content-Length: 65536", "Transfer-Encoding: chunked", ""] {
+            let mut response = "HTTP/1.1 206 Partial Content\r\n".to_string();
+            if !framing.is_empty() {
+                response.push_str(framing);
+                response.push_str("\r\n");
+            }
+            response.push_str("\r\n");
+            if framing.starts_with("Transfer-Encoding") {
+                response.push_str("10000;ext=sample\r\n");
+            }
+            response.push_str(&"x".repeat(PROBE_BYTES as usize));
+            if framing.starts_with("Transfer-Encoding") {
+                response.push_str("\r\n0\r\nX-Tag: sample\r\n\r\n");
+            }
+            let mut up = Cursor::new(response);
+            assert!(
+                read_probe_response(&mut up, std::time::Instant::now()).is_some(),
+                "应支持完整样本的 {framing}"
+            );
+        }
+        let mut too_long = Cursor::new(format!(
+            "HTTP/1.1 206 Partial Content\r\n\r\n{}",
+            "x".repeat(PROBE_BYTES as usize + 1)
+        ));
+        assert!(read_probe_response(&mut too_long, std::time::Instant::now()).is_none());
+    }
+
+    #[test]
+    fn probe_does_not_count_chunk_metadata_as_downloaded_data() {
+        use std::io::Cursor;
+        let response = format!(
+            "HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\n\r\n\
+             1;{}\r\nx\r\n0\r\nX-Tag: sample\r\n\r\n",
+            "p".repeat(PROBE_BYTES as usize / 2 - 16)
+        );
+        let mut up = Cursor::new(response);
+        assert!(read_probe_response(&mut up, std::time::Instant::now()).is_none());
+    }
+
+    #[test]
+    fn probe_speed_budget_is_not_reset_by_incoming_data() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ =
+                stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 65536\r\n\r\n");
+            for _ in 0..8 {
+                if stream.write_all(&[b'x'; 8192]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(80));
+            }
+        });
+        let got = probe_speed(
+            &http_accel(port),
+            Duration::from_millis(300),
+            "https://example.com/x.bin",
+        );
+        server.join().unwrap();
+        assert!(got.is_none(), "持续有数据也不能重置整次探测的时间预算");
     }
 
     /// 读超时必须由 `timeout` 决定，不能被 `IO_TIMEOUT`（60 s）放大。
