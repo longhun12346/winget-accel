@@ -57,7 +57,7 @@ try {
     # 这里补一道守卫，比等用户发现"新版本没生效"便宜得多。
     if ($SkipBuild) {
         $exeItem = Get-Item $exe
-        $newer = Get-ChildItem (Join-Path $repo 'src\*.rs') |
+        $newer = Get-ChildItem (Join-Path $repo 'src') -Recurse -File -Filter '*.rs' |
             Where-Object { $_.LastWriteTime -gt $exeItem.LastWriteTime }
         if ($newer) {
             $names = ($newer | ForEach-Object { $_.Name }) -join ', '

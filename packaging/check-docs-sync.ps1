@@ -12,7 +12,7 @@
     检查六组，任何一组不一致就以非零退出码失败：
       1. CLI 参数：README/design.md/QUICKSTART 提到的 --flag 必须被 main.rs 解析
       2. 配置键：config.example.json 用到的键必须出现在 config.rs 的 *_KEYS 里
-      3. 日志标签：文档里出现的全大写标签必须能在 src/*.rs 里找到
+      3. 日志标签：文档里出现的全大写标签必须能在 src 下的 Rust 源码里找到
       4. ADR 引用：文档里提到的 ADR-NNN 必须在 decisions.md 里有对应小节或废弃表条目
       5. 源码卫生：`#[test]` 后面不能夹着注释再接另一个 `#[test]`（属性错位）
       6. 行尾统一 + 乱码：受版本控制的文本文件不得含 CRLF，也不得含连续问号
@@ -100,7 +100,8 @@ try {
     Write-Host ("配置键：代码 {0} 个，示例配置用到 {1} 个" -f $knownKeys.Count, ($usedKeys | Sort-Object -Unique).Count)
 
     # ---------------------------------------------------------------- 3) 日志标签
-    $allSrc = (Get-ChildItem 'src\*.rs' | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
+    $sourceFiles = @(Get-ChildItem 'src' -Recurse -File -Filter '*.rs')
+    $allSrc = ($sourceFiles | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
     $allDocs = (Get-ChildItem 'README.md', 'docs\design.md' | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
 
     # 只看"像日志标签"的：全大写、至少两个词、带连字符（如 ACCEL-COOLDOWN）。
@@ -124,7 +125,7 @@ try {
         if (-not $allSrc.Contains($t)) { $missing += $t }
     }
     foreach ($m in $missing) {
-        $failures.Add("日志标签 $m 在文档中出现，但 src\*.rs 里找不到")
+        $failures.Add("日志标签 $m 在文档中出现，但 src 下的 Rust 源码里找不到")
     }
     Write-Host ("日志标签：文档 {0} 个，缺失 {1} 个" -f $docTags.Count, $missing.Count)
 
@@ -169,7 +170,7 @@ try {
     # 这里做一条机械检查：`#[test]` 之后必须很快出现 `fn`（允许中间有属性行），
     # 若中间夹了文档注释，就说明属性被错位了。
     $strayTest = 0
-    Get-ChildItem 'src\*.rs' | ForEach-Object {
+    $sourceFiles | ForEach-Object {
         $lines = Get-Content $_.FullName
         for ($i = 0; $i -lt $lines.Count; $i++) {
             if ($lines[$i] -notmatch '^\s*#\[test\]\s*$') { continue }

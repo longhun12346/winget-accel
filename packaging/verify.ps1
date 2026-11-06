@@ -121,7 +121,8 @@ try {
         # exe 还是旧代码，而可复现性检查会报"两次构建不一致"（它其实抓到了二进制与源码不符，
         # 但报错文字会把人引向"构建不可复现"这个错误方向）。
         $exeItem = Get-Item 'target\release\winget-accel.exe'
-        $newer = Get-ChildItem src\*.rs | Where-Object { $_.LastWriteTime -gt $exeItem.LastWriteTime }
+        $newer = Get-ChildItem src -Recurse -File -Filter '*.rs' |
+            Where-Object { $_.LastWriteTime -gt $exeItem.LastWriteTime }
         if ($newer) {
             $names = ($newer | ForEach-Object { $_.Name }) -join ', '
             throw "有源文件比 exe 新（$names）：cargo 可能没重编（常见原因是用 Copy-Item 恢复了旧 mtime 的备份）。先 touch 一下再重跑。"
