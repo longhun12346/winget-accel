@@ -3,7 +3,7 @@
 ## 目标和边界
 
 项目只解决一件事：让 Windows 上的 `winget` 下载 GitHub 安装包时能够使用公共 URL
-前缀加速服务。它不替换 winget 源、不同步清单、不注册新的源，也不把自己做成通用 GitHub
+前缀加速服务；直连足够快时由 PAC 放行，减少中转。它不替换 winget 源、不同步清单、不注册新的源，也不把自己做成通用 GitHub
 代理。
 
 下载内容仍由 winget 使用官方清单中的 `InstallerSha256` 校验。代理改写请求 URL，不改写
@@ -13,6 +13,7 @@
 代理策略位于 `src/proxy.rs`，CONNECT、隧道与 TLS 接入位于 `src/proxy/network.rs`，
 `src/proxy/probe.rs` 负责候选探测和测速，`src/proxy/local.rs` 提供 PAC 与 `/health`。
 `src/http.rs` 统一封装 Hyper 客户端、正文大小限制与完成回调。
+`src/routing.rs` 用有界真实资产采样决定精确域名是否可以 DIRECT。
 
 网络使用共享的四线程 Tokio 运行时。Hyper 负责 HTTP/1.1 解析、消息边界、CONNECT 升级
 和流式正文；`tokio-rustls` 复用现有 rustls 配置接入异步 TLS。启动、Windows 环境恢复
@@ -26,14 +27,15 @@ winget ──查询清单──> cdn.winget.microsoft.com       DIRECT
   |
   └─下载 InstallerUrl──> GitHub 下载域名
                              |
-                             └─PAC──> 127.0.0.1:8443
+                             └─PAC──┬─ 已验证精确域名 ──> GitHub，DIRECT
+                                    └─ 其余 ──> 127.0.0.1:8443
                                        ├─ TLS MITM + 路径改写
                                        ├─ TLS MITM + 原站转发
                                        └─ 非改写子域隧道
 ```
 
 默认白名单由 `rewriteHosts` 给出：`github.com`、`objects.githubusercontent.com`、
-`codeload.github.com`、`release-assets.githubusercontent.com`。白名单 host 由本机 CA
+`codeload.github.com`、`release-assets.githubusercontent.com`。需要代理的白名单 host 由本机 CA
 签发叶证书并终止 TLS；`*.github.com` 等 PAC 捕获到的子域可以只走隧道，不会自动进入
 改写白名单。
 
@@ -42,7 +44,8 @@ winget ──查询清单──> cdn.winget.microsoft.com       DIRECT
 
 ## 2. PAC 为什么对 github.com 整域代理
 
-PAC 由代理提供：`http://127.0.0.1:<port>/winget-accel.pac`。生成的核心逻辑是：
+PAC 由代理提供：`http://127.0.0.1:<port>/winget-accel.pac`。自动模式在以下代理规则之前
+插入经过验证的精确 host DIRECT 条款，条款带毫秒级到期时间；没有有效证据时逻辑是：
 
 ```javascript
 function FindProxyForURL(url, host) {
@@ -59,7 +62,7 @@ function FindProxyForURL(url, host) {
 ```
 
 WinINet 对 HTTPS 调用 PAC 时不会提供完整路径，路径规则在 winget 场景中无法可靠命中。
-因此 `github.com` 必须整域交给本机；代理收到真实 HTTP 请求后，再由
+因此需要加速的 `github.com` 整域交给本机；代理收到真实 HTTP 请求后，再由
 `rewrite::needs_rewrite` 判断路径：
 
 - `/releases/download/`
@@ -69,10 +72,31 @@ WinINet 对 HTTPS 调用 PAC 时不会提供完整路径，路径规则在 winge
 - `/blob/`
 
 命中这些路径才改写到加速器。普通页面和 Git clone 路径仍以原始 host 建立上游连接。
-Git clone 需要发送 POST 请求体，而代理只处理响应体，所以明确不支持。
+经代理的 Git clone 需要发送 POST 请求体，而代理只处理响应体，所以明确不支持。
 
 PAC 只接管 HTTPS。明文 HTTP 经过本地端点会得到 405，避免把可直连请求错误地送入 TLS
 终止路径。PAC 不写全局 `ProxyServer`，Microsoft 域名和其它软件源保持 DIRECT。
+
+### 自动直连判据
+
+默认 `routing.mode=auto`。启动时及每 300 秒检查 Git for Windows release 安装包和
+git/git 的 codeload 归档。每个资产连续采样两次，每次 256 KiB，较低速度必须达到
+`routing.minDirectKbps`（默认 512 KiB/s）。每个资产两次采样共用 5 秒总期限，包含
+DNS、TLS、重定向及正文；不同资产并行检查。配置最多 8 个自定义 HTTPS/443 资产。
+
+只跟随白名单内最多 5 次绝对 HTTPS 重定向。206 要求精确 Range 和完整正文；忽略 Range
+的 200 只取前 256 KiB 后取消。短正文、HTML、JSON、压缩编码或非法范围都不能作为证据。
+只放行两次成功链中都出现的精确 host。一个域名有多份成功样本时取最低速度；该域名
+自身的测速资产失败则不放行。未覆盖的 CDN 和 github.com 子域继续使用代理。
+
+探测失败立即撤销内存中的直连选择，恢复直连需经过默认 300 秒冷却；结果不持久化。
+DIRECT 条款有效期为复查间隔加探测期限再加 10 秒，过期证据不会由新 PAC 放行，
+`/health.routing` 也会标记 `expired`。`routing.mode=accelerator` 跳过直连检查。
+显式指定本机 HTTP 代理的客户端仍按加速器策略转发；直连选择由 PAC 生效。
+
+更新时修改 PAC URL 的会话/版本查询参数，发送 WinINet 设置变更和刷新通知，并为
+本地 PAC 返回 `Cache-Control: no-store, max-age=0`。旧脚本再次求值时自行拒绝过期证据，
+但 Windows 也可能缓存代理决策，现有连接不会迁移，不保证所有客户端立即切换。
 
 ## 3. TLS 和改写
 
@@ -153,7 +177,7 @@ Hyper 解码上游分帧并按下游连接重新编码，不承诺保留原始�
 
 - 最后状态是明确的上游拒绝，保留该状态码供客户端和日志排查；
 - 没有任何已验证候选或 Range 语义不安全时返回 502；
-- 不向原始 GitHub 直连回退。
+- 代理内不向未经验证的原始 GitHub 直连回退；PAC 自动直连由独立的采样证据决定。
 
 公共服务可能临时限流，运行期会记录 `ACCEL-COOLDOWN` 并换候选。下载文件的官方哈希
 仍是最终内容完整性边界。
@@ -179,13 +203,18 @@ state.json
 `state.json` 使用版本 2，记录：
 
 - 接管前的 PAC 值；
-- 本次写入的 PAC 值；
+- 本次写入的 PAC 值，以及刷新中途的上一值；
 - 会话标识；
 - winget 设置原值、文件路径和是否由本次创建。
 
 状态先原子写入并同步到磁盘，看门狗成功启动后才修改注册表。恢复时必须同时满足会话
 匹配和当前设置仍属于本实例；用户在运行期间的新设置会保留。状态损坏或读取失败时保留
 文件并停止自动接管，不把错误解释成“原来没有设置”。旧格式仍可迁移读取。
+
+系统模式的 PAC URL 带本次 `session` 和 `route` 版本。刷新前原子记录新旧 URL，
+写入注册表后再清理旧值；崩溃发生在任一侧都能恢复。刷新与退出恢复共用互斥锁，
+不同会话或用户手工修改的 PAC 不会被覆盖。`--no-env` 不创建系统恢复上下文，
+后台路由刷新仅更新内存和本地端点。
 
 ## 8. 退出和看门狗
 
@@ -200,7 +229,7 @@ PAC 和 winget 设置。旧看门狗发现状态属于新会话时跳过，不�
 
 Delivery Optimization 不读取当前用户 PAC；如果保持默认下载器，winget 可能先直连 GitHub
 并等待失败，再回退 WinINet。默认启动时把用户设置中的 `network.downloader` 设为 `wininet`，
-只修改这个字段，JSON 中其它字段原样保留。非法 JSON 不覆盖，只记录警告；
+使其遵循 PAC 的 DIRECT / PROXY 选择。只修改这个字段，JSON 中其它字段原样保留。非法 JSON 不覆盖，只记录警告；
 `wingetDownloader=false` 时完全跳过这一步。
 
 恢复时使用与 PAC 相同的状态文件和看门狗。若用户在运行期间修改了该设置，恢复逻辑会按
@@ -220,6 +249,8 @@ Delivery Optimization 不读取当前用户 PAC；如果保持默认下载器，
 
 `/health` 提供版本、运行时间、连接数、MITM/隧道计数、改写数、正文计数、错误、限流、
 连接上限拒绝、绑定表饱和和运行期能力阻断等信息。`bytes` 只统计 MITM 正文，不统计隧道。
+`routing` 提供路由模式、版本、每个 host 的直连选择、速度、最近检查时间、有效期和原因；
+PAC DIRECT 流量绕过本机，不计入代理下载统计。
 
 ## 11. 测试和发布
 
@@ -227,6 +258,9 @@ Rust 单测覆盖解析、证书约束、PAC、健康状态、重试和恢复逻
 真实二进制并使用本地假上游，覆盖改写、Range、响应定界、并发、PAC 端点和连接边界。
 客户端调用 Windows 自带的 `curl.exe` 验证 Schannel 与 CONNECT 行为。真实公共服务不作为
 离线回归的固定依赖，因为服务的存活和限流会变化。
+自动路由的离线测试覆盖双采样、期限、重定向范围、过期和冷却；Windows 自带的 WinHTTP
+PAC 引擎验证 DIRECT 精确匹配、过期及 URL 版本切换。注册表测试使用独立临时键，
+验证刷新前后崩溃恢复，不改真实 Internet Settings。
 
 发布前执行：
 
@@ -249,8 +283,9 @@ release 二进制 SHA256。这样可以避免“带颜色的 `Compiling` 文本�
 ## 12. 已知限制
 
 - 公共加速服务可能下线、限流或改变行为；候选池不是可用性保证。
-- 默认测速资产绑定一个具体 GitHub release；资产被删除时需要配置 `health.probeUrl`。
+- 默认测速资产绑定具体版本；资产删除时需配置 `health.probeUrl` 或 `routing.probeUrls`。
 - 不支持 HTTP/2、CRL/OCSP 和请求体转发。
 - 真实系统模式首次导入 CA 需要可见桌面确认；无交互环境只适合 `--no-env` 测试。
-- `github.com` 普通浏览请求会多经过本机 TLS 终止和回源一跳；内容仍原样转发。
+- 未验证为 DIRECT 的 `github.com` 普通浏览请求会多经过本机 TLS 终止和回源一跳。
+- 直连速度来自短样本估计，不能保证所有安装包或网络变化后的实际表现。
 - 私钥以明文保存在本机证书目录，目录权限只能尽力收紧。

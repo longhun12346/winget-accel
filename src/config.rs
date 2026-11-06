@@ -31,6 +31,7 @@ pub struct FileConfig {
     pub rewrite_hosts: Vec<String>,
     pub accelerators: Vec<AcceleratorCfg>,
     pub health: HealthCfg,
+    pub routing: RoutingCfg,
     pub log_level: String,
     /// 可选：自定义证书目录。默认是 exe 同目录下的 `certs`。
     pub cert_dir: Option<PathBuf>,
@@ -40,8 +41,8 @@ pub struct FileConfig {
     pub mitm_extra: Vec<String>,
     /// 是否把 winget 的下载器钉成 WinINet（见 src/winget.rs 与 ADR-017）。
     ///
-    /// 默认开启：winget 默认会先走 Delivery Optimization，而 DO 不读 PAC，
-    /// 对 GitHub 直连必失败（每次白等 60 秒）后才回退到本代理。
+    /// 默认开启：Delivery Optimization 不读 PAC，受限网络可能先等待一次
+    /// 直连失败；WinINet 能遵循自动路由的 DIRECT / PROXY 决策。
     pub winget_downloader: bool,
 }
 impl Default for FileConfig {
@@ -54,6 +55,7 @@ impl Default for FileConfig {
                 .collect(),
             accelerators: Vec::new(),
             health: HealthCfg::default(),
+            routing: RoutingCfg::default(),
             log_level: "info".into(),
             cert_dir: None,
             log_path: None,
@@ -108,6 +110,39 @@ impl Default for HealthCfg {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingMode {
+    Auto,
+    Accelerator,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RoutingCfg {
+    pub mode: RoutingMode,
+    pub min_direct_kbps: u32,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+    pub cooldown_seconds: u64,
+    /// Empty uses a release installer and a codeload archive. Redirect targets
+    /// qualify only when observed in both successful samples.
+    pub probe_urls: Vec<String>,
+}
+
+impl Default for RoutingCfg {
+    fn default() -> Self {
+        Self {
+            mode: RoutingMode::Auto,
+            min_direct_kbps: 512,
+            interval_seconds: 300,
+            timeout_seconds: 5,
+            cooldown_seconds: 300,
+            probe_urls: Vec::new(),
+        }
+    }
+}
+
 /// 运行期配置：文件配置 + 命令行覆盖。
 #[derive(Debug)]
 pub struct App {
@@ -133,6 +168,7 @@ pub struct App {
     pub health_probe: String,
     /// 是否用了自定义测速资产（在"全部候选失败"时据此给出针对性提示）。
     pub health_probe_custom: bool,
+    pub routing: RoutingCfg,
 }
 
 impl App {
@@ -234,6 +270,30 @@ impl App {
             _ => crate::proxy::DEFAULT_PROBE_ASSET.to_string(),
         };
 
+        if file.routing.min_direct_kbps == 0
+            || !(1..=30).contains(&file.routing.timeout_seconds)
+            || !(60..=86_400).contains(&file.routing.interval_seconds)
+            || !(60..=86_400).contains(&file.routing.cooldown_seconds)
+            || file.routing.probe_urls.len() > 8
+        {
+            bail!("routing 要求 minDirectKbps > 0、timeoutSeconds 为 1–30、intervalSeconds/cooldownSeconds 为 60–86400，probeUrls 最多 8 条");
+        }
+        for url in &file.routing.probe_urls {
+            let uri: hyper::Uri = url.parse().context("routing.probeUrls URL 非法")?;
+            if uri.scheme_str() != Some("https")
+                || uri
+                    .authority()
+                    .is_some_and(|a| a.as_str() != a.host() && uri.port_u16() != Some(443))
+                || !uri
+                    .host()
+                    .is_some_and(|host| rewrite_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)))
+                || uri.authority().is_some_and(|a| a.as_str().contains('@'))
+                || uri.path() == "/"
+            {
+                bail!("routing.probeUrls 必须是 rewriteHosts 内域名的 HTTPS 下载 URL（443 端口）: {url}");
+            }
+        }
+
         Ok(Self {
             listen,
             rewrite_hosts,
@@ -253,6 +313,7 @@ impl App {
             health_failures: file.health.failures_before_unhealthy.max(1),
             health_probe,
             health_probe_custom,
+            routing: file.routing,
         })
     }
 
@@ -320,11 +381,12 @@ pub fn load(path: Option<&PathBuf>) -> Result<(FileConfig, Vec<String>)> {
 }
 
 /// 顶层配置项（与 `FileConfig` 的字段一一对应）。
-const TOP_KEYS: [&str; 9] = [
+const TOP_KEYS: [&str; 10] = [
     "listen",
     "rewriteHosts",
     "accelerators",
     "health",
+    "routing",
     "logLevel",
     "certDir",
     "logPath",
@@ -339,6 +401,14 @@ const HEALTH_KEYS: [&str; 5] = [
     "probeUrl",
 ];
 const ACCEL_KEYS: [&str; 4] = ["name", "template", "priority", "hosts"];
+const ROUTING_KEYS: [&str; 6] = [
+    "mode",
+    "minDirectKbps",
+    "intervalSeconds",
+    "timeoutSeconds",
+    "cooldownSeconds",
+    "probeUrls",
+];
 
 /// 找出配置里不认识的键（以 `$` 开头的是注释性键，允许存在）。
 ///
@@ -349,6 +419,9 @@ pub fn unknown_config_keys(doc: &serde_json::Value) -> Vec<String> {
         return out;
     };
     collect_unknown(top, "", &TOP_KEYS, &mut out);
+    if let Some(routing) = top.get("routing").and_then(|value| value.as_object()) {
+        collect_unknown(routing, "routing.", &ROUTING_KEYS, &mut out);
+    }
     if let Some(health) = top.get("health").and_then(|value| value.as_object()) {
         collect_unknown(health, "health.", &HEALTH_KEYS, &mut out);
     }
@@ -458,6 +531,7 @@ mod tests {
                 hosts: Vec::new(),
             }],
             health: HealthCfg::default(),
+            routing: RoutingCfg::default(),
             log_level: "info".into(),
             cert_dir: Some(PathBuf::from("certs-test")),
             log_path: Some(PathBuf::from("proxy-test.log")),
@@ -731,6 +805,34 @@ mod tests {
         assert!(file.accelerators.is_empty());
         assert!(file.cert_dir.is_none());
         assert!(file.log_path.is_none());
+        assert_eq!(file.routing.mode, RoutingMode::Auto);
+        assert_eq!(file.routing.min_direct_kbps, 512);
+    }
+
+    #[test]
+    fn routing_rejects_invalid_budgets_and_out_of_scope_assets() {
+        for routing in [
+            serde_json::json!({"minDirectKbps": 0}),
+            serde_json::json!({"timeoutSeconds": 0}),
+            serde_json::json!({"intervalSeconds": 59}),
+            serde_json::json!({"cooldownSeconds": u64::MAX}),
+        ] {
+            let mut file = test_file("127.0.0.1:8443");
+            file.routing = serde_json::from_value(routing).unwrap();
+            assert!(App::new(file).is_err());
+        }
+        for url in [
+            "http://github.com/file",
+            "https://other.example/file",
+            "https://github.com:8443/file",
+            "https://github.com:bad/file",
+            "https://user@github.com/file",
+            "https://github.com/",
+        ] {
+            let mut file = test_file("127.0.0.1:8443");
+            file.routing.probe_urls = vec![url.into()];
+            assert!(App::new(file).is_err(), "{url}");
+        }
     }
     /// 示例配置里不该有任何"不认识的键"——它是字段形状的唯一权威。
     ///

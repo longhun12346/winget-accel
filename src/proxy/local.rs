@@ -16,8 +16,17 @@ impl Proxy {
         match (req.method().as_str(), path) {
             ("GET", "/winget-accel.pac") => {
                 self.log.info(&format!("PAC-SERVED peer={peer}"));
-                let body = pac::build(self.app.listen.port(), &self.app.rewrite_hosts);
-                http::response(200, "application/x-ns-proxy-autoconfig", body)
+                let snapshot = self.routing.snapshot();
+                let body = pac::build_with_routes(
+                    self.app.listen.port(),
+                    &self.app.rewrite_hosts,
+                    &snapshot.pac_routes(),
+                );
+                let mut response = http::response(200, "application/x-ns-proxy-autoconfig", body);
+                response
+                    .headers_mut()
+                    .insert("cache-control", "no-store, max-age=0".parse().unwrap());
+                response
             }
             ("GET", "/health") => {
                 // 计数器 + 每个候选的健康状态 + 总体状态，交给 serde_json 序列化
@@ -38,7 +47,10 @@ impl Proxy {
                         }
                     })
                     .collect();
-                let status = if self.health.all_unhealthy() {
+                let routing = self.routing.snapshot();
+                let status = if self.health.all_unhealthy()
+                    && !routing.hosts.iter().all(|host| host.direct)
+                {
                     "down"
                 } else {
                     "ok"
@@ -55,6 +67,7 @@ impl Proxy {
                     self.started.elapsed().as_secs(),
                     learned,
                     self.pins_saturated.load(Ordering::Relaxed),
+                    Some(routing),
                 );
                 http::response(200, "application/json", body)
             }

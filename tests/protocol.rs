@@ -345,6 +345,7 @@ impl Proxy {
             "logPath": log,
             "mitmExtra": mitm_extra,
             "wingetDownloader": false,
+            "routing": {"mode": "accelerator"},
             "health": {
                 "intervalSeconds": 60,
                 "timeoutSeconds": 2,
@@ -903,6 +904,12 @@ fn serves_pac_and_health_and_tracks_rewrites() {
     assert!(pac_text.contains("github.com"));
 
     let before = proxy.health();
+    assert_eq!(before["routing"]["mode"], "accelerator");
+    assert!(before["routing"]["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|host| host["direct"] == false && host["reason"] == "forced"));
     let result = curl(&proxy, &asset("health-counter"), &[]);
     assert_curl_ok(&result);
     let after = proxy.health();
@@ -1036,6 +1043,7 @@ fn same_port_second_instance_fails_fast() {
         "certDir": cert_dir,
         "logPath": log,
         "wingetDownloader": false,
+            "routing": {"mode": "accelerator"},
         "health": {"probeUrl": "https://github.com/probe.bin"}
     });
     std::fs::write(&config, serde_json::to_vec(&value).expect("config json")).expect("config");

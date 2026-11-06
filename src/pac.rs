@@ -4,7 +4,7 @@
 //! 但这些 host 的子域（如 `api.github.com`）也会被圈进代理，只做隧道。
 //! 这样做的目的是避免子域流量落到"系统直连"上被卡死（见 docs/design.md §2）。
 //!
-//! `github.com` 必须整域交给代理，因为 WinINet 的 HTTPS PAC 调用不包含路径；
+//! 需要加速的 `github.com` 整域交给代理，因为 WinINet 的 HTTPS PAC 调用不包含路径；
 //! 代理收到请求后再按路径决定是否改写。这样普通页面和 git clone 仍保持原目标，
 //! 不会被发送到公共加速器（`git clone` 依赖 POST 请求体，本代理不转发）。
 
@@ -25,6 +25,12 @@ const GITHUB: &str = "github.com";
 /// `github.com` 上的 release 下载会 302 到 `release-assets.githubusercontent.com`，
 /// 那个 host 仍在完整代理列表里，所以跳转后照样被改写。
 pub fn build(port: u16, rewrite_hosts: &[String]) -> String {
+    build_with_routes(port, rewrite_hosts, &[])
+}
+
+/// Exact, expiring exceptions precede github.com's subdomain wildcard. Expiry
+/// rejects stale evidence when even an old cached script is evaluated again.
+pub fn build_with_routes(port: u16, rewrite_hosts: &[String], direct: &[(String, u64)]) -> String {
     let mut conditions: Vec<String> = Vec::new();
 
     // 配置里的 host 一律**小写化**后再写进 PAC。
@@ -67,9 +73,16 @@ pub fn build(port: u16, rewrite_hosts: &[String]) -> String {
     // 客户端（winget）对这些 host 一律用 https，这条限定不损失功能。
     let condition = format!("(url.substring(0, 6) == \"https:\") && ({condition})");
 
+    let direct_rules = direct.iter()
+        .filter(|(host, _)| hosts.contains(&host.to_ascii_lowercase()))
+        .map(|(host, expires)| format!(
+            "  if (url.substring(0, 6) == \"https:\" && host == \"{}\" && new Date().getTime() < {expires}) return \"DIRECT\";\n",
+            escape_js(&host.to_ascii_lowercase())
+        )).collect::<String>();
     format!(
         "function FindProxyForURL(url, host) {{\n\
          \x20 host = host.toLowerCase();\n\
+         {direct_rules}\
          \x20 if ({condition}) {{\n\
          \x20   return \"PROXY 127.0.0.1:{port}\";\n\
          \x20 }}\n\
@@ -89,6 +102,118 @@ fn escape_js(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_pac_engine_honors_exact_direct_rules_expiry_and_url_refresh() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use windows_sys::Win32::Foundation::GlobalFree;
+        use windows_sys::Win32::Networking::WinHttp::*;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            while !server_stop.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut raw = [0; 4096];
+                let count = stream.read(&mut raw).unwrap_or(0);
+                let expires = if String::from_utf8_lossy(&raw[..count]).contains("route=2") {
+                    0
+                } else {
+                    9_000_000_000_000
+                };
+                let body = build_with_routes(8443, &hosts(), &[("github.com".into(), expires)]);
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let mut results = Vec::new();
+        // SAFETY: session and output buffers are released below; UTF-16 inputs
+        // remain live throughout each synchronous PAC evaluation.
+        unsafe {
+            let session = WinHttpOpen(
+                wide("winget-accel PAC test").as_ptr(),
+                WINHTTP_ACCESS_TYPE_NO_PROXY,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            if !session.is_null() {
+                WinHttpSetTimeouts(session, 1000, 1000, 1000, 1000);
+                for (url, revision, expected) in [
+                    ("https://GitHub.com/file", 1, WINHTTP_ACCESS_TYPE_NO_PROXY),
+                    (
+                        "https://api.github.com/file",
+                        1,
+                        WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                    ),
+                    (
+                        "https://codeload.github.com/file",
+                        1,
+                        WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                    ),
+                    ("https://example.com/file", 1, WINHTTP_ACCESS_TYPE_NO_PROXY),
+                    (
+                        "https://github.com/file",
+                        2,
+                        WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                    ),
+                ] {
+                    let pac_url = wide(&format!(
+                        "http://{address}/winget-accel.pac?route={revision}"
+                    ));
+                    let mut options: WINHTTP_AUTOPROXY_OPTIONS = std::mem::zeroed();
+                    options.dwFlags =
+                        WINHTTP_AUTOPROXY_CONFIG_URL | WINHTTP_AUTOPROXY_RUN_INPROCESS;
+                    options.lpszAutoConfigUrl = pac_url.as_ptr();
+                    let mut proxy: WINHTTP_PROXY_INFO = std::mem::zeroed();
+                    let ok = WinHttpGetProxyForUrl(
+                        session,
+                        wide(url).as_ptr(),
+                        &mut options,
+                        &mut proxy,
+                    );
+                    results.push((
+                        url,
+                        expected,
+                        if ok == 0 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(proxy.dwAccessType)
+                        },
+                    ));
+                    if !proxy.lpszProxy.is_null() {
+                        GlobalFree(proxy.lpszProxy.cast());
+                    }
+                    if !proxy.lpszProxyBypass.is_null() {
+                        GlobalFree(proxy.lpszProxyBypass.cast());
+                    }
+                }
+                WinHttpCloseHandle(session);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        assert_eq!(results.len(), 5, "WinHTTP session creation failed");
+        for (url, expected, result) in results {
+            assert_eq!(
+                result.unwrap_or_else(|error| panic!("{url}: {error}")),
+                expected,
+                "{url}"
+            );
+        }
+    }
 
     fn hosts() -> Vec<String> {
         [

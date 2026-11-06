@@ -379,7 +379,7 @@ fn pac_text_issue(app: &App) -> Option<String> {
 
 fn pac_registry_detail(expected: &str, actual: Option<&str>) -> (Verdict, String) {
     match actual {
-        Some(value) if value.trim() == expected => {
+        Some(value) if same_pac_endpoint(value.trim(), expected) => {
             (Verdict::Pass, format!("AutoConfigURL 已指向 {expected}"))
         }
         Some(value) => (
@@ -392,6 +392,17 @@ fn pac_registry_detail(expected: &str, actual: Option<&str>) -> (Verdict, String
             Verdict::Fail,
             format!("AutoConfigURL 未设置，期望 {expected:?}；请去掉 --no-env 后启动代理"),
         ),
+    }
+}
+
+fn same_pac_endpoint(actual: &str, expected: &str) -> bool {
+    match (actual.parse::<hyper::Uri>(), expected.parse::<hyper::Uri>()) {
+        (Ok(actual), Ok(expected)) => {
+            actual.scheme() == expected.scheme()
+                && actual.authority() == expected.authority()
+                && actual.path() == expected.path()
+        }
+        _ => false,
     }
 }
 
@@ -464,7 +475,38 @@ fn check_pac(app: &App) -> Check {
 
     // 注册表指向本机代理只说明"应该用它"，还得看**正在跑的那个实例**吐出来的是什么。
     // 改了 rewriteHosts 却忘了重启时，注册表看起来完全正常，而实际生效的还是旧 PAC。
-    let expected_text = pac::build(app.listen.port(), &app.rewrite_hosts);
+    let snapshot = crate::http::get_text(
+        &format!("http://127.0.0.1:{}/health", app.listen.port()),
+        Duration::from_secs(2),
+        1024 * 1024,
+    )
+    .ok()
+    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    .and_then(|doc| {
+        serde_json::from_value::<crate::routing::Snapshot>(doc.get("routing")?.clone()).ok()
+    });
+    if snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot.mode != app.routing.mode
+            || snapshot.hosts.len() != app.rewrite_hosts.len()
+            || !app.rewrite_hosts.iter().all(|host| {
+                snapshot
+                    .hosts
+                    .iter()
+                    .filter(|route| &route.host == host)
+                    .count()
+                    == 1
+            })
+    }) {
+        return Check::new(
+            "pac",
+            Verdict::Warn,
+            format!("{detail}；运行中的路由模式或域名范围与当前配置不一致，请重启代理"),
+        );
+    }
+    let routes = snapshot
+        .map(|snapshot| snapshot.pac_routes())
+        .unwrap_or_default();
+    let expected_text = pac::build_with_routes(app.listen.port(), &app.rewrite_hosts, &routes);
     let served = fetch_pac_text(app.listen.port());
     let (live_verdict, note) = pac_live_verdict(&expected_text, served.as_deref());
     Check::new("pac", live_verdict, format!("{detail}；{note}"))
@@ -806,8 +848,12 @@ mod tests {
     #[test]
     fn pac_registry_match_is_pass() {
         let expected = "http://127.0.0.1:8443/winget-accel.pac";
-        let (verdict, _) = pac_registry_detail(expected, Some(expected));
-        assert_eq!(verdict, Verdict::Pass);
+        for actual in [
+            expected,
+            "http://127.0.0.1:8443/winget-accel.pac?session=test&route=7",
+        ] {
+            assert_eq!(pac_registry_detail(expected, Some(actual)).0, Verdict::Pass);
+        }
     }
 
     #[test]

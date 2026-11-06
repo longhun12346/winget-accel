@@ -16,7 +16,10 @@
 ### 用户可见变化
 
 - 默认接管 winget 的 `network.downloader=wininet`，绕过不读取 PAC 的 Delivery Optimization；退出时恢复原值。
-- PAC 对 `github.com` 整域代理，代理内部按路径改写；普通页面保持原目标，Git clone 仍不支持。
+- 默认自动判断直连：真实资产连续两次达到 512 KiB/s 后，PAC 为验证过的精确域名返回 DIRECT。
+- 路由定期复查、失败撤销并冷却，DIRECT 规则带有效期；可用 `routing.mode=accelerator` 固定公共加速链。
+- 需要加速的 `github.com` 整域代理，内部按路径改写；普通页面保持原目标，经代理的 Git clone 不支持。
+- `/health.routing` 暴露逐域名测速结果；PAC URL 版本更新与恢复日志支持刷新中途崩溃恢复。
 - 启动前验证候选公共加速服务；未通过资产 Range 验证的候选不会进入下载池。
 - `--doctor` 增加运行中 PAC、CA 实际约束、全局代理、测速资产和 winget 下载器检查。
 - 同一用户的多个实例使用共享锁；PAC 和 winget 设置使用带会话标识的状态文件和看门狗恢复。
@@ -33,6 +36,7 @@
 ### 验证和交付
 
 - 增加本地 fake upstream、真实 Rust 二进制协议测试、PAC 生命周期和多进程看门狗测试。
+- 增加有界双采样、精确域名直连、过期冷却、Windows 原生 PAC 求值及刷新崩溃恢复回归。
 - 修复协议测试与 PAC 整域代理语义不一致导致的 CI 假失败。
 - CI 和发布脚本关闭 Cargo ANSI 颜色并使用未来 mtime，可靠验证真实重编和可复现 SHA256。
 - 发布包校验不再误杀其它实例，异常路径正确返回失败。

@@ -66,6 +66,8 @@ pub struct WingetState {
 pub struct SavedState {
     pub prior: Option<String>,
     pub owned_pac: Option<String>,
+    /// During a URL refresh either registry value is recoverable after a crash.
+    pub previous_pac: Option<String>,
     pub session: Option<String>,
     /// 本次是否接管过 winget 的设置文件；`None` = 没接管。
     pub winget: Option<WingetState>,
@@ -76,6 +78,7 @@ impl SavedState {
         Self {
             prior,
             owned_pac: Some(format!("http://127.0.0.1:{port}/winget-accel.pac")),
+            previous_pac: None,
             // 这是会话标识，不用作认证凭据。
             session: Some(format!(
                 "{:016x}{:016x}",
@@ -104,6 +107,7 @@ impl SavedState {
                 return Ok(Self {
                     prior: (!text.is_empty()).then(|| text.to_string()),
                     owned_pac: None,
+                    previous_pac: None,
                     session: None,
                     winget: None,
                 });
@@ -127,20 +131,38 @@ impl SavedState {
             let owned = doc
                 .get("ownedPac")
                 .and_then(|v| v.as_str())
-                .filter(|value| is_our_pac(value))
+                .filter(|value| is_owned_endpoint(value))
                 .context("PAC 状态缺少合法的 ownedPac")?;
             let session = doc
                 .get("session")
                 .and_then(|v| v.as_str())
                 .filter(|value| !value.is_empty())
                 .context("PAC 状态缺少 session")?;
+            if !matches_session(owned, session) {
+                bail!("PAC 状态 ownedPac 会话不匹配");
+            }
             (Some(owned.to_string()), Some(session.to_string()))
         } else {
             (None, None)
         };
+        let previous_pac = match doc.get("previousPac") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value))
+                if is_owned_endpoint(value)
+                    && session
+                        .as_deref()
+                        .is_some_and(|session| matches_session(value, session))
+                    && value.split('?').next()
+                        == owned_pac.as_deref().and_then(|url| url.split('?').next()) =>
+            {
+                Some(value.clone())
+            }
+            _ => bail!("PAC 状态 previousPac 非法"),
+        };
         Ok(Self {
             prior,
             owned_pac,
+            previous_pac,
             session,
             winget: parse_winget(&doc),
         })
@@ -148,11 +170,27 @@ impl SavedState {
 
     pub fn owns(&self, current: Option<&str>) -> bool {
         match (&self.owned_pac, current) {
-            (Some(owned), Some(current)) => current == owned,
+            (Some(owned), Some(current)) => {
+                current == owned || self.previous_pac.as_deref() == Some(current)
+            }
             // 旧版没有记录自己写入的值，只在当前仍明确指向本工具时恢复。
             (None, Some(current)) => is_our_pac(current),
             _ => false,
         }
+    }
+
+    pub fn set_revision(&mut self, revision: u64, current: String) -> Result<()> {
+        let base = self
+            .owned_pac
+            .as_deref()
+            .context("missing owned PAC")?
+            .split('?')
+            .next()
+            .unwrap();
+        let session = self.session.as_deref().context("missing session")?;
+        self.owned_pac = Some(format!("{base}?session={session}&route={revision}"));
+        self.previous_pac = Some(current);
+        Ok(())
     }
 }
 
@@ -191,6 +229,36 @@ fn is_our_pac(value: &str) -> bool {
         .is_some_and(|port| port != 0)
 }
 
+fn is_owned_endpoint(value: &str) -> bool {
+    if is_our_pac(value) {
+        return true;
+    }
+    let Some((base, query)) = value.split_once('?') else {
+        return false;
+    };
+    let Some((session, revision)) = query
+        .strip_prefix("session=")
+        .and_then(|q| q.split_once("&route="))
+    else {
+        return false;
+    };
+    is_our_pac(base)
+        && !session.is_empty()
+        && session
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && revision.parse::<u64>().is_ok()
+}
+
+fn matches_session(value: &str, session: &str) -> bool {
+    value.split_once('?').is_none_or(|(_, query)| {
+        query
+            .strip_prefix("session=")
+            .and_then(|q| q.split_once("&route="))
+            .is_some_and(|(value, _)| value == session)
+    })
+}
+
 pub fn read(path: &Path) -> Result<Option<SavedState>> {
     match std::fs::read_to_string(path) {
         Ok(text) => SavedState::parse(&text).map(Some).with_context(|| {
@@ -210,6 +278,7 @@ pub fn write(path: &Path, state: &SavedState) -> Result<()> {
             "version": 2,
             "prior": state.prior,
             "ownedPac": state.owned_pac,
+            "previousPac": state.previous_pac,
             "session": state.session,
         })
     } else {
@@ -258,6 +327,21 @@ mod tests {
         })
         .to_string();
         assert_eq!(SavedState::parse(&text).unwrap(), empty);
+        let mut versioned = state.clone();
+        versioned
+            .set_revision(1, state.owned_pac.clone().unwrap())
+            .unwrap();
+        let mut doc = serde_json::json!({
+            "version": 2, "prior": state.prior, "ownedPac": versioned.owned_pac,
+            "previousPac": versioned.previous_pac, "session": versioned.session
+        });
+        assert_eq!(SavedState::parse(&doc.to_string()).unwrap(), versioned);
+        doc["session"] = "different-session".into();
+        assert!(SavedState::parse(&doc.to_string()).is_err());
+        doc["session"] = versioned.session.unwrap().into();
+        doc["previousPac"] =
+            "http://127.0.0.1:18443/winget-accel.pac?session=different&route=0".into();
+        assert!(SavedState::parse(&doc.to_string()).is_err());
     }
 
     #[test]

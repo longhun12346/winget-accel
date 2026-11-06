@@ -89,6 +89,9 @@ try {
     foreach ($p in $example.health.PSObject.Properties) {
         if ($p.Name -notlike '$*') { $usedKeys += $p.Name }
     }
+    foreach ($p in $example.routing.PSObject.Properties) {
+        if ($p.Name -notlike '$*') { $usedKeys += $p.Name }
+    }
     foreach ($p in $example.accelerators[0].PSObject.Properties) {
         if ($p.Name -notlike '$*') { $usedKeys += $p.Name }
     }

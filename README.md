@@ -3,19 +3,19 @@
 `winget-accel` 是一个 Windows 本地代理，让 `winget` 下载 GitHub 安装包时使用公共
 GitHub 加速服务。它不替换 winget 源、不修改清单，也不维护自己的软件包索引。
 
-程序只处理下载链路：PAC 把指定的 GitHub 下载域名交给本机，代理终止 TLS，按请求路径
-把下载 URL 改写成公共加速服务的 URL，再流式转发响应正文，保持安装包字节一致。安装包的完整性仍由
-winget 根据官方清单中的 `InstallerSha256` 校验。
+默认先检查真实下载资产的直连表现：连续两次达到速度门槛的精确域名由 PAC 返回
+`DIRECT`，绕过本机代理和公共加速服务。其余域名交给本机，终止 TLS 后按请求路径
+改写到公共加速服务，并流式转发正文。安装包完整性仍由 winget 根据官方清单中的
+`InstallerSha256` 校验。
 
 ## 先看边界
 
 - 只支持 Windows 10/11 x64，不需要管理员权限、VC++ 运行库或 .NET。
 - 只使用公共 URL 前缀加速服务；候选池会在启动时刷新，也有本地缓存和内置兜底。
-- 不支持 `git clone`、`git-upload-pack` 等带请求体的 Git 操作。本代理不转发请求体，
-  这类请求会被拒绝。
-- `github.com` 在 PAC 层按整域交给本机，因为 WinINet 的 HTTPS PAC 调用不提供路径。
-  代理层再按路径决定：下载路径改写，普通页面原样转发回 GitHub。
-- 所有候选失效时返回 `502`，不回退直连。对 winget 来说，直连通常只是再等待一次失败。
+- 经本机代理的 `git clone` 等带请求体的 Git 操作会被拒绝；已验证为 DIRECT 的连接不经过本工具。
+- 需要加速的 `github.com` 在 PAC 层按整域交给本机，因为 WinINet 的 HTTPS PAC 调用不提供路径。
+  代理再按路径区分下载和普通页面；直连例外不自动放行未测试的子域。
+- 代理内候选用尽仍返回 `502`，不盲目回退到未经验证的直连。
 
 ## 安装和运行
 
@@ -31,12 +31,11 @@ D:\Tools\winget-accel
 
 双击 `winget-accel.exe`。默认模式会依次完成：
 
-1. 生成或复用本机 CA；
-2. 请求把 CA 加入“当前用户\受信任的根证书颁发机构”；
-3. 设置当前用户 PAC；
-4. 把 winget 用户设置中的 `network.downloader` 设为 `wininet`，绕过不读取 PAC 的
-   Delivery Optimization；
-5. 验证候选加速服务后开始监听 `127.0.0.1:8443`。
+1. 预留监听端口，生成或复用本机 CA；
+2. 检查真实资产的直连能力并验证公共加速候选；
+3. 请求把 CA 加入“当前用户\受信任的根证书颁发机构”，供需要加速的连接使用；
+4. 设置当前用户 PAC，把 winget 的 `network.downloader` 设为 `wininet`；
+5. 报告“已就绪”，在 `127.0.0.1:8443` 提供服务并后台更新路由。
 
 第一次安装 CA 时会出现 Windows 确认框，需要在可见桌面中点击“是”。确认完成后，在另一个
 终端正常使用：
@@ -54,7 +53,8 @@ winget download --id junegunn.fzf --download-directory "$env:TEMP\winget-test"
 ```text
 winget 查询清单  ──>  官方 winget 源，DIRECT
        |
-       └─ 下载 GitHub 资产 ── PAC ──> 127.0.0.1:8443
+       └─ 下载 GitHub 资产 ── PAC ──┬─ 已验证够快的精确域名 ──> GitHub，DIRECT
+                                   └─ 其余 ──> 127.0.0.1:8443
                                       ├ github.com 下载路径
                                       │  └ TLS MITM -> 公共加速器 -> GitHub
                                       ├ github.com 普通路径
@@ -89,6 +89,11 @@ winget-accel.exe --config .\config.json
 | `listen` | 监听地址，只接受 `127.0.0.1:<固定端口>` |
 | `rewriteHosts` | 终止 TLS 并允许 URL 改写的精确主机名 |
 | `accelerators` | 自定义公共加速候选；非空时替代自动候选池 |
+| `routing.mode` | `auto` 默认自动判断；`accelerator` 强制公共加速器 |
+| `routing.minDirectKbps` | 直连门槛，默认 512 KiB/s |
+| `routing.timeoutSeconds` | 每个资产两次采样的总期限，默认 5 秒 |
+| `routing.intervalSeconds` / `routing.cooldownSeconds` | 复查间隔和恢复直连的冷却期，默认均为 300 秒 |
+| `routing.probeUrls` | 可选的真实直连测速资产；默认检查 release 安装包和 codeload 归档 |
 | `health.probeUrl` | 候选测速资产，必须是完整 HTTPS URL |
 | `health.enabled` | 是否运行例行巡检；全挂后的恢复探测仍会运行 |
 | `mitmExtra` | 额外终止 TLS 但不改写的主机，仅用于排障 |
@@ -97,6 +102,16 @@ winget-accel.exe --config .\config.json
 
 `rewriteHosts` 只接受精确主机名，不接受通配符、协议、路径或端口。修改白名单后，若
 已有 CA 的 Name Constraints 不再匹配，程序会提示删除证书目录并重新生成。
+
+自动路由每个资产连续取两段 256 KiB，取较低速度，并将 DNS、TLS 和重定向时间计入。
+默认两个资产并行检查，每个资产的总期限为 5 秒。未验证的域名保持代理；
+`objects.githubusercontent.com` 等 CDN 只有在成功重定向链中连续两次出现，或显式配置
+其测速资产后才可能直连。`/health` 中的 `routing` 给出每个域名的结果、速度和有效期。
+这些是小样本估计；可调整门槛，或设 `routing.mode=accelerator` 固定使用加速器。
+
+路由变化时更新 PAC URL 并通知 Windows，退出后还原原始设置。DIRECT 规则自带有效期，
+旧 PAC 再次求值时会拒绝过期的直连证据。Windows 还可能缓存代理决策，不能保证所有客户端
+立即切换；现有连接不会被迁移，更新主要影响后续连接。
 
 ## 命令
 
@@ -122,7 +137,7 @@ winget-accel [--config <路径>] [--doctor [--quick]] [--remove-ca]
 ```
 
 `state.json` 记录原 PAC、程序写入的 PAC、会话标识，以及 winget 设置的原值。程序只在当前
-PAC 仍等于本次写入值时恢复它；损坏或无法读取状态时保留文件并停止自动接管，避免把用户
+PAC 仍等于本次写入值（包括 URL 更新中途记录的新旧值）时恢复它；损坏或无法读取状态时保留文件并停止自动接管，避免把用户
 自己的 PAC 当成“原本没有”。同一用户的多个解压副本共用锁，旧看门狗不会处理新会话。
 
 CA 私钥以明文保存在 `certs\ca-key.pem`。不要把包含 `certs` 的目录发给别人或放进云同步
@@ -172,6 +187,8 @@ cargo test --test protocol --offline -- --test-threads=1
 需要验证真实公共服务时，可运行 `.\packaging\verify-no-env.ps1`。它要求两次 Range 请求
 均通过代理取得完整的 64 KiB，并检查成功改写日志，以及运行前、运行中和退出后的
 PAC、受信任根、恢复日志与锁的状态。
+使用 `.\packaging\verify-no-env.ps1 -RoutingMode auto` 可同时运行真实直连探测，
+打印路由结果；负载仍显式经过本机代理，以验证公共加速链和系统设置保护。
 
 ## 当前验证边界
 

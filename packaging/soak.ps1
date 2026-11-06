@@ -110,6 +110,7 @@ while ($true) {
         certDir      = $certDir
         logPath      = $logPath
         health       = @{ enabled = $false }
+        routing      = @{ mode = 'accelerator' }
     } | ConvertTo-Json -Depth 6 | Set-Content -Path $cfgPath -Encoding UTF8
 
     $proxyProc = Start-Process $exe -ArgumentList '--config', $cfgPath, '--no-env' -PassThru -WindowStyle Hidden

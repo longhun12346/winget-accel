@@ -103,6 +103,7 @@ impl EnvGuard {
     /// 退出/崩溃时按记录的原值还原；为假时完全不碰 winget 的设置文件。
     pub fn enable(cert_dir: &Path, state_dir: &Path, port: u16, winget: bool) -> Result<Self> {
         let opts = EnableOptions {
+            versioned_pac: true,
             winget_path: if winget {
                 crate::winget::settings_path()
             } else {
@@ -159,6 +160,10 @@ impl EnvGuard {
         };
         let state_path = state_dir.join(STATE_FILE);
         let mut state = SavedState::new(prior, port);
+        if opts.versioned_pac {
+            state.set_revision(0, state.owned_pac.clone().unwrap())?;
+            state.previous_pac = None;
+        }
         if let Some(prior) = &winget_prior {
             state = state.with_winget(WingetState {
                 path: prior.path.to_string_lossy().to_string(),
@@ -235,6 +240,7 @@ struct EnableOptions {
     watchdog: bool,
     /// winget 设置文件路径；`None` = 不接管 winget（测试默认、或配置关掉）。
     winget_path: Option<PathBuf>,
+    versioned_pac: bool,
 }
 
 impl Default for EnableOptions {
@@ -244,6 +250,7 @@ impl Default for EnableOptions {
             ensure_ca: true,
             watchdog: true,
             winget_path: None,
+            versioned_pac: false,
         }
     }
 }
@@ -419,8 +426,10 @@ fn write_pac_at(key: &str, value: &str) -> Result<()> {
             (value.len() * 2) as u32,
         );
         R::RegCloseKey(opened);
-        registry_result(status).context("写 PAC 注册表失败")
+        registry_result(status).context("写 PAC 注册表失败")?;
     }
+    notify_proxy_change(key);
+    Ok(())
 }
 
 fn delete_pac_at(key: &str) -> Result<()> {
@@ -432,7 +441,73 @@ fn delete_pac_at(key: &str) -> Result<()> {
     if matches!(status, 2 | 3) {
         return Ok(());
     }
-    registry_result(status).context("删除 PAC 注册表失败")
+    registry_result(status).context("删除 PAC 注册表失败")?;
+    notify_proxy_change(key);
+    Ok(())
+}
+
+fn notify_proxy_change(key: &str) {
+    // Scratch-key tests must never notify or modify the real system proxy.
+    if key != INET_KEY {
+        return;
+    }
+    use windows_sys::Win32::Networking::WinInet::{
+        InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+    };
+    for option in [INTERNET_OPTION_SETTINGS_CHANGED, INTERNET_OPTION_REFRESH] {
+        // SAFETY: these process-wide notifications take a null handle/buffer.
+        if unsafe { InternetSetOptionW(std::ptr::null(), option, std::ptr::null(), 0) } == 0 {
+            crate::log::warn(&format!(
+                "PAC-NOTIFY-FAIL Windows 刷新通知失败: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+}
+
+/// No-env has no restore context and never writes the registry or journal.
+pub fn refresh_owned_pac(revision: u64) -> Result<bool> {
+    let Some(context) = RESTORE_CONTEXT.get() else {
+        return Ok(false);
+    };
+    if !PAC_WRITTEN.load(AtomicOrdering::SeqCst) {
+        return Ok(false);
+    }
+    refresh_pac_at(
+        &context.state_path,
+        &context.inet_key,
+        context.session.as_deref(),
+        revision,
+    )
+}
+
+fn refresh_pac_at(
+    state_path: &Path,
+    key: &str,
+    session: Option<&str>,
+    revision: u64,
+) -> Result<bool> {
+    let _update = PAC_UPDATE.lock().expect("PAC update lock");
+    let Some(mut state) = pacstate::read(state_path)? else {
+        return Ok(false);
+    };
+    if session.is_none() || state.session.as_deref() != session {
+        return Ok(false);
+    }
+    let Some(current) = read_pac_checked(key)?.filter(|value| state.owns(Some(value))) else {
+        return Ok(false);
+    };
+    state.set_revision(revision, current.clone())?;
+    // Record both sides before touching the registry: either survives a crash.
+    pacstate::write(state_path, &state)?;
+    if read_pac_checked(key)?.as_deref() != Some(&current) {
+        return Ok(false);
+    }
+    write_pac_at(key, state.owned_pac.as_deref().unwrap())?;
+    state.previous_pac = None;
+    pacstate::write(state_path, &state)?;
+    crate::log::info(&format!("PAC-REFRESH revision={revision}"));
+    Ok(true)
 }
 
 /// CA 是否已在用户根存储里。
@@ -516,6 +591,7 @@ struct RestoreContext {
 }
 
 static RESTORE_CONTEXT: std::sync::OnceLock<RestoreContext> = std::sync::OnceLock::new();
+static PAC_UPDATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 是否已进入本次 PAC 写入阶段。
 ///
 /// 控制台事件处理器现在无条件注册（见 `install_exit_handler`），所以必须先问一句
@@ -840,6 +916,7 @@ fn restore_saved_state_impl(
     session: Option<&str>,
     consume: bool,
 ) -> Result<RestoreOutcome> {
+    let _update = PAC_UPDATE.lock().expect("PAC update lock");
     let Some(state) = pacstate::read(state_path)? else {
         return Ok(RestoreOutcome::Absent);
     };
@@ -881,6 +958,95 @@ fn describe_status(code: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pac_refresh_is_recoverable_on_either_side_of_registry_update() {
+        struct Sandbox {
+            root: PathBuf,
+            key: String,
+        }
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                if let Ok(subkey) = registry_path(&self.key) {
+                    // SAFETY: only this test's randomly named scratch key.
+                    unsafe {
+                        R::RegDeleteTreeW(R::HKEY_CURRENT_USER, subkey.as_ptr());
+                    }
+                }
+                if let (Ok(root), Ok(temp)) = (
+                    self.root.canonicalize(),
+                    std::env::temp_dir().canonicalize(),
+                ) {
+                    if root.parent() == Some(temp.as_path())
+                        && root
+                            .file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with("wg-route-refresh-"))
+                    {
+                        let _ = std::fs::remove_dir_all(root);
+                    }
+                }
+            }
+        }
+        let id = format!("{:016x}", fastrand::u64(..));
+        let sandbox = Sandbox {
+            root: std::env::temp_dir().join(format!("wg-route-refresh-{id}")),
+            key: format!(r"HKCU\Software\winget-accel-route-{id}"),
+        };
+        let certs = sandbox.root.join("certs");
+        std::fs::create_dir_all(&certs).unwrap();
+        std::fs::write(certs.join("ca-cert.pem"), "placeholder").unwrap();
+        let options = || EnableOptions {
+            inet_key: sandbox.key.clone(),
+            ensure_ca: false,
+            watchdog: false,
+            winget_path: None,
+            versioned_pac: true,
+        };
+        let state_path = sandbox.root.join(STATE_FILE);
+        let original = "http://corp.example/代理.pac";
+        write_pac_at(&sandbox.key, original).unwrap();
+        for registry_updated in [false, true] {
+            let guard = EnvGuard::enable_with(&certs, &sandbox.root, 18443, options()).unwrap();
+            let state = pacstate::read(&state_path).unwrap().unwrap();
+            assert!(read_pac_checked(&sandbox.key)
+                .unwrap()
+                .unwrap()
+                .contains("?session="));
+            assert!(
+                !refresh_pac_at(&state_path, &sandbox.key, Some("another-session"), 7).unwrap()
+            );
+            assert!(
+                refresh_pac_at(&state_path, &sandbox.key, state.session.as_deref(), 7).unwrap()
+            );
+            let mut state = pacstate::read(&state_path).unwrap().unwrap();
+            assert!(state.previous_pac.is_none());
+            let current = read_pac_checked(&sandbox.key).unwrap().unwrap();
+            assert!(current.ends_with("&route=7"));
+            state.set_revision(8, current).unwrap();
+            pacstate::write(&state_path, &state).unwrap();
+            if registry_updated {
+                write_pac_at(&sandbox.key, state.owned_pac.as_deref().unwrap()).unwrap();
+            }
+            std::mem::forget(guard);
+            EnvGuard::recover_stale_at(&sandbox.root, &sandbox.key).unwrap();
+            assert_eq!(
+                read_pac_checked(&sandbox.key).unwrap().as_deref(),
+                Some(original)
+            );
+        }
+        let guard = EnvGuard::enable_with(&certs, &sandbox.root, 18443, options()).unwrap();
+        let state = pacstate::read(&state_path).unwrap().unwrap();
+        let manual = "http://corp.example/user-changed.pac";
+        write_pac_at(&sandbox.key, manual).unwrap();
+        let before = std::fs::read(&state_path).unwrap();
+        assert!(!refresh_pac_at(&state_path, &sandbox.key, state.session.as_deref(), 9).unwrap());
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        drop(guard);
+        assert_eq!(
+            read_pac_checked(&sandbox.key).unwrap().as_deref(),
+            Some(manual)
+        );
+    }
 
     #[test]
     fn describes_known_error_codes() {
@@ -1171,6 +1337,7 @@ mod tests {
                 ensure_ca: false,
                 watchdog: false,
                 winget_path: None,
+                versioned_pac: false,
             },
         )
         .err()
@@ -1221,6 +1388,7 @@ mod tests {
             ensure_ca: false,
             watchdog: false,
             winget_path: None,
+            versioned_pac: false,
         };
         let pac_url = "http://127.0.0.1:18443/winget-accel.pac";
 
@@ -1304,6 +1472,7 @@ mod tests {
             ensure_ca: false,
             watchdog: false,
             winget_path: None,
+            versioned_pac: false,
         };
         let state_path = root.join(STATE_FILE);
         let original = "http://corp.example/代理.pac";

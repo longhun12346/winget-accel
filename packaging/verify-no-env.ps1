@@ -22,13 +22,18 @@
 .PARAMETER Port
     代理端口（默认自动挑空闲端口）。
 
+.PARAMETER RoutingMode
+    默认 accelerator 固定验证加速链；auto 额外执行真实直连探测。
+
 .EXAMPLE
     ./packaging/verify-no-env.ps1
 #>
 [CmdletBinding()]
 param(
     [int]$Requests = 2,
-    [int]$Port = 0
+    [int]$Port = 0,
+    [ValidateSet('auto', 'accelerator')]
+    [string]$RoutingMode = 'accelerator'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -88,11 +93,12 @@ try {
 
     @{
         listen       = "127.0.0.1:$Port"
-        rewriteHosts = @('github.com')
+        rewriteHosts = @('github.com', 'objects.githubusercontent.com', 'codeload.github.com', 'release-assets.githubusercontent.com')
         accelerators = @(@{ name = 'A'; template = 'https://gh-proxy.com/{url}'; priority = 1 })
         certDir      = $certDir
         logPath      = Join-Path $work 'proxy.log'
         health       = @{ enabled = $false }
+        routing      = @{ mode = $RoutingMode }
     } | ConvertTo-Json -Depth 6 | Set-Content -Path $cfgPath -Encoding UTF8
 
     $proxyProc = Start-Process $exe -ArgumentList '--config', ('"{0}"' -f $cfgPath), '--no-env' -PassThru -WindowStyle Hidden
@@ -113,6 +119,12 @@ try {
     }
     if ($proxyProc.HasExited) { throw "代理启动失败（退出码 $($proxyProc.ExitCode)）" }
     if (-not $ready) { throw "40 秒内代理未就绪；等待 CA 和 /health 失败" }
+    if ($health.routing.mode -ne $RoutingMode) { throw "运行中的 routing.mode 与配置不一致" }
+    Write-Host ("路由：mode={0}  {1}" -f $health.routing.mode,
+        (($health.routing.hosts | ForEach-Object {
+            "{0}={1}({2}, {3} KiB/s)" -f $_.host,
+                $(if ($_.direct) { 'DIRECT' } else { 'ACCELERATOR' }), $_.reason, $_.kbps
+        }) -join ', '))
 
     # 施加真实负载：证明它确实在干活，而不是"没跑起来所以没改系统"。
     #

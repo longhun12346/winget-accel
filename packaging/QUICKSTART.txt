@@ -2,15 +2,16 @@ winget-accel — 让 winget 使用公共 GitHub 加速服务
 ================================================
 
 这是一个 Windows 本地代理。它不替换 winget 源、不修改清单，只接管 GitHub 安装包的
-下载请求，把它们转到公共 URL 前缀加速服务。winget 仍使用官方清单和官方哈希校验。
+下载请求。默认验证真实资产，直连足够快的精确域名直接访问 GitHub，其余交给公共 URL
+前缀加速服务。winget 仍使用官方清单和官方哈希校验。
 
 边界
 ----
 
 - 支持 Windows 10/11 x64。
-- 不支持 git clone / git-upload-pack。代理不转发请求体。
-- PAC 对 github.com 整域代理；代理内部只改写下载路径，普通页面原样回源。
-- 只能使用公共加速服务。服务可能限流、下线或临时不可用。
+- 经本机代理的 git clone / git-upload-pack 不支持，因为代理不转发请求体。
+- 需要加速的 github.com 在 PAC 中整域代理；代理只改写下载路径，普通页面原样回源。
+- 加速使用公共服务。服务可能限流、下线或临时不可用。
 
 放置程序
 --------
@@ -85,6 +86,9 @@ PAC 恢复记录和实例锁统一放在：
 - `rewriteHosts`：精确主机名列表，不写通配符、协议、路径或端口；
 - `accelerators`：自定义公共候选，非空时替代自动候选池；
 - `health.probeUrl`：自定义测速资产，必须是完整 HTTPS URL；
+- `routing.mode`：默认 auto，真实直连采样达标才放行；accelerator 强制使用公共加速器；
+- `routing.minDirectKbps`：默认直连门槛 512 KiB/s；每个资产连续两次各取 256 KiB；
+- `routing.probeUrls`：可选直连测速资产，默认检查 release 安装包和 codeload 归档；
 - `wingetDownloader`：设为 false 可跳过 winget 下载器设置；
 - `certDir` / `logPath`：覆盖证书和日志路径。
 
@@ -93,6 +97,11 @@ PAC 恢复记录和实例锁统一放在：
     winget-accel.exe --config .\config.json --no-env
 
 该模式仍运行代理和候选验证，但不安装 CA、不写 PAC、不改 winget 设置。
+
+自动路由默认每 300 秒检查，失败立即撤销直连选择，恢复直连须经过冷却。
+访问 http://127.0.0.1:8443/health 的 routing 字段可查看各域名的速度、路由和有效期。
+未覆盖的域名保持代理，不会因为 github.com 可达就放行所有 CDN 或子域。
+PAC 更新会通知 Windows；客户端缓存和已有连接可能延后切换。
 
 证书和安全
 ----------
@@ -130,8 +139,9 @@ Windows 代理设置，不要直接删除现有 PAC。状态文件损坏时程�
 “下载 502”：查看 `--doctor` 的 `chain` 和 `probe`。候选首页可达不代表资产支持
 Range；测速资产被删除时，可以配置自己的 `health.probeUrl`。
 
-“仍然很慢”：确认日志里有 `REWRITE`，并检查 `proxyenv` 是否显示全局代理。公共服务
-的速度和限流会变化，候选池会自动切换。
+“仍然很慢”：先看 /health 的 routing。DIRECT 不会出现 REWRITE 日志；需要代理时检查
+REWRITE 与 `proxyenv`。公共服务的速度和限流会变化，候选池会自动切换。
+需要固定加速链排障时设置 routing.mode=accelerator。
 
 提交诊断信息时，请提供：
 

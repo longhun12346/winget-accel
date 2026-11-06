@@ -45,7 +45,7 @@ cargo metadata --format-version 1 | ConvertFrom-Json |
 | `webpki-roots` | 1 | 校验加速器证书的根证书集合 |
 | `ring` | 0.17 | `rustls`/`rcgen` 的加密后端（`aws-lc-rs` 被刻意排除，见 ADR-012） |
 | `x509-parser` / `asn1-rs` / `der-parser` / `yasna` | — | 解析证书有效期、读取 Name Constraints（测试与诊断） |
-| `windows-sys` | 0.61 | Win32 证书存储 API、本地时间 |
+| `windows-sys` | 0.61 | Win32 证书存储、注册表、本地时间和 WinINet 代理刷新通知；测试另用 WinHTTP PAC 引擎 |
 | `serde` / `serde_json` | 1 | 配置与 `/health` 输出 |
 | `tokio` | 1.54 | 共享异步运行时、socket、计时器和同步 |
 | `hyper` / `hyper-util` | 1.12 / 0.1 | HTTP/1.1 客户端/服务端、CONNECT 升级、Tokio I/O 适配 |

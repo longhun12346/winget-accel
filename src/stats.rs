@@ -75,6 +75,7 @@ impl Stats {
         uptime_seconds: u64,
         learned: Vec<LearnedBlock>,
         pin_saturated: bool,
+        routing: Option<crate::routing::Snapshot>,
     ) -> String {
         #[derive(serde::Serialize)]
         struct Doc<'a> {
@@ -103,6 +104,8 @@ impl Stats {
             pin_saturated: bool,
             status: &'a str,
             accelerators: Vec<AccelHealth>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            routing: Option<crate::routing::Snapshot>,
         }
 
         let doc = Doc {
@@ -121,6 +124,7 @@ impl Stats {
             pin_saturated,
             status,
             accelerators,
+            routing,
         };
         serde_json::to_string(&doc).unwrap_or_else(|_| "{}".to_string())
     }
@@ -133,7 +137,7 @@ mod tests {
     #[test]
     fn health_json_has_all_counters_at_zero() {
         let stats = Stats::default();
-        let json = stats.health_json("ok", Vec::new(), 0, Vec::new(), false);
+        let json = stats.health_json("ok", Vec::new(), 0, Vec::new(), false, None);
         for key in ["connects", "mitm", "tunnel", "rewrites", "bytes", "errors"] {
             assert!(json.contains(&format!("\"{key}\":0")), "缺少 {key}: {json}");
         }
@@ -156,6 +160,7 @@ mod tests {
                 host: "codeload.github.com".into(),
             }],
             true,
+            None,
         );
         assert!(
             json.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))),
@@ -192,7 +197,7 @@ mod tests {
         let stats = Stats::default();
         Stats::bump(&stats.rewrites);
         Stats::add(&stats.bytes, 1024);
-        let json = stats.health_json("down", Vec::new(), 42, Vec::new(), false);
+        let json = stats.health_json("down", Vec::new(), 42, Vec::new(), false, None);
         assert!(json.contains("\"rewrites\":1"), "{json}");
         assert!(json.contains("\"bytes\":1024"), "{json}");
         assert!(json.contains("\"status\":\"down\""), "{json}");
@@ -208,7 +213,7 @@ mod tests {
             kbps: 0,
             samples: 0,
         }];
-        let json = stats.health_json("ok", accels, 7, Vec::new(), false);
+        let json = stats.health_json("ok", accels, 7, Vec::new(), false, None);
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("必须是合法 JSON");
         assert_eq!(
             parsed["accelerators"][0]["host"].as_str().unwrap(),
@@ -233,7 +238,7 @@ mod tests {
                 samples: 0,
             },
         ];
-        let json = stats.health_json("ok", accels, 7, Vec::new(), false);
+        let json = stats.health_json("ok", accels, 7, Vec::new(), false, None);
         assert!(json.contains("\"host\":\"a.example\""), "{json}");
         assert!(json.contains("\"health\":\"unhealthy\""), "{json}");
     }

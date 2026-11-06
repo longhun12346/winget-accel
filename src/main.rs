@@ -1,5 +1,5 @@
-//! winget-accel：用 PAC 把 4 个 GitHub 下载域名指到本机，
-//! 由本机终止 TLS 并把请求改写到加速器。
+//! winget-accel：验证下载直连能力，PAC 优先放行够快的域名，
+//! 其余下载由本机终止 TLS 并改写到公共加速器。
 //!
 //! Rust CLI 只保留必要入口；测试通过临时配置文件驱动。
 //!
@@ -19,6 +19,7 @@ mod pac;
 mod pacstate;
 mod proxy;
 mod rewrite;
+mod routing;
 mod stats;
 mod winget;
 
@@ -168,12 +169,11 @@ fn main() -> Result<()> {
              两者并存时 WinINet 优先哪一个未验证——若下载没走加速链，先关掉全局代理再试",
         );
     }
-    // bootstrap 期间**还没写 PAC**（PAC 在 EnvGuard::enable 里写），所以这几十秒内
-    // 开始的 winget 下载会走直连——按 ADR-016 的实测，那是"37 秒后失败、0 字节"。
-    // 与其让用户自己撞上去，不如先说清楚该等什么。
+    // 探测期间还没写 PAC，等两条链路准备好之后才接管系统并报告就绪。
     logger.info(
-        "正在验证加速器候选（最多 30 秒）。此间系统代理尚未接管，请等下面的「已就绪」再开始下载。",
+        "正在检查直连路由和加速器候选。此间系统代理尚未接管，请等下面的「已就绪」再开始下载。",
     );
+    proxy.routing.refresh(&logger);
     proxy.bootstrap_health();
     let _env_guard = if let Some(lock) = &pac_lock {
         Some(autoenv::EnvGuard::enable(
@@ -215,6 +215,7 @@ fn main() -> Result<()> {
         logger.info("  env      未接管系统设置（--no-env），如需 winget 走代理请去掉该参数");
     }
 
+    proxy.routing.spawn(logger);
     proxy.serve(listener)
 }
 
@@ -352,6 +353,7 @@ mod tests {
             ("proxy/local.rs", include_str!("proxy/local.rs")),
             ("proxy/probe.rs", include_str!("proxy/probe.rs")),
             ("rewrite.rs", include_str!("rewrite.rs")),
+            ("routing.rs", include_str!("routing.rs")),
             ("stats.rs", include_str!("stats.rs")),
             ("winget.rs", include_str!("winget.rs")),
         ];

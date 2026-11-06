@@ -26,10 +26,10 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem",
 # 上游（加速器）证书校验需要根证书；纯数据 crate，无传递依赖，无 C 代码。
 # 这是对 ADR-012 允许清单的一处新增，理由见 docs/design.md。
 webpki-roots = "1"
-# Win32 API：证书存储、Unicode PAC 注册表读写，以及独立看门狗进程标志。
+# Win32 API：证书存储、Unicode PAC 注册表读写、WinINet 刷新通知，以及独立看门狗进程标志。
 # 用它替代原先调 powershell.exe 的做法（见 ADR-012 第 3 次修订）。
 # 与 Tokio/mio/socket2 共用 0.61，避免重复绑定和 windows-targets 依赖树。
-windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_System_Threading", "Win32_Networking_WinInet"] }
 
 # 解析证书的 NotAfter：windows-sys 没有导出 CERT_NOT_AFTER_FILETIME_PROP_ID，
 # 与其编一个常量，不如用成熟解析器。它已是 rcgen 的传递依赖（^0.18），不引入新 crate。
@@ -51,6 +51,10 @@ bytes = "1.12.1"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 # 复用成熟的读写空闲超时适配器，避免自行实现 AsyncRead/AsyncWrite 计时。
 tokio-io-timeout = "1.2.1"
+
+[dev-dependencies]
+# Evaluate generated PAC with Windows' own engine; no registry/system proxy edits.
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinHttp"] }
 
 [profile.release]
 opt-level = "z"

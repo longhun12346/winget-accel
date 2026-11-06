@@ -207,6 +207,7 @@ pub struct Proxy {
     pub stats: Arc<Stats>,
     pub log: Arc<Logger>,
     pub health: Arc<Tracker>,
+    pub routing: Arc<crate::routing::Router>,
     /// 同一文件的候选绑定：键 = host + path，值 = (候选索引, 过期时刻)。
     pins: std::sync::Mutex<std::collections::HashMap<String, (usize, std::time::Instant)>>,
     /// 绑定表是否已饱和到 [`MAX_PINS`]；只用来让 `PIN-FULL` 告警**只打一次**。
@@ -234,6 +235,7 @@ impl Proxy {
         health: Arc<Tracker>,
     ) -> Self {
         Self {
+            routing: Arc::new(crate::routing::Router::new(&app)),
             app,
             ca,
             stats,
