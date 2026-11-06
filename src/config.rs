@@ -19,10 +19,8 @@ pub const DEFAULT_REWRITE_HOSTS: [&str; 4] = [
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8443";
 
-/// 内置候选链（按多次实测中位数排序，2026-11-01）。
-///
-/// 刻意内置多个：即使不写配置文件，也不能只有一个候选——
-/// 那个单点一挂，功能就整体不可用（不回退直连，ADR-016）。
+/// 用户配置。未显式设置候选时读取公共清单，并由本机验证和下载样本决定权重。
+/// CI 清单只提供可用性与内容校验证据，不提供速度排名。
 #[derive(Debug, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct FileConfig {

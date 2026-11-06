@@ -43,18 +43,18 @@ function New-CandidateCatalog {
         }
         $wasCandidate = @($Existing.candidates | Where-Object { $_.template -eq $template }).Count -gt 0
         if (($builtin -or $passed) -and -not ($FirstPassOnly -and -not $builtin -and -not $wasCandidate)) {
-            $note = if ($passed) { "实测通过（CI 侧 $($result.kbps) KB/s，不代表用户网络）" }
+            $note = if ($passed) { '可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）' }
             elseif ($result) { "本轮实测失败（$($result.verdict)/$($result.status)），保留内置离线兜底" }
             else { '本轮未测，保留内置离线兜底' }
             $candidates.Add([ordered]@{
                     name = $name; template = $template; builtin = [bool]$builtin
-                    verified = [ordered]@{ date = $today; kbps = if ($result) { $result.kbps } else { 0 }; note = $note }
+                    verified = [ordered]@{ date = $today; note = $note }
                 })
             continue
         }
         if ($passed) {
             $failures = 0
-            $reason = "实测通过（$($result.kbps) KB/s）；-FirstPassOnly 下仅观察不启用"
+            $reason = '可用性校验通过；-FirstPassOnly 下仅观察不启用'
         }
         else {
             if ($result) { $failures++ }

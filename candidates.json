@@ -6,10 +6,9 @@
     "  builtin  true  = 编译进二进制，离线/上游消失时仍可用。标准很严：必须是长期存在、",
     "                   被多个独立项目引用、且我们实测通过的。宁可少，不可滥。",
     "  builtin  false = 由 CI 从上游发现并实测通过，随发布更新，不进离线兜底。",
-    "  verified        = **CI 侧**实测记录（日期 + KB/s）。CI 跑在 Azure 美国，与用户网络",
-    "                    （如国内）完全不同，此值不代表任何用户的体验，也不能用作排序依据。",
-    "                    它只记录『该域名当时活着、且返回字节与 GitHub 一致』。",
-    "                    真实排序由每个用户自己的运行时探测 + 下载样本决定。",
+    "  verified        = CI 侧可用性与内容一致性校验记录（日期 + 结论）。",
+    "                    只确认当时能下载，且样本字节与 GitHub 一致；不记录速度。",
+    "                    清单不按 CI 速度排序、筛选或限制数量；下载选择依据用户本机实测。",
     "",
     "上游发现源：https://hubp.tbedu.top/nodes.json（标准 JSON）。",
     "只取域名，不采信上游的任何推荐结论或顺序。",
@@ -26,8 +25,7 @@
       "builtin": true,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 79,
-        "note": "实测 79 KB/s"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -36,8 +34,7 @@
       "builtin": true,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 98,
-        "note": "实测 98 KB/s"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -46,8 +43,7 @@
       "builtin": true,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 184,
-        "note": "实测 184 KB/s"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -56,8 +52,7 @@
       "builtin": true,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 180,
-        "note": "实测 180 KB/s"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -66,8 +61,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 90,
-        "note": "CI 侧实测 90 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -76,8 +70,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 115,
-        "note": "CI 侧实测 115 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -86,8 +79,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 107,
-        "note": "CI 侧实测 107 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -96,8 +88,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 43,
-        "note": "CI 侧实测 43 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -106,8 +97,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 71,
-        "note": "CI 侧实测 71 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -116,8 +106,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 52,
-        "note": "CI 侧实测 52 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -126,8 +115,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 37,
-        "note": "CI 侧实测 37 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -136,8 +124,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 80,
-        "note": "CI 侧实测 80 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -146,8 +133,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 127,
-        "note": "CI 侧实测 127 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -156,8 +142,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 85,
-        "note": "CI 侧实测 85 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -166,8 +151,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 50,
-        "note": "CI 侧实测 50 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -176,8 +160,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 29,
-        "note": "CI 侧实测 29 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -186,8 +169,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 130,
-        "note": "CI 侧实测 130 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -196,8 +178,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 118,
-        "note": "CI 侧实测 118 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -206,8 +187,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 29,
-        "note": "CI 侧实测 29 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -216,8 +196,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 138,
-        "note": "CI 侧实测 138 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -226,8 +205,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 103,
-        "note": "CI 侧实测 103 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -236,8 +214,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 420,
-        "note": "CI 侧实测 420 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -246,8 +223,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 73,
-        "note": "CI 侧实测 73 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -256,8 +232,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 148,
-        "note": "CI 侧实测 148 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -266,8 +241,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 102,
-        "note": "CI 侧实测 102 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -276,8 +250,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 43,
-        "note": "CI 侧实测 43 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -286,8 +259,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 152,
-        "note": "CI 侧实测 152 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -296,8 +268,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 130,
-        "note": "CI 侧实测 130 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -306,8 +277,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 39,
-        "note": "CI 侧实测 39 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -316,8 +286,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 36,
-        "note": "CI 侧实测 36 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -326,8 +295,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 42,
-        "note": "CI 侧实测 42 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -336,8 +304,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 113,
-        "note": "CI 侧实测 113 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -346,8 +313,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 56,
-        "note": "CI 侧实测 56 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -356,8 +322,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 76,
-        "note": "CI 侧实测 76 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -366,8 +331,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 30,
-        "note": "CI 侧实测 30 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -376,8 +340,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 10,
-        "note": "CI 侧实测 10 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -386,8 +349,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 79,
-        "note": "CI 侧实测 79 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -396,8 +358,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 100,
-        "note": "CI 侧实测 100 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -406,8 +367,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 11,
-        "note": "CI 侧实测 11 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -416,8 +376,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 154,
-        "note": "CI 侧实测 154 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -426,8 +385,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 73,
-        "note": "CI 侧实测 73 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     },
     {
@@ -436,8 +394,7 @@
       "builtin": false,
       "verified": {
         "date": "2026-11-05",
-        "kbps": 33,
-        "note": "CI 侧实测 33 KB/s（Azure 美国，不代表用户网络）"
+        "note": "可用性校验通过（206 + 64 KiB + 样本 SHA-256 一致）"
       }
     }
   ],

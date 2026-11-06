@@ -10,7 +10,7 @@ function Roundtrip($Document) {
     $Document | ConvertTo-Json -Depth 8 | ConvertFrom-Json
 }
 function Result([string]$Verdict) {
-    [pscustomobject]@{ host = 'test.example'; verdict = $Verdict; status = 206; kbps = 100 }
+    [pscustomobject]@{ host = 'test.example'; verdict = $Verdict; status = 206 }
 }
 
 foreach ($builtin in @($true, $false)) {
@@ -29,6 +29,8 @@ foreach ($builtin in @($true, $false)) {
     $doc = New-CandidateCatalog (Roundtrip $doc) @((Result 'ok'))
     Assert-True ($doc.candidates.Count -eq 1 -and $doc.watchlist.Count -eq 0) '重新通过哈希校验后应解除隔离'
     Assert-True ($doc.candidates[0].builtin -eq $builtin) '隔离往返必须保留内置身份'
+    $verifiedKeys = @($doc.candidates[0].verified.Keys | Sort-Object) -join ','
+    Assert-True ($verifiedKeys -eq 'date,note') 'CI 验证记录只包含日期和可用性结论'
 }
 $doc = New-CandidateCatalog $existing @((Result 'dead'))
 Assert-True ($doc.candidates.Count -eq 0 -and $doc.watchlist[0].failures -eq 1) '普通候选失败应降级观察'

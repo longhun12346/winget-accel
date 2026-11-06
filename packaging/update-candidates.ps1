@@ -12,7 +12,7 @@
        用「内嵌兜底 + 逐个实测」把上游失效的影响限制在"候选池不再增长"。
 
     2. **所有域名每次都全量重测**，不是只测新增的。
-       域名可用性变化很快（实测过同一天 703 → 104 KB/s、可用 → 429 → 可用），
+       域名可用性变化很快（实测过同一天可用 → 429 → 可用），
        只测增量会长期保留过期的判断。
 
     3. **投毒靠机械判据，不靠人**。
@@ -22,6 +22,9 @@
        取同一段 64 KB，比对 SHA-256。不一致的无论坏掉还是投毒一律拒绝。
        （这挡不住"只对探测资产正常、对其它资产投毒"的定向攻击，
         那一层由 winget 官方的 InstallerSha256 校验兜底。）
+
+    CI 只检查可用性和内容一致性，不计算速度、不按速度排序或筛选。
+    超时用于限制探测等待时间，不代表用户侧速度门槛。
 
     4. **内嵌候选的临时网络故障仍保留，内容不符一律隔离**。
        隔离记录跨轮次保存，不因断网、未测或失败次数而消失；
@@ -169,20 +172,15 @@ try {
         $timeout = $using:PerDomainTimeout
         $work = Join-Path $using:tmp ("probe-" + ($host_ -replace '[^a-z0-9.-]', '_') + ".bin")
 
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
         # -L：不少加速器用 302 跳到真实资产（正常行为），不跟随会误判为不可用。
         # --max-redirs 3：限制跳数，防止恶意域名用无限重定向拖死探测。
         # %{http_code} 带 -L 时取的是最终响应码，所以 206 才算通过。
         $out = & curl.exe -sS -L --max-redirs 3 --max-time $timeout -r $range -A $ua -D "$work.h" -o $work -w '%{http_code}' "https://$host_/$asset" 2>$null
-        $sw.Stop()
-        $secs = $sw.Elapsed.TotalSeconds
 
         $len = if (Test-Path $work) { (Get-Item $work).Length } else { 0 }
         $hasRange = if (Test-Path "$work.h") { (Select-String -Path "$work.h" -Pattern '^content-range:' -Quiet) } else { $false }
         $hash = if ($len -gt 0) { (Get-FileHash $work -Algorithm SHA256).Hash.ToLower() } else { '' }
         Remove-Item $work, "$work.h" -Force -ErrorAction SilentlyContinue
-
-        $kbps = if ($secs -gt 0 -and $len -gt 0) { [int](($len / 1024.0) / $secs) } else { 0 }
 
         # 判定顺序：状态码 → 字节数 → **内容哈希**。
         #
@@ -203,8 +201,6 @@ try {
             verdict = $verdict
             status  = $status
             bytes   = $len
-            kbps    = $kbps
-            secs    = [Math]::Round($secs, 2)
             noRange = (-not $hasRange)
         }
     }
@@ -214,7 +210,7 @@ finally {
 }
 
 # ---------------------------------------------------------------- 分类汇总
-$ok = @($results | Where-Object { $_.verdict -eq 'ok' } | Sort-Object -Property kbps -Descending)
+$ok = @($results | Where-Object { $_.verdict -eq 'ok' } | Sort-Object -Property host)
 $limited = @($results | Where-Object { $_.verdict -eq 'ratelimited' })
 $dead = @($results | Where-Object { $_.verdict -eq 'dead' })
 $mismatch = @($results | Where-Object { $_.verdict -eq 'mismatch' })
@@ -222,7 +218,7 @@ $mismatch = @($results | Where-Object { $_.verdict -eq 'mismatch' })
 Write-Host ''
 Write-Host "=== 结果 ===" -ForegroundColor Cyan
 Write-Host "  通过（字节与 GitHub 一致）: $($ok.Count)"
-foreach ($r in $ok | Select-Object -First 15) { Write-Host ("    {0,-34} {1,5} KB/s  {2}s" -f $r.host, $r.kbps, $r.secs) }
+foreach ($r in $ok) { Write-Host ("    {0}（HTTP {1}，{2} B，样本 SHA-256 一致）" -f $r.host, $r.status, $r.bytes) }
 Write-Host "  限流 429/503: $($limited.Count)"
 foreach ($r in $limited) { Write-Host ("    {0}（状态 {1}）" -f $r.host, $r.status) }
 Write-Host "  不可用: $($dead.Count)"
