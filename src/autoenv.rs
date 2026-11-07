@@ -4,17 +4,25 @@
 //! **不加命令行参数**。所以"绿色版"的入口就是双击 exe —— 无参数即全自动。
 //! `--no-env` 退回纯代理模式，供测试与高级用法使用。
 //!
-//! 注册表与 WinINet 有效连接配置分别保存、接管和恢复，证书导入走 `certutil.exe`。
+//! 注册表与 WinINet 有效连接配置分别保存、接管和恢复，证书首次导入走 Windows
+//! 原生证书导入向导。
 //! 仅写 AutoConfigURL 不会保证自动脚本已启用；接管须通过 WinINet 设置 PAC 标志。
 //!
 //! 证书的**读取**（是否已信任、有效期）走 Win32 API（见 `certinfo.rs`），
 //! 不依赖 PowerShell。
 
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use windows_sys::Win32::Security::Cryptography::UI::{
+    CryptUIWizImport, CRYPTUI_WIZ_IMPORT_ALLOW_CERT, CRYPTUI_WIZ_IMPORT_NO_CHANGE_DEST_STORE,
+    CRYPTUI_WIZ_IMPORT_SRC_INFO, CRYPTUI_WIZ_IMPORT_SUBJECT_FILE,
+};
 use windows_sys::Win32::System::Registry as R;
 
 use crate::pacstate::{self, SavedState, WingetState, STATE_FILE};
@@ -545,8 +553,15 @@ fn ca_is_trusted(ca_pem: &Path) -> Result<bool> {
         .with_context(|| format!("无法读取或解析 CA：{}", ca_pem.display()))?;
     crate::certinfo::is_trusted(&der).context("无法读取当前用户根证书存储，信任状态未知")
 }
-/// 不在就导入。certutil 会弹一次确认框；无桌面会话下它**不报错而是永久阻塞**，
-/// 所以必须轮询 + 超时，超时后给出可手工执行的命令。
+/// 不在就打开 Windows 原生证书导入向导。
+///
+/// 不能在后台静默把 MITM 根证书塞进用户信任存储：Windows 会保护根证书存储，
+/// 而且这一步本身就是用户需要明确同意的安全操作。使用系统向导的好处是：
+///
+/// - 用户能看到证书名称和导入过程；
+/// - 取消或无交互桌面时不会留下一个后台 `certutil` 子进程；
+/// - 导入结束后仍按证书编码重新检查 `CurrentUser\\Root`，不把向导返回成功
+///   当成信任已经生效。
 fn ensure_ca_trusted(ca_pem: &Path) -> Result<()> {
     if ca_is_trusted(ca_pem)? {
         crate::log::info("本机 CA 已被信任，跳过导入。");
@@ -556,76 +571,75 @@ fn ensure_ca_trusted(ca_pem: &Path) -> Result<()> {
     if let Some(info) = crate::certinfo::info(ca_pem) {
         crate::log::info(&format!("待导入根 CA SHA-1 指纹：{}", info.thumbprint));
     }
-    crate::log::info("需要把本机 CA 加入「受信任的根证书」。稍后会弹一次确认框，请点「是」。");
-    let mut child = Command::new("certutil")
-        .args(["-user", "-addstore", "Root"])
-        .arg(ca_pem)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("启动 certutil 失败")?;
+    crate::log::info("将打开 Windows 证书导入向导。请确认导入到当前用户的受信任根证书存储。");
 
-    // 用户要去点那个安全警告框，给足时间；超时说明大概率是"没有可见桌面"。
-    const CONFIRM_TIMEOUT_SECS: u64 = 60;
-    let deadline = Instant::now() + Duration::from_secs(CONFIRM_TIMEOUT_SECS);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if let Err(error) = verify_ca_import(status, || ca_is_trusted(ca_pem)) {
-                    crate::log::error(&format!("CA-IMPORT-FAIL {error:#}"));
-                    return Err(error);
-                }
-                crate::log::info("CA 已加入受信任的根证书。");
-                return Ok(());
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let error = format!(
-                        "等待证书确认超时（{} 秒）。\n\
-                         这条确认框是 Windows 的「是否信任此根证书」，必须在**当前可见桌面**上点「是」——\n\
-                         无桌面的会话（服务、远程无交互、CI、被隐藏的窗口）里它会一直等下去。\n\
-                         二选一：\n\
-                         1) 在可见桌面上手动执行下面这条命令，点「是」，然后重新运行：\n   \
-                         certutil -user -addstore Root \"{}\"\n\
-                         2) 只想先试试代理本身（不改任何系统设置）：加 --no-env 启动",
-                        CONFIRM_TIMEOUT_SECS,
-                        ca_pem.display()
-                    );
-                    crate::log::error(&format!("CA-IMPORT-TIMEOUT {error}"));
-                    bail!("{error}");
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let error = format!("等待 certutil 失败: {err}");
-                crate::log::error(&format!("CA-IMPORT-FAIL {error}"));
-                bail!("{error}");
-            }
+    // The generated CA is kept as PEM for rustls/rcgen. The Windows import
+    // wizard accepts the DER certificate reliably when the source has a .cer
+    // suffix, so materialize a short-lived public certificate file.
+    let der = crate::certinfo::read_ca_der(ca_pem)
+        .with_context(|| format!("无法读取或解析 CA：{}", ca_pem.display()))?;
+    let import_path =
+        std::env::temp_dir().join(format!("winget-accel-root-{}.cer", std::process::id()));
+    std::fs::write(&import_path, &der)
+        .with_context(|| format!("无法准备 Windows 证书导入文件：{}", import_path.display()))?;
+    let file_name: Vec<u16> = import_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut source = CRYPTUI_WIZ_IMPORT_SRC_INFO {
+        dwSize: std::mem::size_of::<CRYPTUI_WIZ_IMPORT_SRC_INFO>() as u32,
+        dwSubjectChoice: CRYPTUI_WIZ_IMPORT_SUBJECT_FILE,
+        dwFlags: 0,
+        pwszPassword: std::ptr::null(),
+        ..Default::default()
+    };
+    // SAFETY: the UTF-16 path and source descriptor remain alive until the
+    // synchronous import wizard returns. The wizard owns no borrowed data
+    // after that point.
+    source.Anonymous.pwszFileName = file_name.as_ptr();
+    let title: Vec<u16> = "winget-accel 本机根证书"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination = match crate::certinfo::open_user_root_for_import() {
+        Ok(store) => store,
+        Err(error) => {
+            let _ = std::fs::remove_file(&import_path);
+            return Err(error).context("无法打开当前用户的受信任根证书存储");
         }
-    }
-}
-
-/// A successful child process alone is not proof that trust was installed.
-fn verify_ca_import(
-    status: std::process::ExitStatus,
-    trusted: impl FnOnce() -> Result<bool>,
-) -> Result<()> {
-    if !status.success() {
-        bail!(
-            "导入 CA 失败（certutil 退出码 {}）",
-            describe_status(status.code().unwrap_or(-1))
+    };
+    let flags = CRYPTUI_WIZ_IMPORT_ALLOW_CERT | CRYPTUI_WIZ_IMPORT_NO_CHANGE_DEST_STORE;
+    let imported = unsafe {
+        CryptUIWizImport(
+            flags,
+            std::ptr::null_mut(),
+            title.as_ptr(),
+            &source,
+            destination,
+        )
+    };
+    crate::certinfo::close_import_store(destination);
+    let _ = std::fs::remove_file(&import_path);
+    if imported == 0 {
+        let error = std::io::Error::last_os_error();
+        let message = format!(
+            "Windows 证书导入向导未完成：{error}。\n\
+             未接管 PAC、WinINet 或 winget 设置。请从可见桌面重新启动，\
+             或使用 --no-env 先测试代理链路"
         );
+        crate::log::error(&format!("CA-IMPORT-FAIL {message}"));
+        bail!(message);
     }
-    if !trusted()? {
-        bail!(
-            "certutil 返回成功，但 CurrentUser\\Root 中未找到本次 CA；\
-             尚未接管 PAC 或 winget 设置。请在可见桌面手动确认信任后重试"
-        );
+    if !ca_is_trusted(ca_pem)? {
+        let message = "证书导入向导返回成功，但 CurrentUser\\Root 中未找到本次 CA。\n\
+             未接管 PAC、WinINet 或 winget 设置。请确认导入目标是当前用户的\
+            「受信任的根证书颁发机构」，然后重试"
+            .to_string();
+        crate::log::error(&format!("CA-IMPORT-FAIL {message}"));
+        bail!(message);
     }
+    crate::log::info("CA 已加入当前用户的受信任根证书。");
     Ok(())
 }
 
@@ -1067,44 +1081,9 @@ fn restore_pac_settings(
     })
 }
 
-/// 把退出码格式化成「十进制（十六进制）+ 常见原因」。
-///
-/// certutil 的失败信息是本地化文字，过去我们直接丢弃，
-/// 导致拿到 `ERROR_NOT_SUPPORTED` 时无从判断。数字码是可搜索、可对照的。
-fn describe_status(code: i32) -> String {
-    let raw = code as u32;
-    let hint = match raw {
-        0x8007_0005 => "，拒绝访问（常见于安全软件拦截）",
-        0x8007_0032 => "，系统不支持该操作（该环境禁止写证书存储）",
-        _ => "",
-    };
-    format!("{code}（0x{raw:08X}）{hint}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn import_command_success_requires_certificate_in_store() {
-        use std::os::windows::process::ExitStatusExt as _;
-        let success = || std::process::ExitStatus::from_raw(0);
-        assert!(verify_ca_import(success(), || Ok(true)).is_ok());
-        let error = verify_ca_import(success(), || Ok(false)).unwrap_err();
-        assert!(error.to_string().contains("未找到本次 CA"));
-        let error = verify_ca_import(success(), || {
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
-        })
-        .unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<std::io::Error>().unwrap().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        assert!(verify_ca_import(std::process::ExitStatus::from_raw(5), || {
-            panic!("a failing importer must not be accepted because of a later store lookup")
-        })
-        .is_err());
-    }
 
     #[test]
     fn native_pac_recovery_survives_partial_writes_and_preserves_user_edits() {
@@ -1472,21 +1451,6 @@ mod tests {
     }
 
     #[test]
-    fn describes_known_error_codes() {
-        // 0x80070032 = ERROR_NOT_SUPPORTED，这是实测踩到的那个
-        let text = describe_status(0x8007_0032u32 as i32);
-        assert!(text.contains("0x80070032"), "应含十六进制: {text}");
-        assert!(text.contains("不支持"), "应给出原因提示: {text}");
-    }
-
-    #[test]
-    fn describes_access_denied() {
-        let text = describe_status(0x8007_0005u32 as i32);
-        assert!(text.contains("0x80070005"));
-        assert!(text.contains("拒绝访问"));
-    }
-
-    #[test]
     fn console_event_names_are_readable() {
         // 日志要能回答"是怎么退出的"，所以这几个编号必须有可读名字
         assert_eq!(event_name(0), "Ctrl+C");
@@ -1494,13 +1458,6 @@ mod tests {
         assert_eq!(event_name(5), "注销");
         assert_eq!(event_name(6), "关机");
         assert_eq!(event_name(99), "其它事件");
-    }
-
-    #[test]
-    fn unknown_code_still_shows_number() {
-        let text = describe_status(1);
-        assert!(text.contains('1'));
-        assert!(text.contains("0x00000001"));
     }
 
     /// `ProxyEnable` 的解析必须与本地化无关：只看 `REG_DWORD` 右边的值。

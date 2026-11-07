@@ -105,6 +105,9 @@ DIRECT 条款有效期为复查间隔加探测期限再加 10 秒，过期证据
 信任锚；`ca-cert.pem` 是由根签发、带 Name Constraints 且 `path_length=0` 的中间 CA。
 这样 Windows 不需要把带关键 Name Constraints 的自签证书当作信任根，同时域名约束仍由
 中间 CA 强制执行。服务端发送叶证书和中间 CA，客户端只需信任根证书。
+根 CA 使用 RSA 公钥：Windows 某些当前用户 Root 存储路径会把 ECDSA 自签根留在
+`ProtectedRoots` 却不持久化为可用的 `Root\Certificates` 条目。根密钥由 Windows
+CryptoAPI 生成，继续使用 ring 处理 Rust 侧的签名；检测到旧版 ECDSA 根时自动轮换。
 两级链保存在 exe 目录的 `certs` 中，启动时复用现有链；白名单变化时会检查中间证书中的真实
 约束，避免只相信旁边的 meta 文件。旧版单 CA 会在启动时迁移为新链；续期可以更新本地文件，
 但只有系统接管模式才修改受信任根；`--no-env` 不导入或删除系统根证书。
@@ -366,7 +369,10 @@ release 二进制 SHA256。这样可以避免“带颜色的 `Compiling` 文本�
 - 公共加速服务可能下线、限流或改变行为；候选池不是可用性保证。
 - 默认测速资产绑定具体版本；资产删除时需配置 `health.probeUrl` 或 `routing.probeUrls`。
 - 不支持 HTTP/2、CRL/OCSP 和请求体转发。
-- 真实系统模式首次导入 CA 需要可见桌面确认；无交互环境只适合 `--no-env` 测试。
+- 真实系统模式首次导入 CA 通过 Windows 原生证书导入向导完成，需要可见桌面确认；
+  取消导入或无交互环境不会接管 PAC、WinINet 或 winget，后者只适合 `--no-env` 测试。
+  首次导入运行时不再依赖后台 `certutil` 子进程，避免在隐藏会话中等待用户看不到的确认框；
+  `--remove-ca` 和旧 CA 清理仍可使用系统证书工具。
 - 未验证为 DIRECT 的 `github.com` 普通浏览请求会多经过本机 TLS 终止和回源一跳。
 - 直连速度来自短样本估计，不能保证所有安装包或网络变化后的实际表现。
 - 私钥以明文保存在本机证书目录，目录权限只能尽力收紧。

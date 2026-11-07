@@ -137,6 +137,28 @@ impl CertAuthority {
                 }
             }
         }
+        // Versions before 0.1.8 generated an ECDSA self-signed root. On
+        // Windows that certificate can appear in ProtectedRoots while never
+        // becoming a persistent CurrentUser\Root certificate. Rotate it
+        // before the environment manager asks the user to trust it.
+        if root_cert_path.exists() && !Self::root_uses_rsa(&root_cert_path) {
+            crate::log::warn(
+                "检测到旧版 ECDSA 根 CA；Windows 当前用户根存储无法稳定持久化它，\
+                 正在轮换为 RSA 根 CA。",
+            );
+            if manage_trust {
+                if let Some((thumb, _)) = expiry_info(&root_cert_path) {
+                    remove_trust(&thumb);
+                }
+            }
+            remove_ca_files(
+                &cert_path,
+                &key_path,
+                &root_cert_path,
+                &root_key_path,
+                &meta_path,
+            );
+        }
         let complete = cert_path.exists()
             && key_path.exists()
             && root_cert_path.exists()
@@ -269,7 +291,11 @@ impl CertAuthority {
         ];
         set_validity(&mut root_params, CA_VALIDITY_DAYS);
 
-        let root_key = KeyPair::generate().context("生成根 CA 私钥失败")?;
+        // Windows 当前用户 Root 对 ECDSA 自签根的持久化并不稳定：
+        // 向导可能报告成功，但证书只进入 ProtectedRoots，重新打开 Root
+        // 后没有可用的 Certificates 条目。使用 RSA 根兼容该存储路径；
+        // 中间 CA 和叶证书仍沿用默认的 ECDSA，保持运行时性能。
+        let root_key = crate::windowsrsa::generate_rsa_key_pair()?;
         let root_key_pem = root_key.serialize_pem();
         let root_cert = root_params
             .self_signed(&root_key)
@@ -352,6 +378,21 @@ impl CertAuthority {
     /// Windows 把带关键 Name Constraints 的自签根证书拒绝出 CurrentUser\Root。
     pub fn root_pem_path(dir: &Path) -> PathBuf {
         dir.join(ROOT_CERT_FILE)
+    }
+
+    /// Windows 当前用户 Root 需要能持久化该信任锚。
+    ///
+    /// 只检查 SubjectPublicKeyInfo 的算法，不按文件名或元数据猜测；
+    /// 这样旧版 ECDSA 根会在启动时自动轮换，手工替换过的文件也不会
+    /// 继续进入必然失败的导入流程。
+    fn root_uses_rsa(path: &Path) -> bool {
+        let Some(der) = crate::certinfo::read_ca_der(path) else {
+            return false;
+        };
+        let Ok((_, cert)) = x509_parser::parse_x509_certificate(&der) else {
+            return false;
+        };
+        cert.subject_pki.algorithm.oid() == &x509_parser::oid_registry::OID_PKCS1_RSAENCRYPTION
     }
 
     /// 校验现有中间 CA 与根 CA 的层级约束和签名关系，不修改磁盘或系统存储。
@@ -679,7 +720,8 @@ fn restore_legacy_files(dir: &Path, cert: &[u8], key: &[u8], meta: Option<&[u8]>
 
 /// 从用户根存储移除指定指纹的证书。
 ///
-/// 走 `certutil -user -delstore`，与安装对称；失败时只记日志，
+/// 走 `certutil -user -delstore`；首次安装由 Windows 原生证书导入向导完成。
+/// 删除失败时只记日志，
 /// 不换别的路径（写注册表属于实现细节，不该作为常规手段）。
 fn remove_trusted_ca(thumbprint: &str) {
     let ok = std::process::Command::new("certutil")

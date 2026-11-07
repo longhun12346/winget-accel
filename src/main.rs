@@ -21,6 +21,7 @@ mod proxy;
 mod rewrite;
 mod routing;
 mod stats;
+mod windowsrsa;
 mod winget;
 mod wininet;
 

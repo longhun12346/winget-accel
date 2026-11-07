@@ -898,7 +898,7 @@ fn io_error_kind(err: &anyhow::Error) -> &'static str {
 ///
 /// 设计文档要求"端口被占用时立即失败并打印占用进程"——只报"端口不可用"
 /// 会让用户无从下手（尤其 PAC 里端口是写死的，换端口不可行）。
-/// 两个工具都是 Windows 自带组件，与项目既有的 certutil.exe 取舍一致。
+/// 两个工具都是 Windows 自带组件，避免为一次诊断引入新的运行时依赖。
 fn port_owner(addr: SocketAddr) -> Option<String> {
     let out = std::process::Command::new("netstat")
         .args(["-ano", "-p", "tcp"])

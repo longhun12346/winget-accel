@@ -1,6 +1,6 @@
 [package]
 name = "winget-accel"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 rust-version = "1.88"
 description = "用 PAC 把 GitHub 下载域名指到本机，再由本机改写为加速器 URL"
@@ -22,6 +22,9 @@ rustls-pemfile = "2"
 # rcgen 0.14 才有 `Issuer::from_ca_cert_pem`：能把磁盘上的 CA 重新当成签发者。
 # 0.13 做不到，会导致每次重启换一张 CA、用户必须重新信任。
 # `x509-parser` 是该方法的前置 feature（它要解析 PEM 里的证书）。
+# Windows 当前用户 Root 对 ECDSA 自签根的持久化不可靠；RSA 根才能稳定
+# 进入 Root\Certificates。RSA 根密钥由 Windows CryptoAPI 生成，避免为了
+# 一张本机根证书把 aws-lc-rs/CMake/NASM 引入发布构建。
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
 # 上游（加速器）证书校验需要根证书；纯数据 crate，无传递依赖，无 C 代码。
 # 这是对 ADR-012 允许清单的一处新增，理由见 docs/design.md。
@@ -29,7 +32,7 @@ webpki-roots = "1"
 # Win32 API：证书存储、Unicode PAC 注册表读写、WinINet 刷新通知，以及独立看门狗进程标志。
 # 用它替代原先调 powershell.exe 的做法（见 ADR-012 第 3 次修订）。
 # 与 Tokio/mio/socket2 共用 0.61，避免重复绑定和 windows-targets 依赖树。
-windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_System_Threading", "Win32_Networking_WinInet"] }
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Security_Cryptography_UI", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_System_Registry", "Win32_System_Threading", "Win32_Networking_WinInet"] }
 
 # 解析证书的 NotAfter：windows-sys 没有导出 CERT_NOT_AFTER_FILETIME_PROP_ID，
 # 与其编一个常量，不如用成熟解析器。它已是 rcgen 的传递依赖（^0.18），不引入新 crate。

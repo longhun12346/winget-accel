@@ -92,6 +92,46 @@ fn open_user_store(name: &str) -> io::Result<C::HCERTSTORE> {
     }
 }
 
+/// Open the current user's root store with write access for the Windows
+/// certificate import wizard.
+///
+/// Diagnostics use [`open_user_store`] with read-only and existing-store flags.
+/// Import is intentionally separate so a read-only doctor check can never
+/// create or mutate a certificate store.
+pub fn open_user_root_for_import() -> io::Result<C::HCERTSTORE> {
+    let store = unsafe {
+        C::CertOpenStore(
+            // The logical CurrentUser\Root store is a protected collection.
+            // Importing into that collection can update ProtectedRoots while
+            // dropping the certificate from its writable physical store.
+            // CryptUIWizImport is reliable when it receives the user's
+            // physical default store directly.
+            C::CERT_STORE_PROV_PHYSICAL_W,
+            0,
+            0,
+            C::CERT_SYSTEM_STORE_CURRENT_USER
+                | C::CERT_STORE_OPEN_EXISTING_FLAG
+                | C::CERT_STORE_SET_LOCALIZED_NAME_FLAG,
+            wide(r"Root\.Default").as_ptr() as *const core::ffi::c_void,
+        )
+    };
+    if store.is_null() {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(store)
+    }
+}
+
+/// Close a store opened by [`open_user_root_for_import`].
+///
+/// The import wizard is synchronous and does not retain the handle after it
+/// returns, so closing it here is sufficient.
+pub fn close_import_store(store: C::HCERTSTORE) {
+    unsafe {
+        C::CertCloseStore(store, 0);
+    }
+}
+
 fn enumeration_end(error: io::Error) -> io::Result<()> {
     if error.raw_os_error().map(|code| code as u32)
         == Some(windows_sys::Win32::Foundation::CRYPT_E_NOT_FOUND as u32)
@@ -171,7 +211,7 @@ fn wide(text: &str) -> Vec<u16> {
 // 供 `--remove-ca` 使用。不依赖 certs 目录是否还在：
 // 直接枚举「当前用户受信任的根」，按 Subject 认出本工具的 CA 并删除。
 //
-// 删除走 `certutil -user -delstore`，与安装（`certutil -user -addstore`）严格对称。
+// 删除走 `certutil -user -delstore`；首次安装由 Windows 原生证书导入向导完成。
 // 实测部分环境会返回 ERROR_NOT_SUPPORTED（0x80070032）；此时**不偷偷改走写注册表**
 // 这种未文档化的路径，而是如实报错并给出手工方式（certmgr.msc）。
 // 早期版本的注释曾写成"已改用删注册表项"，与实现相反，已按实际行为改正。
@@ -218,8 +258,8 @@ pub fn our_ca_thumbprints() -> io::Result<Vec<String>> {
 
 /// 移除所有属于本工具的受信任根证书，返回（成功数, 失败数）。
 ///
-/// **只用 `certutil -user -delstore`**，与安装（`certutil -user -addstore`）完全对称。
-/// 不写注册表：失败就如实报错，由调用方提示用户手工处理，
+/// **只用 `certutil -user -delstore`**，不写注册表。
+/// 删除失败就如实报错，由调用方提示用户手工处理，
 /// 而不是偷偷换一条未文档化的路径把问题掩盖掉。
 pub fn remove_our_ca() -> io::Result<(usize, usize)> {
     let mut removed = 0;
