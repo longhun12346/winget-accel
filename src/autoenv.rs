@@ -4,9 +4,8 @@
 //! **不加命令行参数**。所以"绿色版"的入口就是双击 exe —— 无参数即全自动。
 //! `--no-env` 退回纯代理模式，供测试与高级用法使用。
 //!
-//! 注册表走 Win32 API，证书导入走 `certutil.exe`。
-//! 已运行的长驻程序（浏览器）可能不立即感知 PAC 变化；
-//! 但 winget 每次是新进程，直接从注册表读配置，不受影响。
+//! 注册表与 WinINet 有效连接配置分别保存、接管和恢复，证书导入走 `certutil.exe`。
+//! 仅写 AutoConfigURL 不会保证自动脚本已启用；接管须通过 WinINet 设置 PAC 标志。
 //!
 //! 证书的**读取**（是否已信任、有效期）走 Win32 API（见 `certinfo.rs`），
 //! 不依赖 PowerShell。
@@ -130,7 +129,7 @@ impl EnvGuard {
             )
         })?;
 
-        let ca_pem = cert_dir.join("ca-cert.pem");
+        let ca_pem = crate::ca::CertAuthority::root_pem_path(cert_dir);
         if !ca_pem.exists() {
             bail!(
                 "还没生成 CA（{}）。请先运行一次本程序让代理生成证书，再回来。",
@@ -156,6 +155,7 @@ impl EnvGuard {
         };
         let state_path = state_dir.join(STATE_FILE);
         let mut state = SavedState::new(prior, port);
+        state.wininet = SystemPac(&opts.inet_key).connection()?;
         if opts.versioned_pac {
             state.set_revision(0, state.owned_pac.clone().unwrap())?;
             state.previous_pac = None;
@@ -208,6 +208,9 @@ impl EnvGuard {
             PAC_WRITTEN.store(true, AtomicOrdering::SeqCst);
         }
         let pac_url = guard.state.owned_pac.as_deref().context("缺少接管 PAC")?;
+        if let Some(prior) = &guard.state.wininet {
+            crate::wininet::apply(&prior.with_pac(pac_url.to_string()))?;
+        }
         write_pac_at(&guard.inet_key, pac_url)?;
         crate::log::info(&format!("PAC-SET {pac_url}"));
 
@@ -281,10 +284,8 @@ pub fn current_pac() -> Option<String> {
 
 /// 系统是否启用了"全局代理"（`ProxyEnable`）。
 ///
-/// 为什么值得单独查：本工具只写 `AutoConfigURL`，**从不改** `ProxyEnable`。
-/// 两者同时存在时 WinINet 到底优先哪一个，本仓库没验证过（design.md §8 的已知空白），
-/// 所以至少要在启动与 `--doctor` 里把它指出来——否则用户遇到"装了没效果"时
-/// 没有任何线索指向"你还有一层全局代理"。
+/// 接管保留 WinINet 手动代理标志，所以在启动与 `--doctor` 里指出已有全局代理，
+/// 帮助排查用户环境中多层代理的影响。
 ///
 /// 返回 `None` 表示读不出来（注册表项不存在、或无权限），与"明确关闭"区分开。
 pub fn global_proxy_enabled() -> Option<bool> {
@@ -478,6 +479,15 @@ fn refresh_pac_at(
     session: Option<&str>,
     revision: u64,
 ) -> Result<bool> {
+    refresh_pac_settings(state_path, session, revision, &mut SystemPac(key))
+}
+
+fn refresh_pac_settings(
+    state_path: &Path,
+    session: Option<&str>,
+    revision: u64,
+    settings: &mut impl PacSettings,
+) -> Result<bool> {
     let _update = PAC_UPDATE.lock().expect("PAC update lock");
     let Some(mut state) = pacstate::read(state_path)? else {
         return Ok(false);
@@ -485,16 +495,39 @@ fn refresh_pac_at(
     if session.is_none() || state.session.as_deref() != session {
         return Ok(false);
     }
-    let Some(current) = read_pac_checked(key)?.filter(|value| state.owns(Some(value))) else {
+    let Some(current) = settings.registry()?.filter(|value| state.owns(Some(value))) else {
         return Ok(false);
+    };
+    if state.wininet_restore.is_some() {
+        return Ok(false);
+    }
+    let native = if state.wininet.is_some() {
+        let connection = settings.connection()?;
+        if !connection.as_ref().is_some_and(|value| {
+            value.pac_enabled() && value.url.as_deref() == Some(current.as_str())
+        }) {
+            // An earlier update may have stopped between the native and
+            // registry writes. Keep both journal URLs until recovery; replacing
+            // previousPac here could lose the still-effective native URL.
+            return Ok(false);
+        }
+        connection
+    } else {
+        None
     };
     state.set_revision(revision, current.clone())?;
     // Record both sides before touching the registry: either survives a crash.
     pacstate::write(state_path, &state)?;
-    if read_pac_checked(key)?.as_deref() != Some(&current) {
+    if settings.registry()?.as_deref() != Some(&current) {
         return Ok(false);
     }
-    write_pac_at(key, state.owned_pac.as_deref().unwrap())?;
+    if let Some(native) = native {
+        if settings.connection()?.as_ref() != Some(&native) {
+            return Ok(false);
+        }
+        settings.apply(&native.with_pac(state.owned_pac.clone().unwrap()))?;
+    }
+    settings.write_registry(state.owned_pac.as_deref())?;
     state.previous_pac = None;
     pacstate::write(state_path, &state)?;
     crate::log::info(&format!("PAC-REFRESH revision={revision}"));
@@ -507,20 +540,22 @@ fn refresh_pac_at(
 /// 不按 Subject，也不依赖 PowerShell。
 /// 踩过的坑：同名不同证书是合法且常见的，按名字比会误判"已信任"，
 /// 跳过导入后客户端报 TRUST_E_CERT_SIGNATURE / 0x80096004。
-fn ca_is_trusted(ca_pem: &Path) -> bool {
-    match crate::certinfo::read_ca_der(ca_pem) {
-        Some(der) => crate::certinfo::is_trusted(&der),
-        None => false,
-    }
+fn ca_is_trusted(ca_pem: &Path) -> Result<bool> {
+    let der = crate::certinfo::read_ca_der(ca_pem)
+        .with_context(|| format!("无法读取或解析 CA：{}", ca_pem.display()))?;
+    crate::certinfo::is_trusted(&der).context("无法读取当前用户根证书存储，信任状态未知")
 }
 /// 不在就导入。certutil 会弹一次确认框；无桌面会话下它**不报错而是永久阻塞**，
 /// 所以必须轮询 + 超时，超时后给出可手工执行的命令。
 fn ensure_ca_trusted(ca_pem: &Path) -> Result<()> {
-    if ca_is_trusted(ca_pem) {
+    if ca_is_trusted(ca_pem)? {
         crate::log::info("本机 CA 已被信任，跳过导入。");
         return Ok(());
     }
 
+    if let Some(info) = crate::certinfo::info(ca_pem) {
+        crate::log::info(&format!("待导入根 CA SHA-1 指纹：{}", info.thumbprint));
+    }
     crate::log::info("需要把本机 CA 加入「受信任的根证书」。稍后会弹一次确认框，请点「是」。");
     let mut child = Command::new("certutil")
         .args(["-user", "-addstore", "Root"])
@@ -536,19 +571,18 @@ fn ensure_ca_trusted(ca_pem: &Path) -> Result<()> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                if status.success() {
-                    crate::log::info("CA 已加入受信任的根证书。");
-                    return Ok(());
+                if let Err(error) = verify_ca_import(status, || ca_is_trusted(ca_pem)) {
+                    crate::log::error(&format!("CA-IMPORT-FAIL {error:#}"));
+                    return Err(error);
                 }
-                bail!(
-                    "导入 CA 失败（certutil 退出码 {}）",
-                    describe_status(status.code().unwrap_or(-1))
-                );
+                crate::log::info("CA 已加入受信任的根证书。");
+                return Ok(());
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
-                    bail!(
+                    let _ = child.wait();
+                    let error = format!(
                         "等待证书确认超时（{} 秒）。\n\
                          这条确认框是 Windows 的「是否信任此根证书」，必须在**当前可见桌面**上点「是」——\n\
                          无桌面的会话（服务、远程无交互、CI、被隐藏的窗口）里它会一直等下去。\n\
@@ -559,12 +593,40 @@ fn ensure_ca_trusted(ca_pem: &Path) -> Result<()> {
                         CONFIRM_TIMEOUT_SECS,
                         ca_pem.display()
                     );
+                    crate::log::error(&format!("CA-IMPORT-TIMEOUT {error}"));
+                    bail!("{error}");
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }
-            Err(err) => bail!("等待 certutil 失败: {err}"),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let error = format!("等待 certutil 失败: {err}");
+                crate::log::error(&format!("CA-IMPORT-FAIL {error}"));
+                bail!("{error}");
+            }
         }
     }
+}
+
+/// A successful child process alone is not proof that trust was installed.
+fn verify_ca_import(
+    status: std::process::ExitStatus,
+    trusted: impl FnOnce() -> Result<bool>,
+) -> Result<()> {
+    if !status.success() {
+        bail!(
+            "导入 CA 失败（certutil 退出码 {}）",
+            describe_status(status.code().unwrap_or(-1))
+        );
+    }
+    if !trusted()? {
+        bail!(
+            "certutil 返回成功，但 CurrentUser\\Root 中未找到本次 CA；\
+             尚未接管 PAC 或 winget 设置。请在可见桌面手动确认信任后重试"
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------- 退出时还原
@@ -869,22 +931,13 @@ fn restore_saved_state_impl(
     consume: bool,
 ) -> Result<RestoreOutcome> {
     let _update = PAC_UPDATE.lock().expect("PAC update lock");
-    let Some(state) = pacstate::read(state_path)? else {
+    let Some(mut state) = pacstate::read(state_path)? else {
         return Ok(RestoreOutcome::Absent);
     };
     if session.is_some() && state.session.as_deref() != session {
         return Ok(RestoreOutcome::NewSession);
     }
-    let current = read_pac_checked(inet_key)?;
-    let outcome = if state.owns(current.as_deref()) {
-        match state.prior {
-            Some(ref value) => write_pac_at(inet_key, value)?,
-            None => delete_pac_at(inet_key)?,
-        }
-        RestoreOutcome::Restored
-    } else {
-        RestoreOutcome::Changed
-    };
+    let outcome = restore_pac_settings(state_path, &mut state, &mut SystemPac(inet_key))?;
     // PAC 已还原时也可重试 winget；全部成功后才消费恢复日志。
     restore_winget_from(&state)?;
     // 控制台事件发生时主线程可能还在写 PAC，保留日志供父进程真正退出后的看门狗再核对。
@@ -893,6 +946,125 @@ fn restore_saved_state_impl(
             .with_context(|| format!("无法清理 PAC 状态 {}", state_path.display()))?;
     }
     Ok(outcome)
+}
+
+/// The injected backend keeps regression tests away from real Internet Settings.
+trait PacSettings {
+    fn connection(&self) -> Result<Option<crate::wininet::Connection>>;
+    fn apply(&mut self, value: &crate::wininet::Connection) -> Result<()>;
+    fn registry(&self) -> Result<Option<String>>;
+    fn write_registry(&mut self, value: Option<&str>) -> Result<()>;
+}
+
+struct SystemPac<'a>(&'a str);
+
+impl PacSettings for SystemPac<'_> {
+    fn connection(&self) -> Result<Option<crate::wininet::Connection>> {
+        if self.0 == INET_KEY {
+            crate::wininet::query().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn apply(&mut self, value: &crate::wininet::Connection) -> Result<()> {
+        anyhow::ensure!(self.0 == INET_KEY, "测试键不得修改真实 WinINet 设置");
+        crate::wininet::apply(value)?;
+        notify_proxy_change(self.0);
+        Ok(())
+    }
+
+    fn registry(&self) -> Result<Option<String>> {
+        read_pac_checked(self.0)
+    }
+
+    fn write_registry(&mut self, value: Option<&str>) -> Result<()> {
+        match value {
+            Some(value) => write_pac_at(self.0, value),
+            None => delete_pac_at(self.0),
+        }
+    }
+}
+
+fn restore_pac_settings(
+    path: &Path,
+    state: &mut SavedState,
+    settings: &mut impl PacSettings,
+) -> Result<RestoreOutcome> {
+    let mut restored = false;
+    if let Some(prior) = &state.wininet {
+        let current = settings.connection()?.context("缺少 WinINet 配置")?;
+        if state.wininet_restore.as_ref().is_some_and(|plan| {
+            current != plan.before
+                && current != plan.after
+                && current.pac_enabled()
+                && state.owns(current.url.as_deref())
+        }) {
+            // A retry must retain manual proxy/WPAD changes made meanwhile.
+            state.wininet_restore = None;
+        }
+        if state.wininet_restore.is_none()
+            && current.pac_enabled()
+            && state.owns(current.url.as_deref())
+        {
+            let registry = settings.registry()?;
+            state.wininet_restore = Some(crate::wininet::Restore {
+                before: current.clone(),
+                after: current.restore_pac(prior),
+                registry_after: if state.owns(registry.as_deref()) {
+                    state.prior.clone()
+                } else {
+                    registry.clone()
+                },
+                registry_before: registry,
+            });
+            // Persist intent before the native API overwrites the registry URL.
+            pacstate::write(path, state)?;
+        }
+        if let Some(mut plan) = state.wininet_restore.clone() {
+            let mut current = settings.connection()?.context("缺少 WinINet 配置")?;
+            if current == plan.before {
+                let registry = settings.registry()?;
+                if registry != plan.registry_before {
+                    // Recovery may be retried long after its first attempt.
+                    // Capture newer registry edits before the native setter
+                    // overwrites that value as a side effect.
+                    plan.registry_after = if state.owns(registry.as_deref()) {
+                        state.prior.clone()
+                    } else {
+                        registry.clone()
+                    };
+                    plan.registry_before = registry;
+                    state.wininet_restore = Some(plan.clone());
+                    pacstate::write(path, state)?;
+                }
+                settings.apply(&plan.after)?;
+                current = settings.connection()?.context("缺少 WinINet 配置")?;
+                anyhow::ensure!(current == plan.after, "WinINet PAC 还原尚未生效");
+            }
+            if current.url == plan.after.url {
+                let registry = settings.registry()?;
+                // On either side of the native write, restore the independent
+                // registry original. Unrelated flag edits after the native
+                // write must not strand its intermediate registry value.
+                // A different user registry value always wins.
+                if registry == plan.registry_before || registry == plan.after.url {
+                    settings.write_registry(plan.registry_after.as_deref())?;
+                }
+                restored = true;
+            }
+        }
+    }
+    // Covers legacy journals, pre-native-write crashes and user native edits.
+    if state.owns(settings.registry()?.as_deref()) {
+        settings.write_registry(state.prior.as_deref())?;
+        restored = true;
+    }
+    Ok(if restored {
+        RestoreOutcome::Restored
+    } else {
+        RestoreOutcome::Changed
+    })
 }
 
 /// 把退出码格式化成「十进制（十六进制）+ 常见原因」。
@@ -912,6 +1084,257 @@ fn describe_status(code: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_command_success_requires_certificate_in_store() {
+        use std::os::windows::process::ExitStatusExt as _;
+        let success = || std::process::ExitStatus::from_raw(0);
+        assert!(verify_ca_import(success(), || Ok(true)).is_ok());
+        let error = verify_ca_import(success(), || Ok(false)).unwrap_err();
+        assert!(error.to_string().contains("未找到本次 CA"));
+        let error = verify_ca_import(success(), || {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(verify_ca_import(std::process::ExitStatus::from_raw(5), || {
+            panic!("a failing importer must not be accepted because of a later store lookup")
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn native_pac_recovery_survives_partial_writes_and_preserves_user_edits() {
+        use crate::wininet::Connection;
+        struct Fake {
+            connection: Connection,
+            registry: Option<String>,
+            fail_native: u8,
+            fail_registry: bool,
+        }
+        impl PacSettings for Fake {
+            fn connection(&self) -> Result<Option<Connection>> {
+                Ok(Some(self.connection.clone()))
+            }
+            fn apply(&mut self, value: &Connection) -> Result<()> {
+                anyhow::ensure!(self.fail_native != 1, "interrupted before native write");
+                self.connection = value.clone();
+                // Model the native setter's registry side effect.
+                self.registry = value.url.clone();
+                anyhow::ensure!(self.fail_native != 2, "interrupted after native write");
+                Ok(())
+            }
+            fn registry(&self) -> Result<Option<String>> {
+                Ok(self.registry.clone())
+            }
+            fn write_registry(&mut self, value: Option<&str>) -> Result<()> {
+                anyhow::ensure!(!self.fail_registry, "registry unavailable");
+                self.registry = value.map(str::to_owned);
+                Ok(())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wg-native-{:016x}", fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(STATE_FILE);
+        for prior_registry in [None, Some(""), Some("http://corp/registry.pac")] {
+            for prior_flags in [9, 13] {
+                let prior_native = Connection {
+                    flags: prior_flags,
+                    url: Some("http://corp/effective.pac".into()),
+                };
+                let mut original = SavedState::new(prior_registry.map(str::to_owned), 18443);
+                original
+                    .set_revision(1, original.owned_pac.clone().unwrap())
+                    .unwrap();
+                original.previous_pac = None;
+                original.wininet = Some(prior_native.clone());
+                let active = prior_native.with_pac(original.owned_pac.clone().unwrap());
+                for crash_stage in 0..6 {
+                    let mut state = original.clone();
+                    let mut fake = Fake {
+                        // A manual proxy bit changed during our session.
+                        connection: Connection {
+                            flags: active.flags | 2,
+                            ..active.clone()
+                        },
+                        registry: state.owned_pac.clone(),
+                        fail_native: match crash_stage {
+                            1 => 1,
+                            2 => 2,
+                            _ => 0,
+                        },
+                        fail_registry: crash_stage == 3,
+                    };
+                    pacstate::write(&path, &state).unwrap();
+                    if crash_stage == 4 {
+                        // Crash after journal but before initial PAC mutation.
+                        fake.connection = prior_native.clone();
+                        fake.registry = state.prior.clone();
+                    }
+                    if crash_stage == 5 {
+                        // Initial native update completed, registry URL not
+                        // written yet (or user independently deleted the value).
+                        fake.registry = state.prior.clone();
+                    }
+                    let first = restore_pac_settings(&path, &mut state, &mut fake);
+                    assert_eq!(first.is_err(), matches!(crash_stage, 1..=3));
+                    // Reload exactly what a watchdog/new process would read.
+                    state = pacstate::read(&path).unwrap().unwrap();
+                    if crash_stage == 1 {
+                        fake.connection.flags ^= 8; // user changed WPAD before retry
+                    }
+                    fake.fail_native = 0;
+                    fake.fail_registry = false;
+                    restore_pac_settings(&path, &mut state, &mut fake).unwrap();
+                    assert_eq!(fake.registry, original.prior);
+                    assert_eq!(fake.connection.url, prior_native.url);
+                    assert_eq!(
+                        fake.connection.flags,
+                        if crash_stage == 4 {
+                            prior_flags
+                        } else {
+                            (prior_flags | 2) ^ if crash_stage == 1 { 8 } else { 0 }
+                        }
+                    );
+                    // Console restoration followed by watchdog is idempotent.
+                    restore_pac_settings(&path, &mut state, &mut fake).unwrap();
+                    assert_eq!(fake.registry, original.prior);
+                }
+                // Edits made after a failed recovery are newer than the saved
+                // recovery intent and must survive its next attempt.
+                for edit in 0..3 {
+                    let mut state = original.clone();
+                    let mut fake = Fake {
+                        connection: active.clone(),
+                        registry: active.url.clone(),
+                        fail_native: if edit < 2 { 1 } else { 2 },
+                        fail_registry: false,
+                    };
+                    pacstate::write(&path, &state).unwrap();
+                    assert!(restore_pac_settings(&path, &mut state, &mut fake).is_err());
+                    state = pacstate::read(&path).unwrap().unwrap();
+                    let expected_registry = match edit {
+                        0 => Some("http://user/after-failed-restore.pac".to_owned()),
+                        1 => None,
+                        _ => original.prior.clone(),
+                    };
+                    if edit < 2 {
+                        fake.registry = expected_registry.clone();
+                    } else {
+                        fake.connection.flags ^= 2;
+                    }
+                    fake.fail_native = 0;
+                    restore_pac_settings(&path, &mut state, &mut fake).unwrap();
+                    assert_eq!(fake.registry, expected_registry, "edit={edit}");
+                    assert_eq!(fake.connection.url, prior_native.url);
+                    assert_eq!(
+                        fake.connection.flags,
+                        prior_flags ^ if edit == 2 { 2 } else { 0 },
+                    );
+                    restore_pac_settings(&path, &mut state, &mut fake).unwrap();
+                    assert_eq!(fake.registry, expected_registry);
+                }
+                // Registry and native options can be edited independently.
+                for edit_native in [false, true] {
+                    let mut state = original.clone();
+                    let manual = Some("http://user/new.pac".to_string());
+                    let mut fake = Fake {
+                        connection: if edit_native {
+                            Connection {
+                                flags: 3,
+                                url: manual.clone(),
+                            }
+                        } else {
+                            active.clone()
+                        },
+                        registry: manual.clone(),
+                        fail_native: 0,
+                        fail_registry: false,
+                    };
+                    pacstate::write(&path, &state).unwrap();
+                    restore_pac_settings(&path, &mut state, &mut fake).unwrap();
+                    assert_eq!(fake.registry, manual);
+                    assert_eq!(
+                        fake.connection.url,
+                        if edit_native {
+                            manual
+                        } else {
+                            prior_native.url.clone()
+                        }
+                    );
+                }
+                // User disabled PAC through native settings: leave it disabled.
+                let mut state = original.clone();
+                let mut fake = Fake {
+                    connection: Connection {
+                        flags: 9,
+                        ..active.clone()
+                    },
+                    registry: active.url.clone(),
+                    fail_native: 0,
+                    fail_registry: false,
+                };
+                pacstate::write(&path, &state).unwrap();
+                restore_pac_settings(&path, &mut state, &mut fake).unwrap();
+                assert_eq!(fake.connection.flags, 9);
+                assert_eq!(fake.registry, original.prior);
+                // A refresh interrupted between its two writes must not lose
+                // either owned URL when the next background revision arrives.
+                for native_ahead in [false, true] {
+                    let mut state = original.clone();
+                    state.set_revision(2, active.url.clone().unwrap()).unwrap();
+                    let newer = active.with_pac(state.owned_pac.clone().unwrap());
+                    let mut fake = Fake {
+                        connection: if native_ahead {
+                            newer.clone()
+                        } else {
+                            active.clone()
+                        },
+                        registry: if native_ahead {
+                            active.url.clone()
+                        } else {
+                            newer.url.clone()
+                        },
+                        fail_native: 0,
+                        fail_registry: false,
+                    };
+                    pacstate::write(&path, &state).unwrap();
+                    let journal = std::fs::read(&path).unwrap();
+                    assert!(
+                        !refresh_pac_settings(&path, state.session.as_deref(), 3, &mut fake,)
+                            .unwrap()
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), journal);
+                    restore_pac_settings(&path, &mut state, &mut fake).unwrap();
+                    assert_eq!(fake.connection, prior_native);
+                    assert_eq!(fake.registry, original.prior);
+                }
+                let mut fake = Fake {
+                    connection: active.clone(),
+                    registry: active.url.clone(),
+                    fail_native: 0,
+                    fail_registry: false,
+                };
+                pacstate::write(&path, &original).unwrap();
+                assert!(
+                    refresh_pac_settings(&path, original.session.as_deref(), 3, &mut fake,)
+                        .unwrap()
+                );
+                assert_eq!(fake.registry, fake.connection.url);
+                assert!(fake.registry.as_deref().unwrap().ends_with("&route=3"));
+                let mut state = pacstate::read(&path).unwrap().unwrap();
+                assert!(state.previous_pac.is_none());
+                restore_pac_settings(&path, &mut state, &mut fake).unwrap();
+                assert_eq!(fake.connection, prior_native);
+                assert_eq!(fake.registry, original.prior);
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn pac_refresh_is_recoverable_on_either_side_of_registry_update() {
@@ -949,6 +1372,7 @@ mod tests {
         let certs = sandbox.root.join("certs");
         std::fs::create_dir_all(&certs).unwrap();
         std::fs::write(certs.join("ca-cert.pem"), "placeholder").unwrap();
+        std::fs::write(certs.join("root-cert.pem"), "placeholder").unwrap();
         let options = || EnableOptions {
             inet_key: sandbox.key.clone(),
             ensure_ca: false,
@@ -1326,6 +1750,7 @@ mod tests {
         let certs = root.join("certs");
         std::fs::create_dir_all(&certs).unwrap();
         std::fs::write(certs.join("ca-cert.pem"), "placeholder").unwrap();
+        std::fs::write(certs.join("root-cert.pem"), "placeholder").unwrap();
 
         let err = EnvGuard::enable_with(
             &certs,
@@ -1382,6 +1807,7 @@ mod tests {
         std::fs::create_dir_all(&certs).unwrap();
         // enable_with 只检查这个文件存在（ensure_ca=false，不会去解析它）
         std::fs::write(certs.join("ca-cert.pem"), "placeholder").unwrap();
+        std::fs::write(certs.join("root-cert.pem"), "placeholder").unwrap();
         let opts = |key: &str| EnableOptions {
             inet_key: key.to_string(),
             ensure_ca: false,
@@ -1466,6 +1892,7 @@ mod tests {
         let certs = root.join("certs");
         std::fs::create_dir_all(&certs).unwrap();
         std::fs::write(certs.join("ca-cert.pem"), "placeholder").unwrap();
+        std::fs::write(certs.join("root-cert.pem"), "placeholder").unwrap();
         let opts = || EnableOptions {
             inet_key: key.clone(),
             ensure_ca: false,

@@ -387,13 +387,26 @@ impl Proxy {
                     let status = response.status().as_u16();
                     let bad_range =
                         status == 206 && !range_response_matches(req.headers(), response.headers());
+                    // Even an empty gzip needs an 18-byte header/trailer; GitHub
+                    // source archives cannot be a two-byte service "ok" page.
+                    // Restrict this to full archive responses: tiny ranges and
+                    // text release assets are legitimate.
+                    let bad_archive = status == 200
+                        && archive_response_is_invalid(host, req.uri().path(), response.headers());
                     if bad_range {
                         self.log.warn(&format!(
                             "ACCEL-BAD-RANGE {} 响应范围与请求不一致",
                             accel.host
                         ));
                     }
+                    if bad_archive {
+                        self.log.warn(&format!(
+                            "ACCEL-BAD-ARCHIVE {} 归档响应长度不足",
+                            accel.host
+                        ));
+                    }
                     if bad_range
+                        || bad_archive
                         || (expect_partial && status == 200)
                         || http::is_rate_limited(status)
                         || is_retryable_status(status)
@@ -412,7 +425,11 @@ impl Proxy {
                                 idx,
                                 &accel,
                                 &format!("upstream status {status}"),
-                                failure_scope(status, host),
+                                if bad_archive {
+                                    CooldownScope::Host(host)
+                                } else {
+                                    failure_scope(status, host)
+                                },
                             );
                             if matches!(status, 403 | 404)
                                 && plan.rewritten
@@ -455,6 +472,20 @@ impl Proxy {
                                 Stats::bump(&proxy.stats.errors);
                                 if plan.rewritten {
                                     proxy.unpin(&host, &target);
+                                    // A cancelled response is usually the client
+                                    // going away and must not punish the candidate.
+                                    // Timeout and early EOF mean the upstream body
+                                    // failed after headers were sent. We cannot
+                                    // fail over after that point, but we can keep
+                                    // the same candidate out of the next request.
+                                    if matches!(io_error_kind(&err), "timeout" | "early-eof") {
+                                        proxy.note_accel_failure(
+                                            idx,
+                                            &accel,
+                                            &format!("relay {}: {err:#}", io_error_kind(&err)),
+                                            CooldownScope::Service,
+                                        );
+                                    }
                                 }
                                 proxy.log.warn(&format!(
                                     "RELAY-ERR host={host} via={} kind={} retry={} elapsed={:.2}s pin_cleared={} path={} err={err:#}",
@@ -637,14 +668,25 @@ impl Proxy {
         excluded.extend(self.cooldowns.service_blocked());
         // 命中即续期：pin 的语义是"正在用的那个候选"，不是"上次成功收尾后的 10 分钟"。
         // 只在成功收尾时续期的话，一个跑超过 PIN_TTL 的大分片中途就会失去绑定。
+        // 先读取 pin，再在锁外检查健康/冷却，最后用候选下标校验并续期。
+        // 这样不会形成 pins -> cooldowns -> health，而选择器走的是
+        // health -> cooldowns 的锁顺序。
         let pinned = {
-            let mut pins = self.pins.lock().expect("pin 锁中毒");
-            take_pin(&mut pins, &key, std::time::Instant::now(), PIN_TTL, |idx| {
-                !excluded.contains(&idx)
-                    && !self.cooldowns.is_blocked_for(idx, host)
-                    && self.health.is_healthy(idx)
-                    && self.app.accel_supports(idx, host)
-                    && !self.learned.is_blocked(idx, host)
+            let now = std::time::Instant::now();
+            let idx = {
+                let pins = self.pins.lock().expect("pin 锁中毒");
+                peek_pin(&pins, &key, now)
+            };
+            idx.filter(|idx| {
+                !excluded.contains(idx)
+                    && self.health.is_healthy(*idx)
+                    && self.app.accel_supports(*idx, host)
+                    && !self.learned.is_blocked(*idx, host)
+                    && !self.cooldowns.is_blocked_for(*idx, host)
+            })
+            .filter(|idx| {
+                let mut pins = self.pins.lock().expect("pin 锁中毒");
+                refresh_pin(&mut pins, &key, *idx, now, PIN_TTL)
             })
         };
         if let Some(idx) = pinned {
@@ -657,6 +699,9 @@ impl Proxy {
         let picked = self.health.pick_verified_excluding_where(&excluded, |idx| {
             self.app.accel_supports(idx, host)
                 && !self.learned.is_blocked(idx, host)
+                // `service_blocked()` above is only a snapshot. A concurrent
+                // request can add a service cooldown before this predicate runs.
+                && !self.cooldowns.is_service_blocked(idx)
                 && !self.cooldowns.is_host_blocked(idx, host)
         });
         // 这段是 debug 诊断：43 个候选时每次选候选都要拼 43 段字符串。
@@ -757,6 +802,7 @@ impl Proxy {
 /// - 命中 → 把过期时间推到 `now + ttl` 并返回候选下标
 ///
 /// 抽成独立函数是为了能直接单测这三种情形（`Proxy` 本身依赖网络与证书，不好造）。
+#[cfg(test)]
 fn take_pin<F>(
     pins: &mut std::collections::HashMap<String, (usize, std::time::Instant)>,
     key: &str,
@@ -775,6 +821,34 @@ where
         entry.1 = now + ttl;
     }
     Some(idx)
+}
+
+/// 读取未过期 pin，不在锁外保留引用。
+fn peek_pin(
+    pins: &std::collections::HashMap<String, (usize, std::time::Instant)>,
+    key: &str,
+    now: std::time::Instant,
+) -> Option<usize> {
+    let (idx, expires) = *pins.get(key)?;
+    (expires > now).then_some(idx)
+}
+
+/// 只有 pin 仍绑定同一个候选且没有过期时才续期。
+fn refresh_pin(
+    pins: &mut std::collections::HashMap<String, (usize, std::time::Instant)>,
+    key: &str,
+    idx: usize,
+    now: std::time::Instant,
+    ttl: Duration,
+) -> bool {
+    let Some((current, expires)) = pins.get_mut(key) else {
+        return false;
+    };
+    if *current != idx || *expires <= now {
+        return false;
+    }
+    *expires = now + ttl;
+    true
 }
 
 /// 这个状态码是否意味着"**该候选**不行，换一个可能就成"。
@@ -895,6 +969,9 @@ fn split_host_port(target: &str) -> Result<(String, u16)> {
     let port = authority
         .port_u16()
         .context("CONNECT requires an explicit port")?;
+    if port == 0 {
+        bail!("CONNECT requires a non-zero port");
+    }
     let host = authority.host().trim_matches(['[', ']']);
     if host.is_empty() {
         bail!("CONNECT requires a host");
@@ -993,6 +1070,35 @@ fn range_response_matches(request: &hyper::HeaderMap, response: &hyper::HeaderMa
     parse() == Some(true)
 }
 
+/// A successful source-archive response must at least look like an archive.
+///
+/// Some public mirrors return a small text error page with status 200. A
+/// `Content-Length` check catches the common fixed-length form, but chunked
+/// error pages have no length header and would otherwise be forwarded to the
+/// client as a successful archive. Header-only checks are deliberate here:
+/// the response body has not been sent yet, so a bad candidate can still be
+/// retried without buffering or partially forwarding the archive.
+fn archive_response_is_invalid(host: &str, path: &str, headers: &hyper::HeaderMap) -> bool {
+    let archive = host.eq_ignore_ascii_case("codeload.github.com")
+        || (host.eq_ignore_ascii_case("github.com") && path.contains("/archive/"));
+    if !archive {
+        return false;
+    }
+    let too_short = headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length < 18);
+    let text_error = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|value| {
+            value.starts_with("text/") || value.contains("html") || value.contains("json")
+        });
+    too_short || text_error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1049,6 +1155,31 @@ mod tests {
         assert!(range_response_matches(
             &hyper::HeaderMap::new(),
             &hyper::HeaderMap::new()
+        ));
+    }
+
+    #[test]
+    fn archive_error_pages_are_rejected_even_without_content_length() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("content-type", "text/plain".parse().unwrap());
+        assert!(archive_response_is_invalid(
+            "codeload.github.com",
+            "/owner/repo/tar.gz/refs/tags/v1",
+            &headers
+        ));
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("content-type", "application/gzip".parse().unwrap());
+        headers.insert("content-length", "1024".parse().unwrap());
+        assert!(!archive_response_is_invalid(
+            "codeload.github.com",
+            "/owner/repo/tar.gz/refs/tags/v1",
+            &headers
+        ));
+        assert!(!archive_response_is_invalid(
+            "github.com",
+            "/owner/repo/releases/download/v1/app.zip",
+            &headers
         ));
     }
 
@@ -1143,6 +1274,7 @@ mod tests {
     fn rejects_targets_without_port() {
         assert!(split_host_port("github.com").is_err());
         assert!(split_host_port(":443").is_err());
+        assert!(split_host_port("github.com:0").is_err());
     }
     /// 401/451 表示"**这个**候选不行"，必须换候选重试；而 `HttpStatus` 之外的
     /// 非 2xx（如 418）仍透传。
@@ -1361,6 +1493,31 @@ mod tests {
 
         // 不存在 → None
         assert_eq!(take_pin(&mut pins, "missing", now, ttl, |_| true), None);
+    }
+
+    #[test]
+    fn pin_peek_and_refresh_do_not_refresh_after_candidate_changes() {
+        let mut pins = std::collections::HashMap::new();
+        let now = std::time::Instant::now();
+        pins.insert("k".to_string(), (7, now + Duration::from_secs(1)));
+
+        assert_eq!(peek_pin(&pins, "k", now), Some(7));
+        assert!(!refresh_pin(
+            &mut pins,
+            "k",
+            8,
+            now,
+            Duration::from_secs(600)
+        ));
+        assert_eq!(pins["k"].1, now + Duration::from_secs(1));
+        assert!(refresh_pin(
+            &mut pins,
+            "k",
+            7,
+            now,
+            Duration::from_secs(600)
+        ));
+        assert_eq!(pins["k"].1, now + Duration::from_secs(600));
     }
 
     #[test]

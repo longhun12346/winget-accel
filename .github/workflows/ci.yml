@@ -48,18 +48,18 @@ jobs:
         run: cargo fetch --locked
 
       - name: clippy（警告即失败）
-        run: cargo clippy --all-targets --offline -- -D warnings
+        run: cargo clippy --all-targets --locked --offline -- -D warnings
 
       - name: Rust 单元测试
         env:
           WINGET_ACCEL_SELFTEST: "1"
-        run: cargo test --bin winget-accel --offline
+        run: cargo test --bin winget-accel --locked --offline -- --test-threads=1
 
       - name: 构建 release
-        run: cargo build --release --offline
+        run: cargo build --release --locked --offline
 
       - name: Rust 协议集成测试（无网、不改系统状态）
-        run: cargo test --test protocol --offline -- --test-threads=1
+        run: cargo test --test protocol --locked --offline -- --test-threads=1
 
       # README 承诺"同一源码两次构建逐字节相同"，但此前 CI **从不验证**这条：
       # 万一 rustc/MSVC 或 /Brepro 失效，只有用户自己去比 SHA256 才会发现。
@@ -78,17 +78,24 @@ jobs:
           # 用"未来时间"而不是 Get-Date：这一步紧跟在 release 构建之后，
           # 两者常落在同一秒，而 cargo 按秒比较 mtime，会认为源码没更新、跳过重编。
           # 实测 2026-11-04 与 2026-11-05 各因此误报一次（"没有真正重编"）。
-          (Get-Item src\main.rs).LastWriteTime = (Get-Date).AddMinutes(2)
-          $out = cargo build --release --offline 2>&1
-          $out | Select-String -Pattern 'Compiling|Finished' | ForEach-Object { $_.Line }
-          if (-not ($out | Select-String -Pattern 'Compiling winget-accel')) {
-            throw "没有真正重编（cargo 认为已是最新），这次的比较无效"
+          $source = Get-Item src\main.rs
+          $originalMtime = $source.LastWriteTime
+          try {
+            $source.LastWriteTime = (Get-Date).AddMinutes(2)
+            $out = cargo build --release --locked --offline 2>&1
+            $out | Select-String -Pattern 'Compiling|Finished' | ForEach-Object { $_.Line }
+            if (-not ($out | Select-String -Pattern 'Compiling winget-accel')) {
+              throw "没有真正重编（cargo 认为已是最新），这次的比较无效"
+            }
+            $h2 = (Get-FileHash $exe -Algorithm SHA256).Hash
+            "first  = $h1"
+            "second = $h2"
+            if ($h1 -ne $h2) { throw "构建不可复现：$h1 != $h2" }
+            Write-Host "可复现性通过（两次构建逐字节相同）"
           }
-          $h2 = (Get-FileHash $exe -Algorithm SHA256).Hash
-          "first  = $h1"
-          "second = $h2"
-          if ($h1 -ne $h2) { throw "构建不可复现：$h1 != $h2" }
-          Write-Host "可复现性通过（两次构建逐字节相同）"
+          finally {
+            $source.LastWriteTime = $originalMtime
+          }
 
       # 可复现性还有一条容易破的前提：**工作区的绝对路径不能被编进二进制**。
       # 实测当前是与路径无关的：把源码复制到含空格/中文的另一个目录、用全新 target

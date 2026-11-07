@@ -22,11 +22,12 @@ mod rewrite;
 mod routing;
 mod stats;
 mod winget;
+mod wininet;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::ca::CertAuthority;
 use crate::config::App;
@@ -80,15 +81,19 @@ fn main() -> Result<()> {
     let auto_env = !args.no_env;
 
     if args.remove_ca {
-        let (removed, failed) = crate::certinfo::remove_our_ca();
-        if removed == 0 {
+        let (removed, failed) =
+            crate::certinfo::remove_our_ca().context("无法读取当前用户根证书存储，未执行删除")?;
+        if removed == 0 && failed == 0 {
             println!("未找到属于本工具的根证书（可能本来就没装）。");
         } else {
             println!("已从「当前用户受信任的根」移除 {removed} 张本工具证书。");
-            if failed > 0 {
-                println!("有 {failed} 张未能移除（certutil 返回失败）。");
-                println!("可手工执行：certutil -user -delstore Root <指纹>，或用 certmgr.msc 图形界面删除。");
-            }
+        }
+        if failed > 0 {
+            eprintln!("有 {failed} 张未能移除（certutil 启动或执行失败）。");
+            eprintln!(
+                "可手工执行：certutil -user -delstore Root <指纹>，或用 certmgr.msc 图形界面删除。"
+            );
+            bail!("根证书移除未全部完成");
         }
         println!("提示：若系统 PAC 仍指向本机代理，请一并清除：");
         println!("  reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v AutoConfigURL /f");
@@ -197,7 +202,7 @@ fn main() -> Result<()> {
     ));
     logger.info(&format!(
         "  CA       {}",
-        CertAuthority::ca_pem_path(&app.cert_dir).display()
+        CertAuthority::root_pem_path(&app.cert_dir).display()
     ));
     logger.info(&format!("  log      {}", app.log_path.display()));
     logger.info(&format!(
@@ -206,8 +211,8 @@ fn main() -> Result<()> {
     ));
     logger.info(&format!("  listen   {}", app.listen));
     logger.info(&format!(
-        "  accel    {}（{} 个候选）",
-        chain.join(" > "),
+        "  accel    {}（共 {} 个候选）",
+        summarize_hosts(&chain, 8),
         chain.len()
     ));
     if app.accels.len() == 1 {
@@ -276,6 +281,14 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn summarize_hosts(hosts: &[String], limit: usize) -> String {
+    if hosts.len() <= limit {
+        return hosts.join(" > ");
+    }
+    let shown = hosts[..limit].join(" > ");
+    format!("{shown} > …")
+}
+
 fn print_help() {
     println!(
         "winget-accel {}\n\n\
@@ -328,6 +341,20 @@ mod tests {
     #[test]
     fn config_requires_value() {
         assert!(parse(&["--config"]).is_err());
+    }
+
+    #[test]
+    fn startup_host_summary_is_bounded() {
+        let hosts: Vec<_> = (0..10).map(|i| format!("candidate-{i}.example")).collect();
+        let summary = summarize_hosts(&hosts, 8);
+        assert!(summary.contains("candidate-0.example"));
+        assert!(summary.contains("candidate-7.example"));
+        assert!(!summary.contains("candidate-8.example"));
+        assert!(summary.ends_with(" > …"));
+        assert_eq!(
+            summarize_hosts(&hosts[..2], 8),
+            "candidate-0.example > candidate-1.example"
+        );
     }
 
     /// 中文被编码转换吞掉的护栏。

@@ -1,8 +1,8 @@
 //! 本地 CA 与叶证书。
 //!
 //! 三重约束（ADR-014）里的第 1 条就落在这里：
-//! - CA 带 `NameConstraints`，permitted 恰为改写白名单
-//! - CA 的 `path_length = 0`，不能签下级 CA
+//! - 中间 CA 带 `NameConstraints`，permitted 恰为改写白名单
+//! - 中间 CA 的 `path_length = 0`，不能签下级 CA
 //!
 //! 这两条**由 Windows 强制校验**（实测：签 `example.com` 的链被拒，
 //! `HasNotPermittedNameConstraint`），所以即使代理被攻破，
@@ -33,14 +33,18 @@ const LEAF_VALIDITY_DAYS: i64 = 30;
 
 const CA_CERT_FILE: &str = "ca-cert.pem";
 const CA_KEY_FILE: &str = "ca-key.pem";
+const ROOT_CERT_FILE: &str = "root-cert.pem";
+const ROOT_KEY_FILE: &str = "root-key.pem";
 const CA_META_FILE: &str = "ca-meta.json";
 
 pub struct CertAuthority {
-    /// CA 证书 PEM。单测用它验证"重启后仍是同一张 CA"；doctor 后续也会用到。
+    /// 受 Name Constraints 约束的中间 CA 证书 PEM。
     #[allow(dead_code)]
     ca_pem: String,
-    /// rcgen 的签发者：持有 CA 私钥，可按需签叶证书。
+    /// 中间 CA 的签发者：持有中间 CA 私钥，可按需签叶证书。
     issuer: Issuer<'static, KeyPair>,
+    /// 发送给客户端的中间 CA 证书，组成 leaf → constrained CA → trusted root 链。
+    intermediate_der: CertificateDer<'static>,
     cache: Mutex<HashMap<String, Arc<ServerConfig>>>,
 }
 
@@ -64,30 +68,91 @@ impl CertAuthority {
 
         let cert_path = dir.join(CA_CERT_FILE);
         let key_path = dir.join(CA_KEY_FILE);
+        let root_cert_path = dir.join(ROOT_CERT_FILE);
+        let root_key_path = dir.join(ROOT_KEY_FILE);
         let meta_path = dir.join(CA_META_FILE);
 
-        // 到期前自动轮换：清掉旧证书与旧文件，随后走"创建新 CA"分支
-        if cert_path.exists() {
-            let info = expiry_info(&cert_path);
+        // 旧版本只有一张自签、带 NameConstraints 的 CA。Windows 不会把这种
+        // 证书稳定地接受为 CurrentUser\Root 信任锚，因此升级时必须换成
+        // “无约束根 CA + 受约束中间 CA”链。只在旧版四件套完整、且新根文件
+        // 完全不存在时迁移；新链只生成了一半时仍然保守失败，避免覆盖未知状态。
+        let legacy_single_ca = cert_path.exists()
+            && key_path.exists()
+            && !root_cert_path.exists()
+            && !root_key_path.exists();
+        let legacy_thumb = if legacy_single_ca {
+            expiry_info(&cert_path).map(|(thumb, _)| thumb)
+        } else {
+            None
+        };
+        let legacy_backup = if legacy_single_ca {
+            Some((
+                std::fs::read(&cert_path)
+                    .with_context(|| format!("读不了旧版 {}", cert_path.display()))?,
+                std::fs::read(&key_path)
+                    .with_context(|| format!("读不了旧版 {}", key_path.display()))?,
+                std::fs::read(&meta_path).ok(),
+            ))
+        } else {
+            None
+        };
+        if legacy_single_ca {
+            crate::log::warn(&format!(
+                "检测到旧版单 CA，正在迁移为根 CA + 受约束中间 CA：{}",
+                dir.display()
+            ));
+            remove_ca_files(
+                &cert_path,
+                &key_path,
+                &root_cert_path,
+                &root_key_path,
+                &meta_path,
+            );
+        }
+
+        // 到期前自动轮换：清掉根、中间 CA 与元数据，随后走"创建新链"分支。
+        if root_cert_path.exists() || cert_path.exists() {
+            let info = expiry_info(if root_cert_path.exists() {
+                &root_cert_path
+            } else {
+                &cert_path
+            });
             if info.is_none() {
                 crate::log::warn("无法读取 CA 有效期（Win32 证书 API 未返回结果），跳过到期检查。");
             }
             if let Some((thumb, days)) = info {
                 if days <= RENEW_BEFORE_DAYS {
                     crate::log::warn(&format!(
-                        "本机 CA 有效期剩余 {days} 天（阈值 {RENEW_BEFORE_DAYS} 天），自动轮换：\
-                         移除旧证书并重新生成，需要重新信任一次。"
+                        "本机根 CA 有效期剩余 {days} 天（阈值 {RENEW_BEFORE_DAYS} 天），自动轮换：\
+                         移除旧根证书并重新生成，需要重新信任一次。"
                     ));
                     if manage_trust {
                         remove_trust(&thumb);
                     }
                     let _ = std::fs::remove_file(&cert_path);
                     let _ = std::fs::remove_file(&key_path);
+                    let _ = std::fs::remove_file(&root_cert_path);
+                    let _ = std::fs::remove_file(&root_key_path);
                     let _ = std::fs::remove_file(&meta_path);
                 }
             }
         }
-        if cert_path.exists() && key_path.exists() {
+        let complete = cert_path.exists()
+            && key_path.exists()
+            && root_cert_path.exists()
+            && root_key_path.exists();
+        let partial = cert_path.exists()
+            || key_path.exists()
+            || root_cert_path.exists()
+            || root_key_path.exists();
+        if partial && !complete {
+            bail!(
+                "{} 里的 CA 链文件不完整（需要 ca-cert.pem、ca-key.pem、root-cert.pem、root-key.pem）。\
+                 请删除证书目录后重新启动。",
+                dir.display()
+            );
+        }
+        if complete {
             let ca_pem = std::fs::read_to_string(&cert_path)
                 .with_context(|| format!("读不到 {}", cert_path.display()))?;
             let key_pem = std::fs::read_to_string(&key_path)
@@ -108,20 +173,15 @@ impl CertAuthority {
             if normalize(&actual) != normalize(permitted) {
                 bail!("已存在的 CA 的实际授权域名与当前配置不一致。旧: {actual:?} 新: {permitted:?}；请删除 {} 后重新生成并信任", dir.display());
             }
-            let der = crate::certinfo::read_ca_der(&cert_path).context("CA 证书无法解析")?;
-            let (_, parsed) = x509_parser::parse_x509_certificate(&der)
-                .map_err(|e| anyhow::anyhow!("CA 证书无法解析: {e}"))?;
-            let basic = parsed
-                .basic_constraints()?
-                .context("CA 缺少 BasicConstraints")?;
-            if !basic.value.ca || basic.value.path_len_constraint != Some(0) {
-                bail!("CA 必须禁止签发下级 CA（path_length = 0），请重新生成并信任");
-            }
+            Self::validate_chain_paths(&cert_path, &root_cert_path)?;
+            let der = crate::certinfo::read_ca_der(&cert_path).context("中间 CA 证书无法解析")?;
 
             // 私钥与证书必须是一对。rcgen 不校验这一点（见 `key_matches_cert` 的说明），
             // 不配对时程序能正常启动、签得出叶证书，但每个 MITM 握手都会被客户端拒绝——
             // 与其让用户对着 `MITM-HANDSHAKE-FAIL` 猜，不如在这里直接失败并说清怎么修。
-            if Self::key_matches_cert(dir) == Some(false) {
+            if Self::key_matches_cert_at(&cert_path, &key_path) == Some(false)
+                || Self::key_matches_cert_at(&root_cert_path, &root_key_path) == Some(false)
+            {
                 bail!(
                     "{} 里的 CA 私钥与证书不配对（文件被改动或覆盖过？）。\
                      这样签出的叶证书会被所有客户端拒绝（表现为每处都 MITM-HANDSHAKE-FAIL）。\
@@ -136,19 +196,53 @@ impl CertAuthority {
             return Ok(Self {
                 ca_pem,
                 issuer,
+                intermediate_der: CertificateDer::from(der),
                 cache: Mutex::new(HashMap::new()),
             });
         }
 
-        let ca_pem = Self::create(dir, permitted, &cert_path, &key_path, &meta_path)?;
-        let key_pem = std::fs::read_to_string(&key_path)?;
-        let key = KeyPair::from_pem(&key_pem)?;
-        let issuer = Issuer::from_ca_cert_pem(&ca_pem, key)?;
-        Ok(Self {
-            ca_pem,
-            issuer,
-            cache: Mutex::new(HashMap::new()),
-        })
+        let generated = (|| -> Result<Self> {
+            let ca_pem = Self::create(
+                dir,
+                permitted,
+                &cert_path,
+                &key_path,
+                &root_cert_path,
+                &root_key_path,
+                &meta_path,
+            )?;
+            let key_pem = std::fs::read_to_string(&key_path)?;
+            let key = KeyPair::from_pem(&key_pem)?;
+            let issuer = Issuer::from_ca_cert_pem(&ca_pem, key)?;
+            let intermediate_der = CertificateDer::from(
+                crate::certinfo::read_ca_der(&cert_path).context("中间 CA 证书无法解析")?,
+            );
+            Ok(Self {
+                ca_pem,
+                issuer,
+                intermediate_der,
+                cache: Mutex::new(HashMap::new()),
+            })
+        })();
+        match generated {
+            Ok(ca) => {
+                // Keep the old trust anchor until the replacement chain has
+                // been generated and parsed successfully, avoiding a trust
+                // gap during a successful upgrade.
+                if manage_trust {
+                    if let Some(thumb) = legacy_thumb.as_deref() {
+                        remove_trust(thumb);
+                    }
+                }
+                Ok(ca)
+            }
+            Err(err) => {
+                if let Some((cert, key, meta)) = legacy_backup {
+                    restore_legacy_files(dir, &cert, &key, meta.as_deref());
+                }
+                Err(err)
+            }
+        }
     }
 
     fn create(
@@ -156,8 +250,34 @@ impl CertAuthority {
         permitted: &[String],
         cert_path: &Path,
         key_path: &Path,
+        root_cert_path: &Path,
+        root_key_path: &Path,
         meta_path: &Path,
     ) -> Result<String> {
+        let mut root_params = CertificateParams::default();
+        root_params
+            .distinguished_name
+            .push(DnType::CommonName, "winget-accel local root CA");
+        root_params
+            .distinguished_name
+            .push(DnType::OrganizationName, "winget-accel");
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+        root_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        set_validity(&mut root_params, CA_VALIDITY_DAYS);
+
+        let root_key = KeyPair::generate().context("生成根 CA 私钥失败")?;
+        let root_key_pem = root_key.serialize_pem();
+        let root_cert = root_params
+            .self_signed(&root_key)
+            .context("自签根 CA 失败")?;
+        let root_pem = root_cert.pem();
+        let root_issuer =
+            Issuer::from_ca_cert_pem(&root_pem, root_key).context("构造根 CA 签发者失败")?;
+
         let mut params = CertificateParams::default();
         params
             .distinguished_name
@@ -180,18 +300,40 @@ impl CertAuthority {
         });
         set_validity(&mut params, CA_VALIDITY_DAYS);
 
-        let key = KeyPair::generate().context("生成 CA 私钥失败")?;
+        let key = KeyPair::generate().context("生成中间 CA 私钥失败")?;
         let key_pem = key.serialize_pem();
-        let cert = params.self_signed(&key).context("自签 CA 失败")?;
+        let cert = params
+            .signed_by(&key, &root_issuer)
+            .context("签发中间 CA 失败")?;
         let ca_pem = cert.pem();
 
-        std::fs::write(cert_path, &ca_pem)
-            .with_context(|| format!("写不了 {}", cert_path.display()))?;
-        std::fs::write(key_path, &key_pem)
-            .with_context(|| format!("写不了 {}", key_path.display()))?;
-        // 记下授权域名，配置变化时能立刻发现
-        std::fs::write(meta_path, serde_json::to_string(permitted)?)
-            .with_context(|| format!("写不了 {}", meta_path.display()))?;
+        let write_result = (|| -> Result<()> {
+            std::fs::write(root_cert_path, &root_pem)
+                .with_context(|| format!("写不了 {}", root_cert_path.display()))?;
+            std::fs::write(root_key_path, &root_key_pem)
+                .with_context(|| format!("写不了 {}", root_key_path.display()))?;
+            std::fs::write(cert_path, &ca_pem)
+                .with_context(|| format!("写不了 {}", cert_path.display()))?;
+            std::fs::write(key_path, &key_pem)
+                .with_context(|| format!("写不了 {}", key_path.display()))?;
+            // 记下授权域名，配置变化时能立刻发现
+            std::fs::write(meta_path, serde_json::to_string(permitted)?)
+                .with_context(|| format!("写不了 {}", meta_path.display()))?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            // This function is only called when no complete chain exists.
+            // Remove every file written by this attempt so the next launch
+            // can retry instead of being trapped by a misleading partial chain.
+            remove_ca_files(
+                cert_path,
+                key_path,
+                root_cert_path,
+                root_key_path,
+                meta_path,
+            );
+            return Err(error);
+        }
         restrict_permissions(dir);
 
         Ok(ca_pem)
@@ -204,6 +346,46 @@ impl CertAuthority {
 
     pub fn ca_pem_path(dir: &Path) -> PathBuf {
         dir.join(CA_CERT_FILE)
+    }
+
+    /// Windows 信任的无约束根 CA。Name Constraints 放在中间 CA，避免
+    /// Windows 把带关键 Name Constraints 的自签根证书拒绝出 CurrentUser\Root。
+    pub fn root_pem_path(dir: &Path) -> PathBuf {
+        dir.join(ROOT_CERT_FILE)
+    }
+
+    /// 校验现有中间 CA 与根 CA 的层级约束和签名关系，不修改磁盘或系统存储。
+    ///
+    /// doctor 使用同一套规则，避免“启动时会拒绝、doctor 却显示证书正常”的诊断分歧。
+    pub fn validate_chain(dir: &Path) -> Result<()> {
+        Self::validate_chain_paths(&dir.join(CA_CERT_FILE), &dir.join(ROOT_CERT_FILE))
+    }
+
+    fn validate_chain_paths(cert_path: &Path, root_cert_path: &Path) -> Result<()> {
+        let der = crate::certinfo::read_ca_der(cert_path).context("中间 CA 证书无法解析")?;
+        let (_, parsed) = x509_parser::parse_x509_certificate(&der)
+            .map_err(|e| anyhow::anyhow!("中间 CA 证书无法解析: {e}"))?;
+        let basic = parsed
+            .basic_constraints()?
+            .context("中间 CA 缺少 BasicConstraints")?;
+        if !basic.value.ca || basic.value.path_len_constraint != Some(0) {
+            bail!("中间 CA 必须禁止签发下级 CA（path_length = 0），请重新生成并信任");
+        }
+
+        let root_der =
+            crate::certinfo::read_ca_der(root_cert_path).context("根 CA 证书无法解析")?;
+        let (_, root_parsed) = x509_parser::parse_x509_certificate(&root_der)
+            .map_err(|e| anyhow::anyhow!("根 CA 证书无法解析: {e}"))?;
+        let root_basic = root_parsed
+            .basic_constraints()?
+            .context("根 CA 缺少 BasicConstraints")?;
+        if !root_basic.value.ca || root_basic.value.path_len_constraint != Some(1) {
+            bail!("根 CA 必须允许签发一个中间 CA（path_length = 1）");
+        }
+        parsed
+            .verify_signature(Some(&root_parsed.tbs_certificate.subject_pki))
+            .map_err(|e| anyhow::anyhow!("中间 CA 不是由当前根 CA 签发: {e}"))?;
+        Ok(())
     }
 
     /// 从磁盘上的 CA 证书里读出**实际的** dNSName 授权列表（permitted subtrees）。
@@ -239,8 +421,17 @@ impl CertAuthority {
     /// 做法：直接比公钥字节（证书 SPKI 里的公钥 vs 私钥导出的公钥），不做签名运算。
     /// `None` 表示文件读不出/解析不了，与"确定不配对"区分开。
     pub fn key_matches_cert(dir: &Path) -> Option<bool> {
-        let der = crate::certinfo::read_ca_der(&dir.join(CA_CERT_FILE))?;
-        let key_pem = std::fs::read_to_string(dir.join(CA_KEY_FILE)).ok()?;
+        Self::key_matches_cert_at(&dir.join(CA_CERT_FILE), &dir.join(CA_KEY_FILE))
+    }
+
+    /// 根 CA 私钥与根证书是不是一对。
+    pub fn root_key_matches_cert(dir: &Path) -> Option<bool> {
+        Self::key_matches_cert_at(&dir.join(ROOT_CERT_FILE), &dir.join(ROOT_KEY_FILE))
+    }
+
+    fn key_matches_cert_at(cert_path: &Path, key_path: &Path) -> Option<bool> {
+        let der = crate::certinfo::read_ca_der(cert_path)?;
+        let key_pem = std::fs::read_to_string(key_path).ok()?;
         let key = KeyPair::from_pem(&key_pem).ok()?;
         let (_, parsed) = x509_parser::parse_x509_certificate(&der).ok()?;
         // 注意两边的形态不同（实测）：
@@ -264,7 +455,7 @@ impl CertAuthority {
         let (cert_der, key_der) = self.build_leaf(host)?;
         let cfg = ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der)
+            .with_single_cert(vec![cert_der, self.intermediate_der.clone()], key_der)
             .context("构造 TLS 服务端配置失败")?;
         let cfg = Arc::new(cfg);
         cache.insert(host.to_string(), Arc::clone(&cfg));
@@ -432,6 +623,60 @@ const RENEW_BEFORE_DAYS: i32 = {
 fn expiry_info(ca_pem: &Path) -> Option<(String, i32)> {
     crate::certinfo::info(ca_pem).map(|info| (info.thumbprint, info.days_left as i32))
 }
+
+fn remove_ca_files(
+    cert_path: &Path,
+    key_path: &Path,
+    root_cert_path: &Path,
+    root_key_path: &Path,
+    meta_path: &Path,
+) {
+    for path in [
+        cert_path,
+        key_path,
+        root_cert_path,
+        root_key_path,
+        meta_path,
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn restore_legacy_files(dir: &Path, cert: &[u8], key: &[u8], meta: Option<&[u8]>) {
+    let cert_path = dir.join(CA_CERT_FILE);
+    let key_path = dir.join(CA_KEY_FILE);
+    let root_cert_path = dir.join(ROOT_CERT_FILE);
+    let root_key_path = dir.join(ROOT_KEY_FILE);
+    let meta_path = dir.join(CA_META_FILE);
+    let _ = std::fs::remove_file(root_cert_path);
+    let _ = std::fs::remove_file(root_key_path);
+    if let Err(err) = std::fs::write(&cert_path, cert) {
+        crate::log::warn(&format!(
+            "旧版 CA 证书恢复失败（{}）：{err}",
+            cert_path.display()
+        ));
+    }
+    if let Err(err) = std::fs::write(&key_path, key) {
+        crate::log::warn(&format!(
+            "旧版 CA 私钥恢复失败（{}）：{err}",
+            key_path.display()
+        ));
+    }
+    match meta {
+        Some(meta) => {
+            if let Err(err) = std::fs::write(&meta_path, meta) {
+                crate::log::warn(&format!(
+                    "旧版 CA 元数据恢复失败（{}）：{err}",
+                    meta_path.display()
+                ));
+            }
+        }
+        None => {
+            let _ = std::fs::remove_file(meta_path);
+        }
+    }
+}
+
 /// 从用户根存储移除指定指纹的证书。
 ///
 /// 走 `certutil -user -delstore`，与安装对称；失败时只记日志，
@@ -484,6 +729,64 @@ mod tests {
             assert_eq!(removed.get(), usize::from(manage_trust));
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn migrates_legacy_single_ca_to_two_level_chain() {
+        let dir = std::env::temp_dir().join(format!("wg-ca-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut params = CertificateParams::default();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "legacy winget-accel CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        params.name_constraints = Some(NameConstraints {
+            permitted_subtrees: vec![GeneralSubtree::DnsName("github.com".to_string())],
+            excluded_subtrees: Vec::new(),
+        });
+        let key = KeyPair::generate().unwrap();
+        let legacy = params.self_signed(&key).unwrap().pem();
+        std::fs::write(dir.join(CA_CERT_FILE), &legacy).unwrap();
+        std::fs::write(dir.join(CA_KEY_FILE), key.serialize_pem()).unwrap();
+        std::fs::write(dir.join(CA_META_FILE), r#"["github.com"]"#).unwrap();
+
+        let removed = std::cell::Cell::new(0);
+        let ca = CertAuthority::load_with_remover(&dir, &["github.com".to_string()], true, |_| {
+            removed.set(removed.get() + 1)
+        })
+        .unwrap();
+
+        assert_eq!(removed.get(), 1, "迁移时应移除旧版信任锚");
+        assert_ne!(ca.ca_pem(), legacy);
+        assert!(dir.join(CA_CERT_FILE).is_file());
+        assert!(dir.join(CA_KEY_FILE).is_file());
+        assert!(dir.join(ROOT_CERT_FILE).is_file());
+        assert!(dir.join(ROOT_KEY_FILE).is_file());
+        assert!(CertAuthority::permitted_dns_names(&dir.join(CA_CERT_FILE)).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_chain_creation_does_not_leave_partial_files() {
+        let dir = std::env::temp_dir().join(format!("wg-ca-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(CA_META_FILE)).unwrap();
+
+        let error = CertAuthority::load_or_create(&dir, &["github.com".to_string()], false)
+            .err()
+            .expect("元数据路径是目录时创建必须失败");
+        assert!(error.to_string().contains("写不了"), "实际错误: {error}");
+        for file in [CA_CERT_FILE, CA_KEY_FILE, ROOT_CERT_FILE, ROOT_KEY_FILE] {
+            assert!(
+                !dir.join(file).exists(),
+                "失败创建不应留下半套证书文件: {file}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -627,6 +930,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn detects_mismatched_root_key_pair() {
+        let dir = std::env::temp_dir().join(format!("wgaccel-ca-root-kp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        CertAuthority::load_or_create(&dir, &["github.com".to_string()], false).unwrap();
+        assert_eq!(CertAuthority::root_key_matches_cert(&dir), Some(true));
+
+        let other = KeyPair::generate().unwrap();
+        std::fs::write(dir.join(ROOT_KEY_FILE), other.serialize_pem()).unwrap();
+        assert_eq!(CertAuthority::root_key_matches_cert(&dir), Some(false));
+
+        let err = CertAuthority::load_or_create(&dir, &["github.com".to_string()], false)
+            .err()
+            .expect("根 CA 私钥不配对时必须拒绝启动");
+        assert!(err.to_string().contains("不配对"), "实际错误: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `doctor` 用它核对"这张 CA 到底能签哪些域"——读证书本身，而不是 meta 旁注。
     #[test]
     fn permitted_dns_names_reads_the_certificate_itself() {
@@ -695,6 +1016,17 @@ mod tests {
             .as_ref()
             .map(|v| v.is_empty())
             .unwrap_or(true));
+
+        let root_der = crate::certinfo::read_ca_der(&CertAuthority::root_pem_path(&dir)).unwrap();
+        let (_, root) = x509_parser::parse_x509_certificate(&root_der).unwrap();
+        let root_bc = root.basic_constraints().unwrap().unwrap();
+        assert!(root_bc.value.ca);
+        assert_eq!(root_bc.value.path_len_constraint, Some(1));
+        assert!(
+            root.name_constraints().unwrap().is_none(),
+            "Windows 信任锚不应携带 NameConstraints"
+        );
+        assert!(CertAuthority::validate_chain(&dir).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

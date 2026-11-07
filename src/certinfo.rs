@@ -10,7 +10,7 @@
 //! - 指纹 / 有效期：`CertGetCertificateContextProperty`（SHA-1 指纹、NotAfter FILETIME）
 //! - 是否受信任：枚举 `CurrentUser\Root` 逐张比较编码字节（无需哈希，避免"同名不同证书"误判）
 
-use std::io::BufReader;
+use std::io::{self, BufReader};
 use std::path::Path;
 
 use windows_sys::Win32::Security::Cryptography as C;
@@ -57,40 +57,71 @@ pub fn info(pem: &Path) -> Option<CertInfo> {
     })
 }
 /// 这张证书是否已在「当前用户受信任的根」里。
+/// 这是证书存储查询，不代表完整的客户端 TLS 证书链校验。
+/// 读取失败必须返回错误，不能当成「未找到」。
 ///
 /// 按**编码字节**逐一比较：不能按 Subject 比（同名不同证书合法且常见，
 /// 踩过——旧 CA 还在存储里、Subject 相同，导致误判"已信任"、
 /// 跳过导入，客户端随后报 TRUST_E_CERT_SIGNATURE / 0x80096004）。
-pub fn is_trusted(der: &[u8]) -> bool {
+pub fn is_trusted(der: &[u8]) -> io::Result<bool> {
+    let store = open_user_store("ROOT")?;
     unsafe {
-        let store = C::CertOpenStore(
+        let found = store_contains(store, der);
+        C::CertCloseStore(store, 0);
+        found
+    }
+}
+
+/// Diagnostics must neither request write access nor create missing stores.
+fn open_user_store(name: &str) -> io::Result<C::HCERTSTORE> {
+    let store = unsafe {
+        C::CertOpenStore(
             C::CERT_STORE_PROV_SYSTEM_W,
             0,
             0,
-            C::CERT_SYSTEM_STORE_CURRENT_USER,
-            wide("ROOT").as_ptr() as *const core::ffi::c_void,
-        );
-        if store.is_null() {
-            return false;
-        }
+            C::CERT_SYSTEM_STORE_CURRENT_USER
+                | C::CERT_STORE_READONLY_FLAG
+                | C::CERT_STORE_OPEN_EXISTING_FLAG,
+            wide(name).as_ptr() as *const core::ffi::c_void,
+        )
+    };
+    if store.is_null() {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(store)
+    }
+}
+
+fn enumeration_end(error: io::Error) -> io::Result<()> {
+    if error.raw_os_error().map(|code| code as u32)
+        == Some(windows_sys::Win32::Foundation::CRYPT_E_NOT_FOUND as u32)
+    {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+/// Borrow a store; the caller retains responsibility for closing it.
+fn store_contains(store: C::HCERTSTORE, der: &[u8]) -> io::Result<bool> {
+    unsafe {
         let mut cursor: *const C::CERT_CONTEXT = std::ptr::null();
-        let mut found = false;
         loop {
             cursor = C::CertEnumCertificatesInStore(store, cursor);
             if cursor.is_null() {
-                break;
+                return enumeration_end(io::Error::last_os_error()).map(|()| false);
             }
             let ctx = &*cursor;
             if ctx.cbCertEncoded as usize == der.len() && !ctx.pbCertEncoded.is_null() {
                 let encoded = std::slice::from_raw_parts(ctx.pbCertEncoded, der.len());
                 if encoded == der {
-                    found = true;
-                    break;
+                    // Enum frees the preceding context only on its next call.
+                    // Early return must release this final reference explicitly.
+                    C::CertFreeCertificateContext(cursor);
+                    return Ok(true);
                 }
             }
         }
-        C::CertCloseStore(store, 0);
-        found
     }
 }
 
@@ -146,41 +177,43 @@ fn wide(text: &str) -> Vec<u16> {
 // 早期版本的注释曾写成"已改用删注册表项"，与实现相反，已按实际行为改正。
 
 /// 本工具 CA 的 Subject 关键字。
-const OUR_CA_SUBJECT: &str = "winget-accel local CA";
+///
+/// 新版两级链会把根证书和中间证书分别放进用户存储/服务端链；
+/// 旧版只有 `winget-accel local CA`。两者都必须被 `--remove-ca`
+/// 和 doctor 的残留检查识别。
+const OUR_CA_SUBJECTS: [&str; 2] = ["winget-accel local CA", "winget-accel local root CA"];
+
+fn is_our_ca_subject(subject: &str) -> bool {
+    OUR_CA_SUBJECTS
+        .iter()
+        .any(|needle| subject.contains(needle))
+}
 
 /// 列出「当前用户受信任的根」里所有属于本工具的 CA 指纹（SHA-1 大写十六进制）。
 ///
 /// 抽出来是为了让 `doctor` 也能查"残留了几张"——只枚举、不修改任何东西。
-pub fn our_ca_thumbprints() -> Vec<String> {
+pub fn our_ca_thumbprints() -> io::Result<Vec<String>> {
     let mut thumbprints: Vec<String> = Vec::new();
+    let store = open_user_store("ROOT")?;
     unsafe {
-        let store = C::CertOpenStore(
-            C::CERT_STORE_PROV_SYSTEM_W,
-            0,
-            0,
-            C::CERT_SYSTEM_STORE_CURRENT_USER,
-            wide("ROOT").as_ptr() as *const core::ffi::c_void,
-        );
-        if store.is_null() {
-            return thumbprints;
-        }
         let mut cursor: *const C::CERT_CONTEXT = std::ptr::null();
         loop {
             cursor = C::CertEnumCertificatesInStore(store, cursor);
             if cursor.is_null() {
-                break;
+                // Capture GetLastError before closing the store.
+                let result = enumeration_end(io::Error::last_os_error()).map(|()| thumbprints);
+                C::CertCloseStore(store, 0);
+                return result;
             }
             if let Some(subject) = subject_of(cursor) {
-                if subject.contains(OUR_CA_SUBJECT) {
+                if is_our_ca_subject(&subject) {
                     if let Some(hash) = property_bytes(cursor, C::CERT_SHA1_HASH_PROP_ID) {
                         thumbprints.push(hash.iter().map(|b| format!("{b:02X}")).collect());
                     }
                 }
             }
         }
-        C::CertCloseStore(store, 0);
     }
-    thumbprints
 }
 
 /// 移除所有属于本工具的受信任根证书，返回（成功数, 失败数）。
@@ -188,11 +221,12 @@ pub fn our_ca_thumbprints() -> Vec<String> {
 /// **只用 `certutil -user -delstore`**，与安装（`certutil -user -addstore`）完全对称。
 /// 不写注册表：失败就如实报错，由调用方提示用户手工处理，
 /// 而不是偷偷换一条未文档化的路径把问题掩盖掉。
-pub fn remove_our_ca() -> (usize, usize) {
+pub fn remove_our_ca() -> io::Result<(usize, usize)> {
     let mut removed = 0;
     let mut failed = 0usize;
     // 先收集指纹（不能在枚举过程中删，会让枚举游标失效）
-    for thumbprint in our_ca_thumbprints() {
+    let thumbprints = our_ca_thumbprints()?;
+    for thumbprint in thumbprints {
         let ok = std::process::Command::new("certutil")
             .args(["-user", "-delstore", "Root", &thumbprint])
             .stdout(std::process::Stdio::null())
@@ -206,7 +240,7 @@ pub fn remove_our_ca() -> (usize, usize) {
             failed += 1;
         }
     }
-    (removed, failed)
+    Ok((removed, failed))
 }
 
 /// 取证书的简单显示名（通常是 Subject）。
@@ -237,5 +271,74 @@ fn subject_of(ctx: *const C::CERT_CONTEXT) -> Option<String> {
         }
         buf.truncate((written - 1) as usize);
         Some(String::from_utf16_lossy(&buf))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_both_legacy_and_two_level_ca_subjects() {
+        assert!(is_our_ca_subject("CN=winget-accel local CA"));
+        assert!(is_our_ca_subject("CN=winget-accel local root CA"));
+        assert!(!is_our_ca_subject("CN=some other local CA"));
+    }
+
+    #[test]
+    fn certificate_lookup_releases_contexts_on_match_and_miss() {
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["example.com".to_owned()]).unwrap();
+        let der = certificate.cert.der().as_ref();
+        for matched in [false, true] {
+            // A private memory store exercises native ownership without adding
+            // anything to the user's trusted roots.
+            unsafe {
+                let store = C::CertOpenStore(
+                    C::CERT_STORE_PROV_MEMORY,
+                    0,
+                    0,
+                    C::CERT_STORE_CREATE_NEW_FLAG,
+                    std::ptr::null(),
+                );
+                assert!(!store.is_null());
+                assert_ne!(
+                    C::CertAddEncodedCertificateToStore(
+                        store,
+                        C::X509_ASN_ENCODING,
+                        der.as_ptr(),
+                        der.len() as u32,
+                        C::CERT_STORE_ADD_NEW,
+                        std::ptr::null_mut(),
+                    ),
+                    0
+                );
+                let found = store_contains(store, if matched { der } else { &[] });
+                let closed = C::CertCloseStore(store, C::CERT_CLOSE_STORE_CHECK_FLAG);
+                assert_eq!(found.unwrap(), matched);
+                assert_ne!(
+                    closed, 0,
+                    "certificate lookup leaked an enumeration context"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn certificate_store_errors_are_not_reported_as_absence() {
+        use windows_sys::Win32::Foundation::{CRYPT_E_NOT_FOUND, ERROR_ACCESS_DENIED};
+        assert!(enumeration_end(io::Error::from_raw_os_error(CRYPT_E_NOT_FOUND)).is_ok());
+        let error =
+            enumeration_end(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
+
+        // OPEN_EXISTING + READONLY must fail, without creating a user store.
+        let missing = format!(
+            "winget-accel-missing-store-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        );
+        assert!(open_user_store(&missing).is_err());
+        assert!(open_user_store(&missing).is_err());
     }
 }

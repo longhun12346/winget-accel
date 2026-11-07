@@ -97,12 +97,14 @@ try {
     }
 
     Invoke-Step 'cargo clippy -D warnings' {
-        cargo clippy --all-targets --offline -- -D warnings
+        cargo clippy --all-targets --locked --offline -- -D warnings
         if ($LASTEXITCODE -ne 0) { throw 'clippy 有警告' }
     }
 
     Invoke-Step 'Rust 单元测试' {
-        $out = cargo test --bin winget-accel --offline 2>&1
+        # WinHTTP/PAC 与 Win32 注册表单测共享系统组件；并行运行会产生
+        # 偶发的 12167/PAC 时序失败。协议测试下面也显式串行。
+        $out = cargo test --bin winget-accel --locked --offline -- --test-threads=1 2>&1
         $out | Select-String -Pattern 'test result' | ForEach-Object { Write-Host $_.Line }
         if ($LASTEXITCODE -ne 0) { throw '单元测试失败' }
     }
@@ -118,7 +120,7 @@ try {
     }
 
     Invoke-Step '构建 release' {
-        cargo build --release --offline
+        cargo build --release --locked --offline
         if ($LASTEXITCODE -ne 0) { throw 'release 构建失败' }
 
         # 构建"成功"不等于"重编了"：cargo 按 mtime 判断，而用 Copy-Item 从备份恢复源文件会
@@ -135,7 +137,7 @@ try {
     }
 
     Invoke-Step 'Rust 协议集成测试（离线）' {
-        cargo test --test protocol --offline -- --test-threads=1
+        cargo test --test protocol --locked --offline -- --test-threads=1
         if ($LASTEXITCODE -ne 0) { throw '协议用例失败' }
     }
 
@@ -147,15 +149,22 @@ try {
             # 比出来的"相同"毫无意义（这个坑踩过一次）。
             # 关闭 ANSI 颜色，避免 `Compiling` 与包名之间的转义码影响匹配。
             $env:CARGO_TERM_COLOR = 'never'
-            (Get-Item src\main.rs).LastWriteTime = (Get-Date).AddMinutes(2)
-            $out = cargo build --release --offline 2>&1
-            if (-not ($out | Select-String -Pattern 'Compiling winget-accel')) {
-                throw '没有真正重编（cargo 认为已是最新），本次比较无效'
+            $source = Get-Item src\main.rs
+            $originalMtime = $source.LastWriteTime
+            try {
+                $source.LastWriteTime = (Get-Date).AddMinutes(2)
+                $out = cargo build --release --locked --offline 2>&1
+                if (-not ($out | Select-String -Pattern 'Compiling winget-accel')) {
+                    throw '没有真正重编（cargo 认为已是最新），本次比较无效'
+                }
+                $h2 = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+                Write-Host "first  = $h1"
+                Write-Host "second = $h2"
+                if ($h1 -ne $h2) { throw "构建不可复现：$h1 != $h2" }
             }
-            $h2 = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
-            Write-Host "first  = $h1"
-            Write-Host "second = $h2"
-            if ($h1 -ne $h2) { throw "构建不可复现：$h1 != $h2" }
+            finally {
+                $source.LastWriteTime = $originalMtime
+            }
         }
     }
 

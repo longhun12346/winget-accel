@@ -34,7 +34,7 @@ D:\Tools\winget-accel
 1. 预留监听端口，生成或复用本机 CA；
 2. 检查真实资产的直连能力并验证公共加速候选；
 3. 请求把 CA 加入“当前用户\受信任的根证书颁发机构”，供需要加速的连接使用；
-4. 设置当前用户 PAC，把 winget 的 `network.downloader` 设为 `wininet`；
+4. 通过 WinINet 启用当前用户 PAC，把 winget 的 `network.downloader` 设为 `wininet`；
 5. 报告“已就绪”，在 `127.0.0.1:8443` 提供服务并后台更新路由。
 
 第一次安装 CA 时会出现 Windows 确认框，需要在可见桌面中点击“是”。确认完成后，在另一个
@@ -47,6 +47,7 @@ winget download --id junegunn.fzf --download-directory "$env:TEMP\winget-test"
 
 按 `Ctrl+C` 停止。程序会恢复 PAC 和 winget 下载器设置。被强制结束时，看门狗会在父进程
 退出后尝试恢复；如果用户在运行期间手动修改或删除 PAC，程序会保留用户的新设置。
+接管前分别记录 WinINet 的有效 PAC 配置和注册表原值，恢复失败时保留日志供重试。
 
 ## 代理链路
 
@@ -111,6 +112,8 @@ winget-accel.exe --config .\config.json
 
 候选在本机最多四路并发验证，找到两个可用服务即可结束启动等待，候选验证总期限为 8 秒。
 后台常规维护约 4 个常用、4 个备用，按需补位并低频探索其它候选，不必每次全量测速。
+自动清单按解析后的主机名去重，重复服务只保留优先级最高的一项，
+避免同一公共服务重复占用探测和测速名额；手写 `accelerators` 按配置顺序保留。
 直连检测与候选验证并行；清单刷新、证书和系统接管的耗时另计。
 
 速度优选只依据本机：64 KiB 短测给初值，第一份真实下载替换初值，后续按新样本 20%、
@@ -150,8 +153,11 @@ PAC 仍等于本次写入值（包括 URL 更新中途记录的新旧值）时�
 后续修改或删除的设置会保留。PAC 与 winget 全部处理完成才删除状态，恢复失败可重试。
 同一用户的多个解压副本共用锁，旧看门狗不会处理新会话。
 
-CA 私钥以明文保存在 `certs\ca-key.pem`。不要把包含 `certs` 的目录发给别人或放进云同步
-目录。卸载时先停止代理，再执行：
+证书目录同时包含 `root-cert.pem`（Windows 当前用户根存储中的信任锚）、
+`root-key.pem`（根私钥）、`ca-cert.pem`（带 Name Constraints 的中间 CA）和
+`ca-key.pem`（中间 CA 私钥）。两把私钥都以明文保存，不要把包含 `certs` 的目录发给别人
+或放进云同步目录。服务端会发送叶证书和中间 CA，客户端只需要显式信任
+`root-cert.pem`。卸载时先停止代理，再执行：
 
 ```powershell
 .\winget-accel.exe --remove-ca
@@ -168,10 +174,10 @@ CA 私钥以明文保存在 `certs\ca-key.pem`。不要把包含 `certs` 的目�
 ```powershell
 cargo fmt --all -- --check
 cargo fetch --locked
-cargo clippy --all-targets --offline -- -D warnings
-cargo test --bin winget-accel --offline
-cargo test --test protocol --offline -- --test-threads=1
-cargo build --release --offline
+cargo clippy --all-targets --locked --offline -- -D warnings
+cargo test --bin winget-accel --locked --offline -- --test-threads=1
+cargo test --test protocol --locked --offline -- --test-threads=1
+cargo build --release --locked --offline
 
 .\packaging\check-docs-sync.ps1
 .\packaging\verify.ps1
@@ -185,7 +191,7 @@ cargo build --release --offline
 协议测试使用本地假上游，默认不访问外网：
 
 ```powershell
-cargo test --test protocol --offline -- --test-threads=1
+cargo test --test protocol --locked --offline -- --test-threads=1
 ```
 
 协议测试由 Rust 负责启动代理、假上游和临时目录，客户端调用 Windows 自带的
@@ -196,7 +202,7 @@ cargo test --test protocol --offline -- --test-threads=1
 
 需要验证真实公共服务时，可运行 `.\packaging\verify-no-env.ps1`。它要求两次 Range 请求
 均通过代理取得完整的 64 KiB，并检查成功改写日志，以及运行前、运行中和退出后的
-PAC、受信任根、恢复日志与锁的状态。
+PAC、受信任根证书指纹集合、winget 设置原字节、恢复日志与锁的状态。
 使用 `.\packaging\verify-no-env.ps1 -RoutingMode auto` 可同时运行真实直连探测，
 打印路由结果；负载仍显式经过本机代理，以验证公共加速链和系统设置保护。
 

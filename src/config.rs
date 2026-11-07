@@ -1,5 +1,6 @@
 //! 配置与启动参数。
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -217,6 +218,12 @@ impl App {
             if trimmed.is_empty() {
                 bail!("rewriteHosts 里不能有空条目（请删掉空字符串）");
             }
+            if trimmed.chars().any(|ch| ch.is_control()) {
+                bail!(
+                    "rewriteHosts 里不能有控制字符：{trimmed:?}。\
+                     请写普通主机名，避免生成非法 PAC 脚本"
+                );
+            }
             if trimmed.contains('*') || trimmed.contains('?') {
                 bail!(
                     "rewriteHosts 不支持通配符：{trimmed:?}。请写精确的主机名（如 github.com）；\
@@ -247,7 +254,39 @@ impl App {
         let mut caps = Vec::with_capacity(items.len());
         for item in &items {
             accels.push(parse_accel(&item.template)?);
-            caps.push(item.hosts.clone());
+            let mut hosts = Vec::with_capacity(item.hosts.len());
+            for host in &item.hosts {
+                let host = host.trim();
+                if host.is_empty() {
+                    bail!(
+                        "accelerators[].hosts 不能包含空条目（候选 {:?}）",
+                        item.name
+                    );
+                }
+                if host.chars().any(|ch| ch.is_control())
+                    || host.contains('*')
+                    || host.contains('?')
+                    || host.contains("://")
+                    || host.contains('/')
+                    || host.contains(':')
+                {
+                    bail!(
+                        "accelerators[].hosts 只能填写精确主机名：{host:?}（候选 {:?}）",
+                        item.name
+                    );
+                }
+                let host = host.to_ascii_lowercase();
+                if !rewrite_hosts.iter().any(|allowed| allowed == &host) {
+                    bail!(
+                        "accelerators[].hosts 中的主机名 {host:?} 不在 rewriteHosts 里（候选 {:?}）",
+                        item.name
+                    );
+                }
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
+            }
+            caps.push(hosts);
         }
 
         let mut health_probe_custom = false;
@@ -301,8 +340,11 @@ impl App {
                 .collect(),
             winget_downloader: file.winget_downloader,
             health_enabled: file.health.enabled,
-            health_interval: Duration::from_secs(file.health.interval_seconds.max(60)),
-            health_timeout: Duration::from_secs(file.health.timeout_seconds.max(1)),
+            // Keep user-configured lower-bound clamping, but also cap extreme
+            // values so doctor and background probes cannot wait for hours or
+            // sleep for an effectively infinite interval.
+            health_interval: Duration::from_secs(file.health.interval_seconds.clamp(60, 86_400)),
+            health_timeout: Duration::from_secs(file.health.timeout_seconds.clamp(1, 30)),
             health_failures: file.health.failures_before_unhealthy.max(1),
             health_probe,
             health_probe_custom,
@@ -450,24 +492,20 @@ fn collect_unknown(
 /// 自动候选按 host 去重。只有来源不可用或损坏才回退；有效的空清单表示全部停用。
 fn default_accelerators() -> Vec<AcceleratorCfg> {
     let mut out: Vec<AcceleratorCfg> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
 
     let push = |name: &str,
                 template: &str,
                 priority: u32,
                 out: &mut Vec<AcceleratorCfg>,
-                seen: &mut Vec<String>| {
+                seen: &mut HashSet<String>| {
         // 按 host 去重：同一站点用不同路径前缀没必要占两个名额
-        let probe = crate::candidates::Candidate {
-            name: name.to_string(),
-            template: template.to_string(),
-            builtin: false,
-        };
-        let host = probe.host().unwrap_or(template).to_string();
-        if seen.iter().any(|h| h == &host) {
+        let host = crate::rewrite::parse_accel(template)
+            .map(|accel| accel.host)
+            .unwrap_or_else(|_| template.to_ascii_lowercase());
+        if !seen.insert(host) {
             return;
         }
-        seen.push(host);
         out.push(AcceleratorCfg {
             name: name.to_string(),
             template: template.to_string(),
@@ -591,6 +629,7 @@ mod tests {
             ("https://github.com", "协议"),
             ("github.com/releases", "路径"),
             ("github.com:443", "端口"),
+            ("github\n.com", "控制字符"),
             ("   ", "空条目"),
         ];
         for (host, why) in cases {
@@ -652,6 +691,10 @@ mod tests {
         let mut file = test_file("127.0.0.1:8443");
         file.health.probe_url = Some("http://example.com/x".into());
         assert!(App::new(file).is_err(), "非 https 的探测资产必须拒绝");
+
+        let mut file = test_file("127.0.0.1:8443");
+        file.health.probe_url = Some("https://example.com:0/asset.bin".into());
+        assert!(App::new(file).is_err(), "端口 0 的探测资产必须拒绝");
 
         let mut file = test_file("127.0.0.1:8443");
         file.health.probe_url = Some("https://example.com/asset.bin".into());
@@ -725,11 +768,36 @@ mod tests {
             name: "only-github".into(),
             template: "https://a.example/{url}".into(),
             priority: 1,
-            hosts: vec!["GitHub.com".into()],
+            hosts: vec![" GitHub.com ".into(), "github.com".into()],
         }];
         let app = App::new(file).unwrap();
         assert!(app.accel_supports(0, "github.com"), "声明大写也应生效");
         assert!(!app.accel_supports(0, "codeload.github.com"));
+        assert_eq!(app.caps[0], vec!["github.com"]);
+    }
+
+    #[test]
+    fn capability_matrix_rejects_invalid_host_entries() {
+        for host in [
+            " ",
+            "*.github.com",
+            "https://github.com",
+            "github.com/path",
+            "api.github.com",
+        ] {
+            let mut file = test_file("127.0.0.1:8443");
+            file.accelerators[0].hosts = vec![host.into()];
+            assert!(App::new(file).is_err(), "能力矩阵应拒绝非法主机名 {host:?}");
+        }
+    }
+
+    #[test]
+    fn capability_matrix_hosts_must_be_in_rewrite_scope() {
+        let mut file = test_file("127.0.0.1:8443");
+        file.rewrite_hosts = vec!["github.com".into()];
+        file.accelerators[0].hosts = vec!["codeload.github.com".into()];
+        let error = App::new(file).expect_err("能力矩阵不能引用未启用的 rewrite host");
+        assert!(error.to_string().contains("rewriteHosts"), "{error}");
     }
 
     #[test]
@@ -782,6 +850,16 @@ mod tests {
         assert!(file.log_path.is_none());
         assert_eq!(file.routing.mode, RoutingMode::Auto);
         assert_eq!(file.routing.min_direct_kbps, 512);
+    }
+
+    #[test]
+    fn health_runtime_budgets_are_bounded() {
+        let mut file = test_file("127.0.0.1:8443");
+        file.health.interval_seconds = u64::MAX;
+        file.health.timeout_seconds = u64::MAX;
+        let app = App::new(file).unwrap();
+        assert_eq!(app.health_interval, Duration::from_secs(86_400));
+        assert_eq!(app.health_timeout, Duration::from_secs(30));
     }
 
     #[test]

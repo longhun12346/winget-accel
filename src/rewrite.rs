@@ -104,7 +104,20 @@ pub fn parse_accel(spec: &str) -> Result<Accel> {
         Some((authority, path)) => (authority, format!("/{}", path.trim_end_matches('/'))),
         None => (rest.as_str(), String::new()),
     };
+    if prefix.contains('?') || prefix.contains('#') {
+        bail!(
+            "加速器模板的 {{url}} 前缀只能是路径，不能包含查询串或片段：{spec:?}。\
+             请把固定参数放到服务端配置中，模板只保留路径前缀"
+        );
+    }
     let prefix = if prefix == "/" { String::new() } else { prefix };
+    // `Authority` 的解析不会检查后面的路径。若这里接受原始空格、控制字符
+    // 或其它非法 URI 字符，配置能启动，但真正构造上游请求时才会失败，
+    // 结果表现成候选运行中突然全部 502。提前用完整 URI 校验一次路径前缀，
+    // 让错误在加载配置/清单时暴露。
+    format!("https://example.invalid{prefix}/https://github.com/x")
+        .parse::<hyper::Uri>()
+        .context("加速器路径前缀不是合法 URI 路径")?;
 
     let authority: hyper::http::uri::Authority =
         authority.parse().context("加速器 authority 非法")?;
@@ -119,6 +132,9 @@ pub fn parse_accel(spec: &str) -> Result<Accel> {
         .trim_matches(['[', ']'])
         .to_ascii_lowercase();
     let port = authority.port_u16().unwrap_or(scheme.default_port());
+    if port == 0 {
+        bail!("加速器端口不能是 0：{spec:?}");
+    }
 
     Ok(Accel {
         scheme,
@@ -459,6 +475,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rejects_query_or_fragment_in_template_prefix() {
+        for spec in [
+            "https://accel.example/p?token=x/{url}",
+            "https://accel.example/p#fragment/{url}",
+        ] {
+            let err = parse_accel(spec).expect_err(&format!("应拒绝 {spec:?}"));
+            assert!(
+                err.to_string().contains("查询串或片段"),
+                "报错应说明前缀不能带查询串/片段（{spec:?}）: {err}"
+            );
+        }
+        assert_eq!(
+            parse_accel("https://accel.example/p%3Ftoken%3Dx/{url}")
+                .expect("编码后的问号仍是路径字符")
+                .prefix,
+            "/p%3Ftoken%3Dx"
+        );
+    }
+
     // 带路径前缀的加速器：https://accel/p/{url}
     #[test]
     fn template_with_path_prefix_is_preserved() {
@@ -682,5 +718,25 @@ mod tests {
         // 有冒号但端口不是数字 → 报错，不退化成"无端口"
         let err = parse_accel("http://host:notaport").unwrap_err();
         assert!(err.to_string().contains("端口"), "实际: {err}");
+    }
+
+    #[test]
+    fn parse_accel_rejects_zero_port() {
+        let err = parse_accel("http://127.0.0.1:0").unwrap_err();
+        assert!(err.to_string().contains("端口"), "实际: {err}");
+    }
+
+    #[test]
+    fn parse_accel_rejects_invalid_path_prefix_early() {
+        for spec in [
+            "https://accel.example/path with-space/{url}",
+            "https://accel.example/path\u{0007}/{url}",
+        ] {
+            let err = parse_accel(spec).expect_err(&format!("应拒绝 {spec:?}"));
+            assert!(
+                err.to_string().contains("URI 路径"),
+                "应在配置加载时说明路径非法（{spec:?}）：{err}"
+            );
+        }
     }
 }

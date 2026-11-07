@@ -71,15 +71,6 @@ pub struct Candidate {
     pub builtin: bool,
 }
 
-impl Candidate {
-    /// 从 template 里取 host，用于去重。
-    pub fn host(&self) -> Option<&str> {
-        let rest = self.template.split_once("://")?.1;
-        let authority = rest.split('/').next()?;
-        Some(authority.split(':').next().unwrap_or(authority))
-    }
-}
-
 /// 读取清单。
 ///
 /// 优先级：用户手放的 `candidates.json` > 网络刷新 > 网络缓存 > 内嵌清单。
@@ -155,45 +146,53 @@ pub fn load(dir: &Path, allow_fetch: bool) -> (Vec<Candidate>, String) {
 }
 
 /// 并发获取上游，六秒内优先采用权威源的有效结果；全部失败则回退本地清单。
+///
+/// 权威源较慢但加速镜像已经成功时，只额外等待一个短窗口，避免当前网络
+/// 直连 raw.githubusercontent.com 不通时每次启动白等完整的单源超时。
 fn fetch_best() -> Result<(String, Vec<Candidate>, String)> {
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    crate::http::block_on(fetch_best_async())
+}
 
+async fn fetch_best_async() -> Result<(String, Vec<Candidate>, String)> {
     // 环境变量覆盖：自建镜像用，也方便本地验证整条链路
     let override_url = std::env::var("WINGET_ACCEL_CANDIDATES_URL").ok();
     let urls: Vec<String> = match &override_url {
         Some(u) if !u.trim().is_empty() => vec![u.trim().to_string()],
         _ => UPSTREAM_URLS.iter().map(|u| (*u).to_string()).collect(),
     };
+    fetch_best_from(urls).await
+}
 
-    let known_urls = urls.clone();
-    let mut seen: Vec<String> = Vec::new();
+async fn fetch_best_from(known_urls: Vec<String>) -> Result<(String, Vec<Candidate>, String)> {
+    use std::time::Duration;
 
-    let (tx, rx) = mpsc::channel();
-    for url in urls {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let result = http_get(&url, 5).and_then(|body| {
+    const FETCH_BUDGET: Duration = Duration::from_secs(6);
+    const AUTHORITY_GRACE: Duration = Duration::from_millis(750);
+    let mut tasks = tokio::task::JoinSet::new();
+    for url in known_urls.clone() {
+        tasks.spawn(async move {
+            let result = http_get_async(&url, 5).await.and_then(|body| {
                 let list = parse(&body)?;
                 Ok((body, list))
             });
-            let _ = tx.send((url, result));
+            (url, result)
         });
     }
-    drop(tx);
 
     // 删除或隔离候选会使新清单更短；不能把条目多当作内容更新的证据。
     // 端点顺序表示权威源、加速镜像的优先级，空 candidates 也能表达全部停用。
-    let deadline = Instant::now() + Duration::from_secs(6);
+    let deadline = tokio::time::Instant::now() + FETCH_BUDGET;
     let mut errors: Vec<String> = Vec::new();
     let mut best: Option<(String, Vec<Candidate>, String)> = None;
-    loop {
-        let remaining = match deadline.checked_duration_since(Instant::now()) {
-            Some(d) if !d.is_zero() => d,
-            _ => break,
-        };
-        match rx.recv_timeout(remaining) {
-            Ok((url, Ok((body, list)))) => {
+    let mut seen = Vec::new();
+    let authority = known_urls.first().cloned();
+    let mut authority_pending = authority.is_some();
+    let mut authority_grace_deadline: Option<tokio::time::Instant> = None;
+    let mut stopped_early = false;
+    while !tasks.is_empty() {
+        let wait_until = authority_grace_deadline.map_or(deadline, |grace| grace.min(deadline));
+        match tokio::time::timeout_at(wait_until, tasks.join_next()).await {
+            Ok(Some(Ok((url, Ok((body, list)))))) => {
                 seen.push(url.clone());
                 crate::log::info(&format!("候选源成功: {url} -> {} 条", list.len()));
                 let priority = |url: &str| {
@@ -202,25 +201,62 @@ fn fetch_best() -> Result<(String, Vec<Candidate>, String)> {
                         .position(|known| known == url)
                         .unwrap_or(usize::MAX)
                 };
-                if best
-                    .as_ref()
-                    .is_none_or(|(_, _, current)| priority(&url) < priority(current))
-                {
+                if authority.as_deref() == Some(url.as_str()) {
                     best = Some((body, list, url));
+                    stopped_early = true;
+                    break;
+                }
+                if best.is_none() {
+                    best = Some((body, list, url));
+                    if authority_pending {
+                        authority_grace_deadline =
+                            Some(tokio::time::Instant::now() + AUTHORITY_GRACE);
+                    } else {
+                        stopped_early = true;
+                        break;
+                    }
+                } else {
+                    let current_priority = best
+                        .as_ref()
+                        .map(|(_, _, current)| priority(current))
+                        .unwrap_or(usize::MAX);
+                    if priority(&url) < current_priority {
+                        best = Some((body, list, url));
+                    }
                 }
             }
-            Ok((url, Err(err))) => {
+            Ok(Some(Ok((url, Err(err))))) => {
                 seen.push(url.clone());
+                if authority.as_deref() == Some(url.as_str()) {
+                    authority_pending = false;
+                    authority_grace_deadline = None;
+                    if best.is_some() {
+                        stopped_early = true;
+                        break;
+                    }
+                }
                 crate::log::warn(&format!("候选源失败: {url}: {err:#}"));
                 errors.push(format!("{url}: {err:#}"));
             }
-            Err(_) => break,
+            Ok(Some(Err(err))) => {
+                errors.push(format!("候选源任务异常: {err}"));
+            }
+            Ok(None) => break,
+            Err(_) => {
+                stopped_early = best.is_some() && authority_grace_deadline.is_some();
+                break;
+            }
         }
     }
-    for url in known_urls {
-        if !seen.contains(&url) {
-            crate::log::warn(&format!("候选源超时: {url}: 6 秒内未返回"));
-            errors.push(format!("{url}: 6 秒内未返回"));
+    tasks.abort_all();
+    tasks.shutdown().await;
+
+    if !stopped_early {
+        for url in known_urls {
+            if !seen.contains(&url) {
+                crate::log::warn(&format!("候选源超时: {url}: 获取预算内未返回"));
+                errors.push(format!("{url}: 获取预算内未返回"));
+            }
         }
     }
     if let Some(found) = best {
@@ -232,12 +268,22 @@ fn fetch_best() -> Result<(String, Vec<Candidate>, String)> {
     anyhow::bail!("所有上游都失败: {}", errors.join(" | "))
 }
 /// Same Hyper transport and total deadline as probes; decoded payload is bounded.
+#[cfg(test)]
 fn http_get(url: &str, timeout_secs: u64) -> Result<String> {
     crate::http::get_text(
         url,
         std::time::Duration::from_secs(timeout_secs),
         1024 * 1024,
     )
+}
+
+async fn http_get_async(url: &str, timeout_secs: u64) -> Result<String> {
+    crate::http::get_text_async(
+        url,
+        std::time::Duration::from_secs(timeout_secs),
+        1024 * 1024,
+    )
+    .await
 }
 
 fn parse(text: &str) -> Result<Vec<Candidate>> {
@@ -282,16 +328,14 @@ fn parse(text: &str) -> Result<Vec<Candidate>> {
             ));
             continue;
         }
-        if crate::rewrite::parse_accel(&entry.template).is_err() {
+        let Ok(accel) = crate::rewrite::parse_accel(&entry.template) else {
             crate::log::warn(&format!(
                 "候选模板非法，已跳过: {} => {}",
                 entry.name, entry.template
             ));
             continue;
-        }
-        if crate::rewrite::parse_accel(&entry.template)
-            .is_ok_and(|accel| blocked.contains(&accel.host))
-        {
+        };
+        if blocked.contains(&accel.host) {
             continue;
         }
         out.push(Candidate {
@@ -306,6 +350,40 @@ fn parse(text: &str) -> Result<Vec<Candidate>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn start_catalog_server(
+        delay: std::time::Duration,
+        name: &'static str,
+        status: u16,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind catalog server");
+        let address = listener.local_addr().expect("catalog server address");
+        let body = format!(
+            r#"{{"candidates":[{{"name":"{name}","template":"https://{name}.example/{{url}}"}}]}}"#
+        );
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept catalog request");
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            while !request.ends_with(b"\r\n\r\n") {
+                let count = stream.read(&mut buf).expect("read catalog request");
+                if count == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..count]);
+            }
+            std::thread::sleep(delay);
+            let response = format!(
+                "HTTP/1.1 {status} Result\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{address}/candidates.json"), thread)
+    }
+
     fn read_http_body<R: std::io::Read>(reader: &mut R) -> Result<String> {
         use std::io::{Read, Write};
         let mut raw = Vec::new();
@@ -321,6 +399,62 @@ mod tests {
         let result = http_get(&format!("http://{address}/"), 2);
         server.join().unwrap();
         result
+    }
+
+    #[test]
+    fn fetch_prefers_authority_when_it_returns_within_grace_window() {
+        let (authority, authority_thread) =
+            start_catalog_server(std::time::Duration::from_millis(100), "authority", 200);
+        let (mirror, mirror_thread) =
+            start_catalog_server(std::time::Duration::ZERO, "mirror", 200);
+        let expected = authority.clone();
+        let result = crate::http::block_on(fetch_best_from(vec![authority, mirror]))
+            .expect("authority result");
+        authority_thread.join().expect("authority server thread");
+        mirror_thread.join().expect("mirror server thread");
+
+        assert_eq!(result.2, expected, "{result:?}");
+        assert_eq!(result.1[0].name, "authority");
+    }
+
+    #[test]
+    fn fetch_uses_completed_mirror_after_authority_grace_expires() {
+        let started = std::time::Instant::now();
+        let (authority, authority_thread) =
+            start_catalog_server(std::time::Duration::from_secs(2), "authority", 200);
+        let (mirror, mirror_thread) =
+            start_catalog_server(std::time::Duration::ZERO, "mirror", 200);
+        let result =
+            crate::http::block_on(fetch_best_from(vec![authority, mirror])).expect("mirror result");
+
+        assert_eq!(result.1[0].name, "mirror");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "不应等待权威源完整超时: {:?}",
+            started.elapsed()
+        );
+        authority_thread.join().expect("authority server thread");
+        mirror_thread.join().expect("mirror server thread");
+    }
+
+    #[test]
+    fn fetch_does_not_wait_after_authority_fails() {
+        let started = std::time::Instant::now();
+        let (authority, authority_thread) =
+            start_catalog_server(std::time::Duration::from_millis(200), "authority", 503);
+        let (mirror, mirror_thread) =
+            start_catalog_server(std::time::Duration::ZERO, "mirror", 200);
+        let result =
+            crate::http::block_on(fetch_best_from(vec![authority, mirror])).expect("mirror result");
+
+        assert_eq!(result.1[0].name, "mirror");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(700),
+            "权威源已明确失败后不应再等待优先窗口: {:?}",
+            started.elapsed()
+        );
+        authority_thread.join().expect("authority server thread");
+        mirror_thread.join().expect("mirror server thread");
     }
 
     #[test]
@@ -353,26 +487,6 @@ mod tests {
             list.iter().all(|c| c.template.contains("{url}")),
             "每条模板都必须含 {{url}}"
         );
-    }
-
-    #[test]
-    fn host_is_extracted_from_template() {
-        let c = Candidate {
-            name: "x".into(),
-            template: "https://gh-proxy.com/{url}".into(),
-            builtin: true,
-        };
-        assert_eq!(c.host(), Some("gh-proxy.com"));
-    }
-
-    #[test]
-    fn host_handles_explicit_port() {
-        let c = Candidate {
-            name: "x".into(),
-            template: "http://127.0.0.1:8080/{url}".into(),
-            builtin: false,
-        };
-        assert_eq!(c.host(), Some("127.0.0.1"));
     }
 
     #[test]

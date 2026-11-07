@@ -43,7 +43,7 @@ try {
 
     if (-not $SkipBuild) {
         Write-Host '构建 release...'
-        & cargo build --release --offline
+        & cargo build --release --locked --offline
         if ($LASTEXITCODE -ne 0) { throw "cargo build 失败（退出码 $LASTEXITCODE）" }
     }
 

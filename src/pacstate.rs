@@ -71,6 +71,9 @@ pub struct SavedState {
     pub session: Option<String>,
     /// 本次是否接管过 winget 的设置文件；`None` = 没接管。
     pub winget: Option<WingetState>,
+    /// Registry AutoConfigURL may differ from the effective connection options.
+    pub wininet: Option<crate::wininet::Connection>,
+    pub wininet_restore: Option<crate::wininet::Restore>,
 }
 
 impl SavedState {
@@ -86,10 +89,12 @@ impl SavedState {
                 fastrand::u64(..)
             )),
             winget: None,
+            wininet: None,
+            wininet_restore: None,
         }
     }
 
-    /// 记下 winget 设置的原值（由 `EnvGuard::enable` 在写入后调用）。
+    /// 记下 winget 设置的原值（由 `EnvGuard::enable` 在修改前调用）。
     pub fn with_winget(mut self, winget: WingetState) -> Self {
         self.winget = Some(winget);
         self
@@ -110,13 +115,15 @@ impl SavedState {
                     previous_pac: None,
                     session: None,
                     winget: None,
+                    wininet: None,
+                    wininet_restore: None,
                 });
             }
             bail!("PAC 状态不是可识别的旧格式或 JSON");
         }
         let doc: serde_json::Value = serde_json::from_str(text)?;
         let version = doc.get("version").and_then(|v| v.as_u64());
-        if !matches!(version, Some(1 | 2)) {
+        if !matches!(version, Some(1..=3)) {
             bail!("PAC 状态版本不支持");
         }
         let prior = match doc.get("prior") {
@@ -127,7 +134,7 @@ impl SavedState {
             Some(serde_json::Value::String(value)) => Some(value.clone()),
             _ => bail!("PAC 状态缺少合法的 prior"),
         };
-        let (owned_pac, session) = if version == Some(2) {
+        let (owned_pac, session) = if matches!(version, Some(2 | 3)) {
             let owned = doc
                 .get("ownedPac")
                 .and_then(|v| v.as_str())
@@ -159,12 +166,47 @@ impl SavedState {
             }
             _ => bail!("PAC 状态 previousPac 非法"),
         };
+        let wininet = if version == Some(3) {
+            Some(serde_json::from_value::<crate::wininet::Connection>(
+                doc.get("wininet").context("PAC 状态缺少 wininet")?.clone(),
+            )?)
+        } else {
+            None
+        };
+        let wininet_restore = match doc.get("wininetRestore") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) if wininet.is_some() => {
+                let restore: crate::wininet::Restore = serde_json::from_value(value.clone())?;
+                let native_prior = wininet.as_ref().unwrap();
+                if !restore.before.pac_enabled()
+                    || !restore.before.url.as_deref().is_some_and(|url| {
+                        owned_pac.as_deref() == Some(url) || previous_pac.as_deref() == Some(url)
+                    })
+                    || restore.after != restore.before.restore_pac(native_prior)
+                    || restore.registry_after
+                        != if restore.registry_before.as_deref().is_some_and(|url| {
+                            owned_pac.as_deref() == Some(url)
+                                || previous_pac.as_deref() == Some(url)
+                        }) {
+                            prior.clone()
+                        } else {
+                            restore.registry_before.clone()
+                        }
+                {
+                    bail!("WinINet 恢复计划与原始状态或会话不匹配");
+                }
+                Some(restore)
+            }
+            _ => bail!("PAC 状态 wininetRestore 非法"),
+        };
         Ok(Self {
             prior,
             owned_pac,
             previous_pac,
             session,
             winget: parse_winget(&doc),
+            wininet,
+            wininet_restore,
         })
     }
 
@@ -275,11 +317,13 @@ pub fn read(path: &Path) -> Result<Option<SavedState>> {
 pub fn write(path: &Path, state: &SavedState) -> Result<()> {
     let mut doc = if state.session.is_some() {
         serde_json::json!({
-            "version": 2,
+            "version": if state.wininet.is_some() { 3 } else { 2 },
             "prior": state.prior,
             "ownedPac": state.owned_pac,
             "previousPac": state.previous_pac,
             "session": state.session,
+            "wininet": state.wininet,
+            "wininetRestore": state.wininet_restore,
         })
     } else {
         serde_json::json!({ "version": 1, "prior": state.prior })
@@ -342,6 +386,39 @@ mod tests {
         doc["previousPac"] =
             "http://127.0.0.1:18443/winget-accel.pac?session=different&route=0".into();
         assert!(SavedState::parse(&doc.to_string()).is_err());
+        doc["previousPac"] = serde_json::Value::Null;
+        doc["version"] = 3.into();
+        assert!(SavedState::parse(&doc.to_string()).is_err());
+        for invalid in [
+            serde_json::json!({"flags": 9}),
+            serde_json::json!({"flags": "9", "url": null}),
+            serde_json::json!({"flags": -1, "url": null}),
+            serde_json::json!({"flags": 9, "url": false}),
+        ] {
+            doc["wininet"] = invalid;
+            assert!(SavedState::parse(&doc.to_string()).is_err());
+        }
+        doc["wininet"] = serde_json::json!({"flags": 9, "url": null});
+        assert!(SavedState::parse(&doc.to_string()).is_ok());
+        doc["wininet"] = serde_json::json!({"flags": 9, "url": "http://corp/prior.pac"});
+        assert!(SavedState::parse(&doc.to_string()).is_ok());
+        doc["wininetRestore"] = serde_json::json!({
+            "before": {"flags": 13, "url": doc["ownedPac"]},
+            "after": {"flags": 9, "url": "http://different/prior.pac"},
+            "registryBefore": doc["ownedPac"],
+            "registryAfter": doc["prior"]
+        });
+        assert!(SavedState::parse(&doc.to_string()).is_err());
+        doc["wininetRestore"]["after"]["url"] = doc["wininet"]["url"].clone();
+        assert!(SavedState::parse(&doc.to_string()).is_ok());
+        for field in ["registryBefore", "registryAfter"] {
+            let mut missing = doc.clone();
+            missing["wininetRestore"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(SavedState::parse(&missing.to_string()).is_err(), "{field}");
+        }
     }
 
     #[test]

@@ -13,8 +13,8 @@
     "release-assets.githubusercontent.com"
   ],
 
-  "$comment_accelerators": "按 priority 升序取第一个健康的；{url} 替换为原始完整 URL。**同一 host 只保留第一条**（按 host 去重：同站点不同路径前缀没必要占两个名额），所以写 3 条但其中 2 条同 host 时，启动日志会显示「3 条，合并内置后共 2 个候选」——这是去重生效，不是配置丢了。健康探测打各自 origin 的根路径。默认候选池不在这里——它来自 candidates.json（启动时从上游刷新，约 43 条）；本文件的 accelerators 一旦非空就会**完全取代**默认池，所以只在自建/固定候选时才填",
-  "$comment_accelerators_verified": "下面 5 条是 2026-11-01 的实测快照（同一资源、Range 206 + 整包 SHA256 校验通过：gh-proxy.com 765 KB/s、ghproxy.imciel.com 222 KB/s、ghfast.top 190 KB/s）。公共服务的存活与速度每天都在变，不要把这些数字当作当前值；也不需要照抄——留空 accelerators 就会用自动维护的候选池",
+  "$comment_accelerators": "{url} 替换为原始完整 URL；自动候选清单按 host 去重，手写项按配置顺序保留。priority 用于初始探测顺序，下载按本机近期速度和健康状态加权选择，常用候选最多 4 个。默认候选来自自动维护的 candidates.json；accelerators 非空会完全取代默认池，留空数组才使用默认池。健康验证通过加速器请求真实 GitHub 资产，不探测服务首页",
+  "$comment_accelerators_verified": "下面是固定候选的配置示例，不代表当前可用性或速度排名。公共服务的存活与速度会随网络变化；速度优选只依据本机采样和真实下载，CI 清单只验证可用性与内容。通常建议使用空数组，让程序维护候选池",
   "accelerators": [
     {
       "name": "gh-proxy",
@@ -64,9 +64,9 @@
     "timeoutSeconds": 8,
     "failuresBeforeUnhealthy": 2,
     "probeUrl": null,
-    "$comment_probe": "探测加速器自身 origin 的根路径。收到任意 HTTP 响应（含 404）即视为可达，不要求 2xx。切勿指向 github.com 的资产路径——受限网络下那里本身就不通，会把所有加速器一起误判为不健康",
+    "$comment_probe": "通过每个加速器请求 probeUrl 指定的真实资产，要求 206、正确范围和完整的 64 KiB 样本；首页或 404 响应不能证明下载可用",
     "$comment_probeUrl": "可选：测速用的基准资产（必须 https）。默认是编译期内置的 git-for-windows release 文件，它绑着具体版本，上游删掉就会导致所有候选测速失败 → 全站 502。自建或排障时换成自己的稳定资产",
-    "$comment_rate": "默认 300 秒，配置下限会夹到 60 秒；每轮按批探测（每批 6 个并发）。间隔过短会触发 CDN 侧惩罚（ADR-006）"
+    "$comment_rate": "默认 300 秒，配置下限会夹到 60 秒。启动最多 4 路并发，共用 8 秒预算，找到两个可用候选即可就绪；后台最多 2 路并发，维护最多 8 项，其余低频探索，失败按退避间隔重试"
   },
 
   "$comment_no_fallback": "没有 fallbackToOriginal 这一项：代理内候选用尽仍返回 502，不盲目回退到未经验证的直连（ADR-016）。auto 的 DIRECT 例外由独立的真实下载验证决定，旧 PAC 再次求值时拒绝过期证据；客户端缓存和已有连接可能延后实际切换。",

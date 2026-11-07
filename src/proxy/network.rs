@@ -111,7 +111,7 @@ impl Proxy {
                     let mut builder = hyper::server::conn::http1::Builder::new();
                     builder
                         .keep_alive(false)
-                        .max_buf_size(http::MAX_HEAD)
+                        .max_buf_size(http::MAX_SERVER_HEAD_BUFFER)
                         .timer(TokioTimer::new())
                         .header_read_timeout(if saturated {
                             Duration::from_millis(200)
@@ -185,15 +185,12 @@ impl Proxy {
                 return http::response(503, "text/plain", "");
             }
             let tunnel_slot = TunnelSlot(self.clone());
-            let upstream = match timeout(
-                CONNECT_TIMEOUT,
-                tokio::net::TcpStream::connect((host.as_str(), port)),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => stream,
-                _ => {
+            let upstream = match crate::http::connect_tcp(&host, port, CONNECT_TIMEOUT).await {
+                Ok(stream) => stream,
+                Err(error) => {
                     Stats::bump(&self.stats.errors);
+                    self.log
+                        .warn(&format!("TUNNEL-CONNECT-FAIL {host}:{port} {error:#}"));
                     return http::response(502, "text/plain", "");
                 }
             };
@@ -238,11 +235,48 @@ impl Proxy {
         });
         hyper::server::conn::http1::Builder::new()
             .keep_alive(false)
-            .max_buf_size(http::MAX_HEAD)
+            .max_buf_size(http::MAX_SERVER_HEAD_BUFFER)
             .timer(TokioTimer::new())
             .header_read_timeout(FIRST_REQUEST_TIMEOUT)
             .serve_connection(TokioIo::new(http::timed(io, IO_TIMEOUT)), service)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn upstream_connect_resolves_and_connects_to_a_local_listener() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let thread = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let result = crate::http::block_on(crate::http::connect_tcp(
+            "127.0.0.1",
+            port,
+            Duration::from_secs(2),
+        ));
+        assert!(result.is_ok(), "{result:?}");
+        thread.join().expect("listener thread");
+    }
+
+    #[test]
+    fn upstream_connect_reports_empty_or_unresolvable_targets() {
+        let result = crate::http::block_on(crate::http::connect_tcp(
+            "does-not-exist.invalid",
+            443,
+            Duration::from_millis(250),
+        ));
+        assert!(result.is_err());
+        let text = format!("{:#}", result.unwrap_err());
+        assert!(
+            text.contains("DNS") || text.contains("addresses") || text.contains("connect"),
+            "{text}"
+        );
     }
 }

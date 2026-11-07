@@ -24,19 +24,28 @@
 .PARAMETER Binary
     被测二进制路径（默认 target\release\winget-accel.exe）。
 
+.PARAMETER Concurrency
+    同时进行的请求数（默认 1）。请求仍按批次有界并发，避免压测工具本身制造
+    无界进程和内存增长。
+
 .EXAMPLE
     ./packaging/soak.ps1 -Requests 600
+
+.EXAMPLE
+    ./packaging/soak.ps1 -Requests 600 -Concurrency 8
 #>
 [CmdletBinding()]
 param(
     [int]$Requests = 200,
     [int]$Port = 0,
-    [string]$Binary = "target\release\winget-accel.exe"
+    [string]$Binary = "target\release\winget-accel.exe",
+    [int]$Concurrency = 1
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($Requests -lt 1) { throw '-Requests 必须 >= 1' }
+if ($Concurrency -lt 1 -or $Concurrency -gt 32) { throw '-Concurrency 必须在 1–32 之间' }
 
 trap {
     Write-Host "::error::压测脚本异常终止：$($_.Exception.Message)"
@@ -55,6 +64,29 @@ function Get-FreePort {
     $p = $l.LocalEndpoint.Port
     $l.Stop()
     return $p
+}
+
+function Wait-TcpListener {
+    param(
+        [int]$Port,
+        [int]$TimeoutSeconds = 10
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        try {
+            $client.Connect('127.0.0.1', $Port)
+            return
+        }
+        catch {
+            Start-Sleep -Milliseconds 100
+        }
+        finally {
+            $client.Dispose()
+        }
+    }
+    throw "等待本地上游监听超时：127.0.0.1:$Port"
 }
 
 if ($Port -eq 0) { $Port = Get-FreePort }
@@ -101,7 +133,8 @@ while ($true) {
 '@ | Set-Content -Path $srvPath -Encoding UTF8
 
     $srvProc = Start-Process pwsh -ArgumentList '-NoProfile', '-File', $srvPath, $upstreamPort -PassThru -WindowStyle Hidden
-    Start-Sleep -Milliseconds 1200
+    if ($srvProc.HasExited) { throw "本地模拟上游启动失败（退出码 $($srvProc.ExitCode)）" }
+    Wait-TcpListener -Port $upstreamPort
 
     # ---- 被测代理 ----
     @{
@@ -116,7 +149,7 @@ while ($true) {
     $proxyProc = Start-Process $exe -ArgumentList '--config', $cfgPath, '--no-env' -PassThru -WindowStyle Hidden
 
     # 等 CA 和本地 HTTP 端点均就绪，不能把“证书已生成”当成启动完成。
-    $caPath = Join-Path $certDir 'ca-cert.pem'
+    $caPath = Join-Path $certDir 'root-cert.pem'
     $deadline = (Get-Date).AddSeconds(40)
     $ready = $false
     while ((Get-Date) -lt $deadline) {
@@ -133,7 +166,7 @@ while ($true) {
     if ($proxyProc.HasExited) { throw "代理启动失败（退出码 $($proxyProc.ExitCode)）" }
     if (-not $ready) { throw "40 秒内代理未就绪：$(Get-Content -LiteralPath $logPath -Raw -ErrorAction SilentlyContinue)" }
 
-    Write-Host "代理: 127.0.0.1:$Port   模拟加速器: 127.0.0.1:$upstreamPort   请求数: $Requests"
+    Write-Host "代理: 127.0.0.1:$Port   模拟加速器: 127.0.0.1:$upstreamPort   请求数: $Requests   并发: $Concurrency"
 
     # 取基线前先等线程数**稳定**。
     #
@@ -165,24 +198,42 @@ while ($true) {
     $snapshots = @()
     $perBatch = [Math]::Max(1, [int]($Requests / 4))
     $batch = 0
-    for ($i = 1; $i -le $Requests; $i++) {
-        $code = & curl.exe -sS --max-time 30 --noproxy 'localhost,127.0.0.1' `
-            -x "http://127.0.0.1:$Port" --ssl-no-revoke `
-            --cacert $caPath -r 0-65535 -o NUL -w '%{http_code}:%{size_download}' `
-            "https://github.com/o/r/releases/download/v1/f$i.bin" 2>&1
-        $curlExit = $LASTEXITCODE
-        if ($curlExit -eq 0 -and "$code" -eq '206:65536') { $ok++ }
-        else {
-            $bad++
-            if ($bad -eq 1) { Write-Host "首个失败：curl exit=$curlExit response=$code" }
+    $completed = 0
+    $nextSnapshot = $perBatch
+    for ($start = 1; $start -le $Requests; $start += $Concurrency) {
+        $end = [Math]::Min($Requests, $start + $Concurrency - 1)
+        $results = @($start..$end | ForEach-Object -Parallel {
+            $i = $_
+            $code = & curl.exe -q -sS --max-time 30 --noproxy 'localhost,127.0.0.1' `
+                -x "http://127.0.0.1:$using:Port" --ssl-no-revoke `
+                --cacert $using:caPath -r 0-65535 -o NUL -w '%{http_code}:%{size_download}' `
+                "https://github.com/o/r/releases/download/v1/f$i.bin" 2>&1
+            $curlExit = $LASTEXITCODE
+            [pscustomobject]@{
+                ExitCode = $curlExit
+                Response = ($code | Out-String).Trim()
+                Success  = ($curlExit -eq 0 -and ($code | Out-String).Trim() -eq '206:65536')
+            }
+        } -ThrottleLimit $Concurrency)
+
+        foreach ($result in $results) {
+            $completed++
+            if ($result.Success) { $ok++ }
+            else {
+                $bad++
+                if ($bad -eq 1) {
+                    Write-Host "首个失败：curl exit=$($result.ExitCode) response=$($result.Response)"
+                }
+            }
         }
 
-        if ($i % $perBatch -eq 0) {
+        if ($completed -ge $nextSnapshot -or $completed -eq $Requests) {
             $batch++
             $cur = Get-Process -Id $proxyProc.Id
             $ws = [math]::Round($cur.WorkingSet64 / 1MB, 1)
-            $snapshots += [pscustomobject]@{ Batch = $batch; Done = $i; Threads = $cur.Threads.Count; MB = $ws }
-            Write-Host ("{0,-8} {1,-8} {2,-8} {3}" -f $batch, $i, $cur.Threads.Count, $ws)
+            $snapshots += [pscustomobject]@{ Batch = $batch; Done = $completed; Threads = $cur.Threads.Count; MB = $ws }
+            Write-Host ("{0,-8} {1,-8} {2,-8} {3}" -f $batch, $completed, $cur.Threads.Count, $ws)
+            while ($nextSnapshot -le $completed) { $nextSnapshot += $perBatch }
         }
     }
 

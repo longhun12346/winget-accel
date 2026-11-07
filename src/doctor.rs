@@ -1,8 +1,7 @@
 //! `--doctor`：把"装没装好"这件事检查成一张表。
 //!
 //! 设计约束：**只做本地可判定的事**，不猜。
-//! 根证书是否已装进用户根存储，用 Win32 API 可读（`certinfo`），此处只给人工核对命令，
-//! 这里不调用系统工具（也不引入 `windows` crate），只给出确切的验证命令。
+//! 证书与 WinINet 有效配置使用只读 Win32 API；不会导入证书或修改代理设置。
 
 use std::time::Duration;
 
@@ -61,29 +60,42 @@ pub fn run(app: &App, quick: bool) -> (Vec<Check>, bool) {
         checks.push(check);
     }
 
-    // 探测要等网络。实测 43 个候选全部可达时约 20 秒（每批 6 个 → 8 批），
+    // 探测要等网络。实测 44 个候选全部可达时约 20 秒（完整模式每批 6 个），
     // 全超时最坏约 57 秒。这段时间里此前**一个字都不输出**，用户会以为卡死了。
     let stop_after = if quick {
         Some(QUICK_PROBE_TARGET)
     } else {
         None
     };
-    let batches = app.accels.len().div_ceil(DOCTOR_PROBE_CONCURRENCY);
-    let worst_secs = batches as u64 * app.health_timeout.as_secs();
+    let probe_concurrency = if quick {
+        QUICK_PROBE_CONCURRENCY
+    } else {
+        DOCTOR_PROBE_CONCURRENCY
+    };
+    let worst_secs = worst_probe_secs(
+        app.accels.len(),
+        probe_concurrency,
+        app.health_timeout.as_secs(),
+    );
     if quick {
         println!(
-            "正在探测候选加速器（--quick：找到 {} 个可达就停，最多 {worst_secs} 秒）…",
-            QUICK_PROBE_TARGET
+            "正在探测候选加速器（--quick：找到 {} 个可达就停，每批 {} 个并发，最多 {worst_secs} 秒）…",
+            QUICK_PROBE_TARGET, probe_concurrency
         );
     } else {
         println!(
             "正在探测 {} 个候选加速器（每批 {} 个并发，最坏约 {worst_secs} 秒）…",
             app.accels.len(),
-            DOCTOR_PROBE_CONCURRENCY
+            probe_concurrency
         );
     }
 
-    let accel_checks = check_accels(&app.accels, app.health_timeout, stop_after);
+    let accel_checks = check_accels(
+        &app.accels,
+        app.health_timeout,
+        stop_after,
+        probe_concurrency,
+    );
     let reachable_flags: Vec<bool> = accel_checks
         .iter()
         .map(|c| c.verdict == Verdict::Pass)
@@ -139,7 +151,14 @@ fn check_caps(app: &App) -> Option<Check> {
 /// 后果不是"立刻坏"，而是用户以为只有一张——旧私钥若仍在磁盘上，
 /// 就多了一条本可避免的冒用路径（范围仍限于那 4 个域名）。
 fn check_ca_residue() -> Option<Check> {
-    residue_check(crate::certinfo::our_ca_thumbprints().len())
+    match crate::certinfo::our_ca_thumbprints() {
+        Ok(thumbprints) => residue_check(thumbprints.len()),
+        Err(error) => Some(Check::new(
+            "ca-extra",
+            Verdict::Warn,
+            format!("无法读取当前用户根证书存储，残留数量未知：{error}"),
+        )),
+    }
 }
 
 /// 纯逻辑部分，便于单测：0/1 张不报，>1 张给出可执行建议。
@@ -203,20 +222,22 @@ pub enum ConstraintsVerdict {
 
 pub struct ConstraintsCheck;
 
+fn normalize_host_list(hosts: &[String]) -> Vec<String> {
+    let mut hosts: Vec<_> = hosts
+        .iter()
+        .map(|host| host.trim().to_ascii_lowercase())
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
 impl ConstraintsCheck {
     fn run(cert_pem: &std::path::Path, configured: &[String]) -> ConstraintsVerdict {
         match crate::ca::CertAuthority::permitted_dns_names(cert_pem) {
             Some(mut permitted) => {
-                let mut expected: Vec<String> =
-                    configured.iter().map(|h| h.to_ascii_lowercase()).collect();
-                expected.sort();
-                expected.dedup();
-                permitted = permitted
-                    .into_iter()
-                    .map(|host| host.trim().to_ascii_lowercase())
-                    .collect();
-                permitted.sort();
-                permitted.dedup();
+                let expected = normalize_host_list(configured);
+                permitted = normalize_host_list(&permitted);
                 if permitted == expected {
                     ConstraintsVerdict::Matches
                 } else {
@@ -237,13 +258,16 @@ impl ConstraintsCheck {
 
 fn check_ca(app: &App) -> Check {
     let path = CertAuthority::ca_pem_path(&app.cert_dir);
-    if !path.exists() {
+    let root_path = CertAuthority::root_pem_path(&app.cert_dir);
+    if !path.exists() || !root_path.exists() {
         return Check::new(
             "ca",
             Verdict::Fail,
             format!(
-                "{} 不存在：先启动一次代理生成，再按文档信任它",
-                path.display()
+                "证书链缺失或不完整（中间 CA={}，根 CA={}；文件不存在时需先启动一次代理生成），\
+                 再按文档信任根 CA",
+                path.display(),
+                root_path.display()
             ),
         );
     }
@@ -261,36 +285,36 @@ fn check_ca(app: &App) -> Check {
     let meta_path = app.cert_dir.join("ca-meta.json");
     let meta_note = match std::fs::read_to_string(&meta_path) {
         Ok(meta) => match serde_json::from_str::<Vec<String>>(&meta) {
-            Ok(recorded) if recorded == app.rewrite_hosts => None,
-            Ok(recorded) => {
-                return Check::new(
-                    "ca",
-                    Verdict::Fail,
-                    format!(
-                        "授权域名与配置不一致：旧 {recorded:?} / 新 {:?}；需删除证书目录重新生成",
-                        app.rewrite_hosts
-                    ),
-                )
-            }
-            Err(err) => {
-                return Check::new("ca", Verdict::Fail, format!("ca-meta.json 解析失败: {err}"))
-            }
+            Ok(recorded) if normalize_host_list(&recorded) == normalize_host_list(&app.rewrite_hosts) => None,
+            Ok(recorded) => Some(format!(
+                "ca-meta.json 与配置不一致（旁注 {recorded:?} / 配置 {:?}），已以证书中的 NameConstraints 为准",
+                app.rewrite_hosts
+            )),
+            Err(err) => Some(format!(
+                "ca-meta.json 解析失败（{err}），已以证书中的 NameConstraints 为准"
+            )),
         },
         Err(_) => Some(format!("缺少 ca-meta.json（{}）", app.cert_dir.display())),
     };
 
-    let Some(der) = certinfo::read_ca_der(&path) else {
+    let Some(root_der) = certinfo::read_ca_der(&root_path) else {
         return Check::new(
             "ca",
             Verdict::Fail,
-            format!("{} 无法解析为证书", path.display()),
+            format!("{} 无法解析为根 CA 证书", root_path.display()),
         );
     };
+
+    if let Err(error) = CertAuthority::validate_chain(&app.cert_dir) {
+        return Check::new("ca", Verdict::Fail, format!("证书链校验失败：{error}"));
+    }
 
     // 私钥与证书必须是一对。rcgen 不校验这一点：不配对时程序能启动、也签得出叶证书，
     // 但每个 MITM 握手都会被客户端拒绝，而 `ca` 这一项（信任/有效期/约束）全都正常——
     // 正是最难查的状态。这里单独判一次，代价只是一次公钥字节比较。
-    if crate::ca::CertAuthority::key_matches_cert(&app.cert_dir) == Some(false) {
+    if crate::ca::CertAuthority::key_matches_cert(&app.cert_dir) == Some(false)
+        || crate::ca::CertAuthority::root_key_matches_cert(&app.cert_dir) == Some(false)
+    {
         return Check::new(
             "ca",
             Verdict::Fail,
@@ -321,18 +345,32 @@ fn check_ca(app: &App) -> Check {
         }
     }
 
-    if !certinfo::is_trusted(&der) {
-        return Check::new(
-            "ca",
-            Verdict::Fail,
-            format!(
-                "{} 已生成，但不在 CurrentUser\\Root；启动一次代理完成导入，或手动信任",
-                path.display()
-            ),
-        );
+    match certinfo::is_trusted(&root_der) {
+        Ok(true) => {}
+        Ok(false) => {
+            let thumbprint = certinfo::info(&root_path)
+                .map(|info| format!("，SHA-1 指纹 {}", info.thumbprint))
+                .unwrap_or_default();
+            return Check::new(
+                "ca",
+                Verdict::Fail,
+                format!(
+                    "{} 已生成，但根 CA 不在 CurrentUser\\Root{thumbprint}；启动一次代理完成导入，\
+                     或手动信任同一指纹的证书",
+                    root_path.display(),
+                ),
+            );
+        }
+        Err(error) => {
+            return Check::new(
+                "ca",
+                Verdict::Fail,
+                format!("无法读取当前用户根证书存储，信任状态未知：{error}"),
+            )
+        }
     }
 
-    match certinfo::info(&path) {
+    match certinfo::info(&root_path) {
         Some(info) if info.days_left < 0 => Check::new(
             "ca",
             Verdict::Fail,
@@ -343,8 +381,8 @@ fn check_ca(app: &App) -> Check {
         ),
         Some(info) => {
             let mut detail = format!(
-                "{} 已受信任，剩余 {} 天（{:?}）",
-                path.display(),
+                "根 CA {} 已受信任，剩余 {} 天（{:?}）",
+                root_path.display(),
                 info.days_left,
                 info.thumbprint
             );
@@ -393,6 +431,31 @@ fn pac_registry_detail(expected: &str, actual: Option<&str>) -> (Verdict, String
             format!("AutoConfigURL 未设置，期望 {expected:?}；请去掉 --no-env 后启动代理"),
         ),
     }
+}
+
+fn pac_connection_detail(
+    registered: &str,
+    connection: &crate::wininet::Connection,
+) -> (Verdict, String) {
+    if !connection.pac_enabled() {
+        return (
+            Verdict::Fail,
+            "AutoConfigURL 已设置，但 WinINet 未启用自动脚本；请重新启动代理接管 PAC".to_owned(),
+        );
+    }
+    if connection.url.as_deref() != Some(registered) {
+        return (
+            Verdict::Fail,
+            format!(
+                "WinINet PAC URL = {:?}，注册表 URL = {registered:?}；有效配置不同步，请重新启动代理",
+                connection.url
+            ),
+        );
+    }
+    (
+        Verdict::Pass,
+        "AutoConfigURL 与 WinINet 有效 URL 一致，自动脚本已启用".to_owned(),
+    )
 }
 
 fn same_pac_endpoint(actual: &str, expected: &str) -> bool {
@@ -472,6 +535,20 @@ fn check_pac(app: &App) -> Check {
     if verdict == Verdict::Fail {
         return Check::new("pac", verdict, detail);
     }
+    let connection = match crate::wininet::query() {
+        Ok(connection) => connection,
+        Err(error) => {
+            return Check::new(
+                "pac",
+                Verdict::Fail,
+                format!("无法核验 WinINet 有效 PAC 配置：{error:#}"),
+            );
+        }
+    };
+    let (verdict, detail) = pac_connection_detail(actual.as_deref().unwrap(), &connection);
+    if verdict == Verdict::Fail {
+        return Check::new("pac", verdict, detail);
+    }
 
     // 注册表指向本机代理只说明"应该用它"，还得看**正在跑的那个实例**吐出来的是什么。
     // 改了 rewriteHosts 却忘了重启时，注册表看起来完全正常，而实际生效的还是旧 PAC。
@@ -527,8 +604,9 @@ fn fetch_pac_text(port: u16) -> Option<String> {
 fn pac_live_verdict(expected: &str, served: Option<&str>) -> (Verdict, String) {
     match served {
         None => (
-            Verdict::Pass,
-            "当前没有实例在监听，未能核对运行中的 PAC".to_string(),
+            Verdict::Warn,
+            "当前没有实例在监听，无法核对运行中的 PAC；注册表虽指向本机，但实际下载可能仍失败"
+                .to_string(),
         ),
         Some(text) if text.trim() == expected.trim() => {
             (Verdict::Pass, "运行中的 PAC 与当前配置一致".to_string())
@@ -543,9 +621,7 @@ fn pac_live_verdict(expected: &str, served: Option<&str>) -> (Verdict, String) {
 
 /// 系统里是否还开着一层全局代理（`ProxyEnable=1`）。
 ///
-/// 本工具**从不改** `ProxyEnable`，而"全局代理 + PAC 并存时 WinINet 优先用哪个"
-/// 本仓库没验证过（以前只是文档里的一句"未验证"）。既然能从注册表读出来，
-/// 就不该让用户自己去猜——"装了没效果"时这是第一个要排除的变量。
+/// 接管 PAC 时保留已有手动代理标志；诊断时指出它与 PAC 同时启用的环境。
 fn check_global_proxy() -> Check {
     global_proxy_verdict(crate::autoenv::global_proxy_enabled())
 }
@@ -557,8 +633,8 @@ fn global_proxy_verdict(enabled: Option<bool>) -> Check {
         Some(true) => Check::new(
             "proxyenv",
             Verdict::Warn,
-            "系统全局代理已启用（ProxyEnable=1）。本工具只写 AutoConfigURL、不改它；\
-             两者并存时 WinINet 优先哪一个，本工具未验证——下载异常时先手工关掉全局代理再试"
+            "系统全局代理已启用（ProxyEnable=1）。本工具接管 PAC 时保留手动代理标志；\
+             下载异常时请检查手动代理与 PAC 规则的交互"
                 .to_string(),
         ),
         None => Check::new(
@@ -577,6 +653,9 @@ fn global_proxy_verdict(enabled: Option<bool>) -> Check {
 /// 让更多慢候选挤进同一批，总时间并不会按比例下降。
 /// 所以保持 6，不为一个测不出来的收益去提高对第三方服务的瞬时压力。
 const DOCTOR_PROBE_CONCURRENCY: usize = 6;
+/// 快速模式的目标也是 3 个，因此只启动 3 个并发探测，避免已经够用后还白测
+/// 同一批里剩余的候选。
+const QUICK_PROBE_CONCURRENCY: usize = QUICK_PROBE_TARGET;
 
 /// `--quick` 模式下找到这么多个可达就停。
 ///
@@ -585,9 +664,19 @@ const DOCTOR_PROBE_CONCURRENCY: usize = 6;
 /// 却可能让等待从十几秒涨到一分钟（实测候选池 44 个）。
 const QUICK_PROBE_TARGET: usize = 3;
 
-fn check_accels(accels: &[Accel], timeout: Duration, stop_after: Option<usize>) -> Vec<Check> {
+fn worst_probe_secs(candidate_count: usize, concurrency: usize, timeout_secs: u64) -> u64 {
+    let batches = candidate_count.div_ceil(concurrency.max(1)) as u64;
+    batches.saturating_mul(timeout_secs)
+}
+
+fn check_accels(
+    accels: &[Accel],
+    timeout: Duration,
+    stop_after: Option<usize>,
+    concurrency: usize,
+) -> Vec<Check> {
     let mut checks: Vec<Check> = Vec::with_capacity(accels.len());
-    for chunk in accels.chunks(DOCTOR_PROBE_CONCURRENCY) {
+    for chunk in accels.chunks(concurrency.max(1)) {
         if let Some(target) = stop_after {
             let reachable = checks.iter().filter(|c| c.verdict == Verdict::Pass).count();
             if reachable >= target {
@@ -630,8 +719,11 @@ fn check_one_accel(accel: &Accel, timeout: Duration) -> Check {
     )
 }
 
-/// 测速资产最多通过几个候选验证（每个最多 5 s）。
-const DOCTOR_ASSET_CANDIDATES: usize = 3;
+/// `--doctor --quick` 下最多额外验证几个候选的测速资产（每个最多 5 s）。
+///
+/// 完整 doctor 必须检查**所有**已经确认可达的候选；否则前几个候选
+/// 恰好失效时，后面仍可用的候选会被漏掉，产生假 FAIL。
+const QUICK_DOCTOR_ASSET_CANDIDATES: usize = 3;
 /// 单次取资产的超时。与运行时的 `PROBE_SPEED_TIMEOUT` 对齐。
 const DOCTOR_ASSET_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -652,21 +744,51 @@ fn check_probe_asset(
     if !reachable.iter().any(|ok| *ok) {
         return None;
     }
-    let mut outcomes: Vec<(String, Option<f64>)> = Vec::new();
-    for (accel, ok) in accels.iter().zip(reachable) {
-        if !ok {
-            continue;
-        }
-        if outcomes.len() >= DOCTOR_ASSET_CANDIDATES {
-            break;
-        }
-        let kbps = crate::proxy::probe_speed(accel, DOCTOR_ASSET_TIMEOUT, &app.health_probe);
-        outcomes.push((accel.host.clone(), kbps));
+    let candidates: Vec<_> = asset_probe_candidates(accels, reachable, partial);
+
+    // 完整 doctor 要覆盖所有可达候选，但不能把几十个测速请求无界地
+    // 同时压给公共服务；与可达性探测使用同一个有界并发度。
+    let mut outcomes = Vec::with_capacity(candidates.len());
+    for chunk in candidates.chunks(DOCTOR_PROBE_CONCURRENCY) {
+        let mut batch = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|accel| {
+                    let accel = (*accel).clone();
+                    let asset = app.health_probe.clone();
+                    scope.spawn(move || {
+                        let kbps = crate::proxy::probe_speed(&accel, DOCTOR_ASSET_TIMEOUT, &asset);
+                        (accel.host, kbps)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("doctor asset probe thread panicked"))
+                .collect::<Vec<_>>()
+        });
+        outcomes.append(&mut batch);
     }
     Some(probe_asset_verdict(&app.health_probe, &outcomes, partial))
 }
 
-/// 纯逻辑部分（便于单测）：一个候选取到就算通过，全部取不到才判 FAIL。
+fn asset_probe_candidates<'a>(
+    accels: &'a [Accel],
+    reachable: &[bool],
+    partial: bool,
+) -> Vec<&'a Accel> {
+    let mut candidates: Vec<_> = accels
+        .iter()
+        .zip(reachable)
+        .filter_map(|(accel, reachable)| reachable.then_some(accel))
+        .collect();
+    if partial {
+        candidates.truncate(QUICK_DOCTOR_ASSET_CANDIDATES);
+    }
+    candidates
+}
+
+/// 纯逻辑部分（便于单测）：一个候选取到就算通过；只有全量探测都取不到才判 FAIL。
 fn probe_asset_verdict(asset: &str, outcomes: &[(String, Option<f64>)], partial: bool) -> Check {
     if let Some((host, kbps)) = outcomes
         .iter()
@@ -679,22 +801,32 @@ fn probe_asset_verdict(asset: &str, outcomes: &[(String, Option<f64>)], partial:
         );
     }
     // `--quick` 只探测了部分候选，此时"这些候选都取不到"不足以断定资产失效——
-    // 断言成"下载全部 502"会变成假警报（实测过：quick 模式只探 6 个候选）。
+    // 断言成"下载全部 502"会变成假警报。
     // 文案里必须把这一点说清，并给出"去掉 --quick 复核"的指引。
-    let qualifier = if partial {
-        "（注意：这是 --quick 的抽样结果，只在已探测的候选上验证过；\
-         去掉 --quick 再跑一次可确认全部候选）"
+    let (verdict, consequence) = if partial {
+        (
+            Verdict::Warn,
+            "当前仅能确认已探测候选未通过；剩余候选尚未验证，不能据此断定下载全部 502",
+        )
     } else {
-        ""
+        (
+            Verdict::Fail,
+            "它们会被判为「未通过实测」，导致下载全部 502",
+        )
     };
     Check::new(
         "probe",
-        Verdict::Fail,
+        verdict,
         format!(
-            "{} 个可达候选都取不到测速资产（{asset}）：它们会被判为「未通过实测」，\
-             导致下载全部 502{qualifier}。确认该资产仍存在（它绑着具体 release，上游删掉即失效），\
+            "{} 个已探测的可达候选都取不到测速资产（{asset}）：{consequence}。\
+             {}确认该资产仍存在（它绑着具体 release，上游删掉即失效），\
              或用配置项 health.probeUrl 换成你自己的稳定资产",
-            outcomes.len()
+            outcomes.len(),
+            if partial {
+                "去掉 --quick 再跑一次可确认完整候选池；"
+            } else {
+                ""
+            }
         ),
     )
 }
@@ -864,6 +996,42 @@ mod tests {
             pac_registry_detail(expected, Some("http://127.0.0.1:9999/x.pac")).0,
             Verdict::Fail
         );
+    }
+
+    #[test]
+    fn pac_requires_enabled_effective_url_matching_registered_revision() {
+        let registered = "http://127.0.0.1:8443/winget-accel.pac?session=current&route=7";
+        for (flags, url, verdict) in [
+            (13, Some(registered), Verdict::Pass),
+            (15, Some(registered), Verdict::Pass),
+            (9, Some(registered), Verdict::Fail),
+            (13, None, Verdict::Fail),
+            (
+                13,
+                Some("http://127.0.0.1:8443/winget-accel.pac"),
+                Verdict::Fail,
+            ),
+            (
+                13,
+                Some("http://127.0.0.1:8443/winget-accel.pac?session=current&route=6"),
+                Verdict::Fail,
+            ),
+            (
+                13,
+                Some("http://127.0.0.1:8443/winget-accel.pac?session=other&route=7"),
+                Verdict::Fail,
+            ),
+        ] {
+            let connection = crate::wininet::Connection {
+                flags,
+                url: url.map(str::to_owned),
+            };
+            assert_eq!(
+                pac_connection_detail(registered, &connection).0,
+                verdict,
+                "flags={flags} url={url:?}"
+            );
+        }
     }
 
     #[test]
@@ -1106,7 +1274,49 @@ mod tests {
         assert!(check.detail.contains("123 KB/s"), "{}", check.detail);
     }
 
-    /// `--quick` 抽样时，probe 判 FAIL 的措辞必须说明"只验证了部分候选"。
+    #[test]
+    fn full_probe_checks_all_reachable_candidates_but_quick_is_bounded() {
+        let accels: Vec<_> = (0..5)
+            .map(|i| Accel {
+                scheme: crate::rewrite::Scheme::Https,
+                host: format!("candidate-{i}.example"),
+                port: 443,
+                prefix: String::new(),
+            })
+            .collect();
+        let reachable = vec![true, false, true, true, true];
+
+        let full = asset_probe_candidates(&accels, &reachable, false);
+        assert_eq!(
+            full.iter()
+                .map(|accel| accel.host.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "candidate-0.example",
+                "candidate-2.example",
+                "candidate-3.example",
+                "candidate-4.example",
+            ],
+            "完整 doctor 必须覆盖所有已确认可达候选"
+        );
+
+        let quick = asset_probe_candidates(&accels, &reachable, true);
+        assert_eq!(
+            quick.len(),
+            QUICK_DOCTOR_ASSET_CANDIDATES,
+            "--quick 只抽样固定数量的可达候选"
+        );
+        assert_eq!(quick[2].host, "candidate-3.example");
+    }
+
+    #[test]
+    fn worst_probe_budget_saturates_instead_of_overflowing() {
+        assert_eq!(worst_probe_secs(44, 6, 8), 64);
+        assert_eq!(worst_probe_secs(usize::MAX, 1, u64::MAX), u64::MAX);
+        assert_eq!(worst_probe_secs(10, 0, 5), 50, "并发为 0 时按 1 路计算");
+    }
+
+    /// `--quick` 抽样时，probe 只能告警，不能把未探测候选的未知状态判成 FAIL。
     ///
     /// 否则会变成假警报：quick 只探 6 个候选，若这 6 个恰好都取不到资产，
     /// 文案断言"下载全部 502"就过头了——真实情况可能是其余 38 个里有能取到的。
@@ -1126,10 +1336,11 @@ mod tests {
         );
 
         let sampled = probe_asset_verdict("https://x/y.bin", &outcomes, true);
-        assert_eq!(sampled.verdict, Verdict::Fail);
+        assert_eq!(sampled.verdict, Verdict::Warn);
+        assert!(sampled.detail.contains("尚未验证"), "{}", sampled.detail);
         assert!(
-            sampled.detail.contains("--quick") && sampled.detail.contains("抽样"),
-            "抽样时必须说明这是抽样结果: {}",
+            sampled.detail.contains("不能据此断定下载全部 502"),
+            "{}",
             sampled.detail
         );
         assert!(
@@ -1217,12 +1428,7 @@ mod tests {
 
         let on = global_proxy_verdict(Some(true));
         assert_eq!(on.verdict, Verdict::Warn, "开着全局代理不该阻断退出码");
-        assert!(on.detail.contains("未验证"), "{}", on.detail);
-        assert!(
-            on.detail.contains("关掉全局代理"),
-            "必须给出可执行的建议: {}",
-            on.detail
-        );
+        assert!(on.detail.contains("ProxyEnable=1"), "{}", on.detail);
 
         // 读不出来要说清是"读不出来"，不能假装成"没开"
         let unknown = global_proxy_verdict(None);
@@ -1275,9 +1481,9 @@ mod tests {
     fn live_pac_mismatch_is_reported_as_warning() {
         let expected = "function FindProxyForURL(url, host) { ... github.com ... }";
 
-        // 没有实例：不算错，但要说明"没核对成"
+        // 没有实例：注册表可能仍指向旧 PAC，只能告警并说明"没核对成"
         let (verdict, note) = pac_live_verdict(expected, None);
-        assert_eq!(verdict, Verdict::Pass);
+        assert_eq!(verdict, Verdict::Warn);
         assert!(note.contains("没有实例"), "{note}");
 
         // 一致

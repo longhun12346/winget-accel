@@ -38,6 +38,7 @@ enum UpstreamMode {
     WrongRange,
     Truncate,
     TruncateChunked,
+    TinyArchive,
     Status(u16),
 }
 
@@ -143,6 +144,10 @@ fn handle_http_connection(
 
     // 探测始终正常；故障开关只影响下载，避免后台探测改变候选选择。
     let mode = *mode.lock().expect("upstream mode lock");
+    if matches!(mode, UpstreamMode::TinyArchive) {
+        write_response(&mut stream, 200, &[("Content-Type", "text/plain")], b"ok");
+        return;
+    }
     if let UpstreamMode::Status(status) = mode {
         write_response(
             &mut stream,
@@ -437,7 +442,7 @@ impl Proxy {
     }
 
     fn ca_path(&self) -> PathBuf {
-        self.cert_dir.join("ca-cert.pem")
+        self.cert_dir.join("root-cert.pem")
     }
 
     fn health(&self) -> Value {
@@ -563,8 +568,13 @@ struct CurlResult {
 }
 
 fn curl(proxy: &Proxy, url: &str, args: &[&str]) -> CurlResult {
+    curl_using_ca(proxy, url, args, Some(&proxy.ca_path()))
+}
+
+fn curl_using_ca(proxy: &Proxy, url: &str, args: &[&str], ca: Option<&Path>) -> CurlResult {
     let mut command = Command::new("curl.exe");
     command.args([
+        "-q",
         "-sS",
         "--max-time",
         "30",
@@ -573,9 +583,10 @@ fn curl(proxy: &Proxy, url: &str, args: &[&str]) -> CurlResult {
         "-x",
         &format!("http://127.0.0.1:{}", proxy.port),
         "--ssl-no-revoke",
-        "--cacert",
-        proxy.ca_path().to_str().expect("ca path"),
     ]);
+    if let Some(ca) = ca {
+        command.args(["--cacert", ca.to_str().expect("ca path")]);
+    }
     command.args(args);
     command.args(["-w", "\nHTTP_STATUS:%{http_code}", url]);
     let output = command.output().expect("run curl.exe");
@@ -585,6 +596,42 @@ fn curl(proxy: &Proxy, url: &str, args: &[&str]) -> CurlResult {
         body,
         status,
     }
+}
+
+#[test]
+fn no_env_requires_client_trust_and_does_not_install_its_ca() {
+    let upstream = HttpUpstream::start(UpstreamMode::Normal);
+    let proxy = Proxy::start(&[(&upstream.url(), UpstreamMode::Normal)], &[]);
+
+    // A newly generated CA has never been installed in system roots. Supplying
+    // it to one curl request must not make it trusted by later default clients.
+    for explicit_trust in [false, true, false] {
+        let result = curl_using_ca(
+            &proxy,
+            &asset(if explicit_trust {
+                "trusted"
+            } else {
+                "untrusted"
+            }),
+            &[],
+            explicit_trust.then(|| proxy.ca_path()).as_deref(),
+        );
+        if explicit_trust {
+            assert_curl_ok(&result);
+            assert_eq!(result.status, 200);
+            assert_eq!(result.body, b"hello-through-proxy");
+        } else {
+            assert!(
+                matches!(result.output.status.code(), Some(35 | 60)),
+                "expected TLS rejection, got {:?}: {}",
+                result.output.status,
+                String::from_utf8_lossy(&result.output.stderr)
+            );
+            assert_eq!(result.status, 0);
+            assert!(result.body.is_empty());
+        }
+    }
+    assert_eq!(upstream.records().len(), 1);
 }
 
 fn split_curl_output(output: &[u8]) -> (Vec<u8>, u16) {
@@ -812,6 +859,36 @@ fn fails_over_from_bad_candidate_to_good_candidate() {
 }
 
 #[test]
+fn invalid_archive_success_is_retried_before_any_body_is_forwarded() {
+    let first = HttpUpstream::start(UpstreamMode::Normal);
+    let second = HttpUpstream::start(UpstreamMode::Normal);
+    let proxy = Proxy::start(
+        &[
+            (&first.url(), UpstreamMode::Normal),
+            (&second.url(), UpstreamMode::Normal),
+        ],
+        &[],
+    );
+    let url = "https://codeload.github.com/test/repo/tar.gz/refs/tags/range-v1";
+    let (pinned, other) = prime_file_pin(&proxy, &first, &second, url);
+    pinned.set_mode(UpstreamMode::TinyArchive);
+    let result = curl(&proxy, url, &[]);
+    assert_curl_ok(&result);
+    assert_eq!(result.status, 200);
+    assert_eq!(
+        result.body,
+        (0..=255).cycle().take(1024).collect::<Vec<u8>>()
+    );
+    assert_eq!(other.records().len(), 1);
+    assert!(proxy.log_text().contains("ACCEL-BAD-ARCHIVE"));
+    other.set_mode(UpstreamMode::TinyArchive);
+    let result = curl(&proxy, url, &[]);
+    assert_curl_ok(&result);
+    assert_eq!(result.status, 502);
+    assert!(result.body.is_empty());
+}
+
+#[test]
 fn truncated_upstream_body_fails_and_clears_pin() {
     for mode in [UpstreamMode::Truncate, UpstreamMode::TruncateChunked] {
         assert_truncated_body_clears_pin(mode);
@@ -847,6 +924,10 @@ fn assert_truncated_body_clears_pin(mode: UpstreamMode) {
     let log = proxy.wait_log(|text| text.contains("kind=early-eof"));
     assert!(log.contains("RELAY-ERR"), "{log}");
     assert!(log.contains("pin_cleared=true"), "{log}");
+    assert!(
+        log.contains("ACCEL-COOLDOWN"),
+        "正文提前 EOF 后应暂时冷却候选: {log}"
+    );
 
     // 候选恢复后仍全部健康：若 pin 没有真正删除，这次会显示 bind，而非重新 pick。
     pinned.set_mode(UpstreamMode::Normal);
@@ -967,7 +1048,7 @@ fn oversized_headers_get_431_and_connection_limit_is_bounded() {
         .write_all(b"GET / HTTP/1.1\r\nX: ")
         .expect("write oversized head");
     stream
-        .write_all(&vec![b'a'; 33_000])
+        .write_all(&vec![b'a'; 60_000])
         .expect("write oversized value");
     stream
         .write_all(b"\r\n\r\n")

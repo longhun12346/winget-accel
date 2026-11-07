@@ -8,10 +8,12 @@
     而这条承诺此前只有代码可读、没有实测。它要读注册表与证书存储才能判断，
     不适合作单元测试（会依赖机器状态），所以做成可手动复跑的脚本。
 
-    检查三处，跑前/运行中/退出后各取一次：
+    检查五处，跑前/运行中/退出后各取一次：
       1. HKCU\...\Internet Settings\AutoConfigURL（PAC 落点）
-      2. 受信任根里本工具 CA 的数量
+      2. 受信任根证书的指纹集合（不能只比较数量）
       3. 用户级 PAC 日志/锁是否保持原状，临时目录下是否残留 state.json
+      4. WinINet 默认连接设置二进制值是否逐字节保持原状
+      5. winget settings.json 是否逐字节保持原状（包括原本不存在）
 
     同时施加真实负载（默认 2 次 Range 请求），确保程序确实执行了
     "生成 CA → 终止 TLS → 改写 → 转发"这条链路——否则"什么都没改"可能只是因为它没跑起来。
@@ -68,16 +70,44 @@ function Read-State {
     catch {
         $auto = $null
     }
-    $cas = @(Get-ChildItem Cert:\CurrentUser\Root | Where-Object { $_.Subject -match 'winget-accel' })
+    # 每次打开新的只读存储；读取失败时终止验证，不能当成「没有证书」。
+    $rootStore = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
+    try {
+        $rootStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly -bor
+            [System.Security.Cryptography.X509Certificates.OpenFlags]::OpenExistingOnly)
+        $roots = @($rootStore.Certificates)
+        $caCount = @($roots | Where-Object { $_.Subject -match 'winget-accel' }).Count
+        $rootThumbprints = @($roots | ForEach-Object Thumbprint | Sort-Object) -join ','
+    }
+    finally { $rootStore.Dispose() }
     $pacDir = Join-Path $env:LOCALAPPDATA 'winget-accel'
     $journal = Join-Path $pacDir 'state.json'
+    $wingetSettings = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\settings.json'
+    $connectionPath = Join-Path $inet 'Connections'
+    $connectionValues = if (Test-Path -LiteralPath $connectionPath) {
+        $connectionKey = Get-Item -LiteralPath $connectionPath -ErrorAction Stop
+        try {
+            foreach ($name in @('DefaultConnectionSettings', 'SavedLegacySettings')) {
+                $value = $connectionKey.GetValue($name, $null)
+                if ($null -eq $value) { '<不存在>' }
+                elseif ($value -is [byte[]]) { [Convert]::ToBase64String($value) }
+                else { throw "WinINet $name 不是二进制设置，无法验证" }
+            }
+        }
+        finally { $connectionKey.Close() }
+    } else { '<不存在>' }
     [pscustomobject]@{
         AutoConfigURL = if ($null -eq $auto) { '<不存在>' } else { $auto }
-        CaCount       = $cas.Count
+        CaCount       = $caCount
+        RootThumbprints = $rootThumbprints
+        WingetSettings = if (Test-Path -LiteralPath $wingetSettings) {
+            (Get-FileHash -LiteralPath $wingetSettings -Algorithm SHA256).Hash
+        } else { '<不存在>' }
         Journal       = if (Test-Path -LiteralPath $journal) {
             (Get-FileHash -LiteralPath $journal -Algorithm SHA256).Hash
         } else { '<不存在>' }
         PacLock       = Test-Path -LiteralPath (Join-Path $pacDir 'pac.lock')
+        Connections   = $connectionValues -join '|'
     }
 }
 
@@ -103,7 +133,7 @@ try {
 
     $proxyProc = Start-Process $exe -ArgumentList '--config', ('"{0}"' -f $cfgPath), '--no-env' -PassThru -WindowStyle Hidden
 
-    $caPath = Join-Path $certDir 'ca-cert.pem'
+    $caPath = Join-Path $certDir 'root-cert.pem'
     $deadline = (Get-Date).AddSeconds(40)
     $ready = $false
     while ((Get-Date) -lt $deadline) {
@@ -135,7 +165,7 @@ try {
     $codes = @()
     for ($i = 1; $i -le $Requests; $i++) {
         # 显式覆盖 NO_PROXY，确保 GitHub 负载不会绕过本次代理。
-        $response = & curl.exe -sS --max-time 30 --noproxy 'localhost,127.0.0.1' `
+        $response = & curl.exe -q -sS --max-time 30 --noproxy 'localhost,127.0.0.1' `
             -x "http://127.0.0.1:$Port" --ssl-no-revoke `
             --cacert $caPath -r 0-65535 -o NUL -w '%{http_code}:%{size_download}' `
             $asset 2>&1
@@ -159,11 +189,17 @@ try {
     if ($during.AutoConfigURL -ne $before.AutoConfigURL) {
         $failures.Add("运行中 AutoConfigURL 被改动：$($before.AutoConfigURL) → $($during.AutoConfigURL)")
     }
-    if ($during.CaCount -ne $before.CaCount) {
-        $failures.Add("运行中受信任根 CA 数量变了：$($before.CaCount) → $($during.CaCount)")
+    if ($during.RootThumbprints -ne $before.RootThumbprints) {
+        $failures.Add('运行中受信任根证书指纹集合发生变化')
+    }
+    if ($during.WingetSettings -ne $before.WingetSettings) {
+        $failures.Add('运行中 winget 设置与基线不一致')
     }
     if ($during.Journal -ne $before.Journal -or $during.PacLock -ne $before.PacLock) {
         $failures.Add('运行中用户级 PAC 日志或锁被改动')
+    }
+    if ($during.Connections -ne $before.Connections) {
+        $failures.Add('运行中 WinINet 默认连接设置被改动')
     }
     if (Test-Path (Join-Path $work 'state.json')) {
         $failures.Add('--no-env 下不该写 state.json（那是接管系统时才写的）')
@@ -178,11 +214,17 @@ try {
     if ($after.AutoConfigURL -ne $before.AutoConfigURL) {
         $failures.Add("退出后 AutoConfigURL 与基线不一致：$($before.AutoConfigURL) → $($after.AutoConfigURL)")
     }
-    if ($after.CaCount -ne $before.CaCount) {
-        $failures.Add("退出后受信任根 CA 数量与基线不一致：$($before.CaCount) → $($after.CaCount)")
+    if ($after.RootThumbprints -ne $before.RootThumbprints) {
+        $failures.Add('退出后受信任根证书指纹集合与基线不一致')
+    }
+    if ($after.WingetSettings -ne $before.WingetSettings) {
+        $failures.Add('退出后 winget 设置与基线不一致')
     }
     if ($after.Journal -ne $before.Journal -or $after.PacLock -ne $before.PacLock) {
         $failures.Add('退出后用户级 PAC 日志或锁与基线不一致')
+    }
+    if ($after.Connections -ne $before.Connections) {
+        $failures.Add('退出后 WinINet 默认连接设置与基线不一致')
     }
 
     Write-Host ''
@@ -190,7 +232,7 @@ try {
         foreach ($f in $failures) { Write-Host "::error::$f" }
         exit 1
     }
-    Write-Host '通过：--no-env 全程未改动 AutoConfigURL / 受信任根，也没有留下 state.json' -ForegroundColor Green
+    Write-Host '通过：--no-env 全程未改动 AutoConfigURL / WinINet 连接设置 / 受信任根 / winget 设置，也没有留下 state.json' -ForegroundColor Green
 }
 finally {
     if ($null -ne $proxyProc -and -not $proxyProc.HasExited) {

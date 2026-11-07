@@ -113,8 +113,9 @@ CA 只允许签发四个白名单域及其子域：
     codeload.github.com
     release-assets.githubusercontent.com
 
-安装包下载完成后，winget 还会按官方清单校验 `InstallerSha256`。CA 私钥在
-certs\ca-key.pem 中，请勿分发或放入云同步目录。
+安装包下载完成后，winget 还会按官方清单校验 `InstallerSha256`。证书目录中的
+`root-cert.pem` 是 Windows 信任锚，`ca-cert.pem` 是带 Name Constraints 的中间 CA；
+两把私钥 `root-key.pem` 和 `ca-key.pem` 均以明文保存，请勿分发证书目录或放入云同步目录。
 
 卸载
 ----

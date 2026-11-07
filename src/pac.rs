@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn windows_pac_engine_honors_exact_direct_rules_expiry_and_url_refresh() {
-        use std::io::{Read, Write};
+        use std::io::{BufRead, Read, Write};
         use std::sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -115,9 +115,17 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
+        // Use a distinct loopback port for the refreshed PAC. WinHTTP may
+        // cache an auto-config script more broadly than its URL path, so a
+        // different endpoint makes the revision change observable.
+        let refresh_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let refresh_address = refresh_listener.local_addr().unwrap();
+        refresh_listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = stop.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
             while !server_stop.load(Ordering::Relaxed) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -126,17 +134,86 @@ mod tests {
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                     .unwrap();
-                let mut raw = [0; 4096];
-                let count = stream.read(&mut raw).unwrap_or(0);
-                let expires = if String::from_utf8_lossy(&raw[..count]).contains("route=2") {
-                    0
-                } else {
-                    9_000_000_000_000
-                };
+                // Consume the complete request before closing; leaving unread
+                // headers can cause a TCP reset and sporadic PAC download errors.
+                let mut raw = String::new();
+                {
+                    let mut reader = std::io::BufReader::new(&mut stream);
+                    while raw.len() < 4096 && !raw.ends_with("\r\n\r\n") {
+                        if reader.read_line(&mut raw).unwrap_or(0) == 0 {
+                            break;
+                        }
+                    }
+                }
+                let expires = 9_000_000_000_000;
                 let body = build_with_routes(8443, &hosts(), &[("github.com".into(), expires)]);
-                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/x-ns-proxy-autoconfig\r\n\
+                     Cache-Control: no-store\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\
+                     \r\n\
+                     {body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
             }
         });
+        let refresh_stop = stop.clone();
+        let refresh_server = std::thread::spawn(move || {
+            while !refresh_stop.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = refresh_listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut raw = String::new();
+                {
+                    let mut reader = std::io::BufReader::new(&mut stream);
+                    while raw.len() < 4096 && !raw.ends_with("\r\n\r\n") {
+                        if reader.read_line(&mut raw).unwrap_or(0) == 0 {
+                            break;
+                        }
+                    }
+                }
+                let body = build_with_routes(8443, &hosts(), &[("github.com".into(), 0)]);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/x-ns-proxy-autoconfig\r\n\
+                     Cache-Control: no-store\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\
+                     \r\n\
+                     {body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        // A fixed sleep cannot prove that the serving thread has entered its
+        // accept loop. Complete one explicit warm-up request before the first
+        // WinHTTP PAC fetch; otherwise WinHTTP can sporadically report 12167
+        // even though the listener is already bound.
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("PAC fixture server did not start");
+        let mut warmup = std::net::TcpStream::connect(address).unwrap();
+        warmup
+            .write_all(b"GET /warmup HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut discarded = Vec::new();
+        warmup.read_to_end(&mut discarded).unwrap();
+        let mut refresh_warmup = std::net::TcpStream::connect(refresh_address).unwrap();
+        refresh_warmup
+            .write_all(b"GET /warmup HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut discarded = Vec::new();
+        refresh_warmup.read_to_end(&mut discarded).unwrap();
         let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
         let mut results = Vec::new();
         // SAFETY: session and output buffers are released below; UTF-16 inputs
@@ -151,7 +228,11 @@ mod tests {
             );
             if !session.is_null() {
                 WinHttpSetTimeouts(session, 1000, 1000, 1000, 1000);
-                for (url, revision, expected) in [
+                // WinHTTP may cache a proxy decision by target URL even when the
+                // PAC URL changes. Keep the final refresh check on the same host
+                // but use a distinct target query so this test exercises the
+                // newly fetched PAC rather than a stale per-URL decision.
+                for (index, (url, revision, expected)) in [
                     ("https://GitHub.com/file", 1, WINHTTP_ACCESS_TYPE_NO_PROXY),
                     (
                         "https://api.github.com/file",
@@ -165,46 +246,68 @@ mod tests {
                     ),
                     ("https://example.com/file", 1, WINHTTP_ACCESS_TYPE_NO_PROXY),
                     (
-                        "https://github.com/file",
+                        "https://github.com/file?pac-refresh=2",
                         2,
                         WINHTTP_ACCESS_TYPE_NAMED_PROXY,
                     ),
-                ] {
-                    let pac_url = wide(&format!(
-                        "http://{address}/winget-accel.pac?route={revision}"
-                    ));
-                    let mut options: WINHTTP_AUTOPROXY_OPTIONS = std::mem::zeroed();
-                    options.dwFlags =
-                        WINHTTP_AUTOPROXY_CONFIG_URL | WINHTTP_AUTOPROXY_RUN_INPROCESS;
-                    options.lpszAutoConfigUrl = pac_url.as_ptr();
-                    let mut proxy: WINHTTP_PROXY_INFO = std::mem::zeroed();
-                    let ok = WinHttpGetProxyForUrl(
-                        session,
-                        wide(url).as_ptr(),
-                        &mut options,
-                        &mut proxy,
-                    );
-                    results.push((
-                        url,
-                        expected,
-                        if ok == 0 {
-                            Err(std::io::Error::last_os_error())
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let mut result = Err(std::io::Error::from_raw_os_error(12167));
+                    for retry in 0..4 {
+                        let target = if retry == 0 {
+                            url.to_string()
+                        } else if url.contains('?') {
+                            format!("{url}&pac-retry={retry}")
                         } else {
-                            Ok(proxy.dwAccessType)
-                        },
-                    ));
-                    if !proxy.lpszProxy.is_null() {
-                        GlobalFree(proxy.lpszProxy.cast());
+                            format!("{url}?pac-retry={retry}")
+                        };
+                        let pac_address = if revision == 2 {
+                            refresh_address
+                        } else {
+                            address
+                        };
+                        let pac_url = wide(&format!(
+                            "http://{pac_address}/winget-accel-r{revision}-{index}-{retry}.pac"
+                        ));
+                        let mut options: WINHTTP_AUTOPROXY_OPTIONS = std::mem::zeroed();
+                        options.dwFlags = WINHTTP_AUTOPROXY_CONFIG_URL
+                            | WINHTTP_AUTOPROXY_RUN_INPROCESS
+                            | WINHTTP_AUTOPROXY_NO_CACHE_CLIENT
+                            | WINHTTP_AUTOPROXY_NO_CACHE_SVC;
+                        options.lpszAutoConfigUrl = pac_url.as_ptr();
+                        let mut proxy: WINHTTP_PROXY_INFO = std::mem::zeroed();
+                        let ok = WinHttpGetProxyForUrl(
+                            session,
+                            wide(&target).as_ptr(),
+                            &mut options,
+                            &mut proxy,
+                        );
+                        if ok != 0 {
+                            result = Ok(proxy.dwAccessType);
+                        } else {
+                            result = Err(std::io::Error::last_os_error());
+                        }
+                        if !proxy.lpszProxy.is_null() {
+                            GlobalFree(proxy.lpszProxy.cast());
+                        }
+                        if !proxy.lpszProxyBypass.is_null() {
+                            GlobalFree(proxy.lpszProxyBypass.cast());
+                        }
+                        if result.is_ok() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
                     }
-                    if !proxy.lpszProxyBypass.is_null() {
-                        GlobalFree(proxy.lpszProxyBypass.cast());
-                    }
+                    results.push((url, expected, result));
                 }
                 WinHttpCloseHandle(session);
             }
         }
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap();
+        refresh_server.join().unwrap();
         assert_eq!(results.len(), 5, "WinHTTP session creation failed");
         for (url, expected, result) in results {
             assert_eq!(

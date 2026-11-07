@@ -293,6 +293,12 @@ pub(crate) fn split_asset(asset: &str) -> Option<(String, String)> {
         return None;
     }
     let authority = uri.authority()?;
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    if uri.port_u16() == Some(0) {
+        return None;
+    }
     let path = uri.path_and_query()?;
     if path.path() == "/" {
         return None;
@@ -659,6 +665,8 @@ mod tests {
         // 只接受 https：否则会把 http 资产拼成 https://host/... 的错误路径
         assert!(split_asset("http://github.com/a").is_none());
         assert!(split_asset("https://github.com").is_none());
+        assert!(split_asset("https://github.com:0/a").is_none());
+        assert!(split_asset("https://user@github.com/a").is_none());
         assert!(split_asset("not-a-url").is_none());
     }
 

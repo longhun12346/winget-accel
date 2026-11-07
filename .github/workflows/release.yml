@@ -41,13 +41,13 @@ jobs:
       # 打包前先跑一遍与主 CI 相同的测试：产物必须来自测试通过的代码。
       # 分开执行，为协议测试单独设置串行运行并明确失败位置。
       - name: Rust 单元测试
-        run: cargo test --bin winget-accel --offline
+        run: cargo test --bin winget-accel --locked --offline -- --test-threads=1
 
       - name: Rust 协议集成测试（无网、不改系统状态）
-        run: cargo test --test protocol --offline -- --test-threads=1
+        run: cargo test --test protocol --locked --offline -- --test-threads=1
 
       - name: clippy（警告即失败）
-        run: cargo clippy --all-targets --offline -- -D warnings
+        run: cargo clippy --all-targets --locked --offline -- -D warnings
 
       - name: 组装发布包
         id: pack
@@ -73,18 +73,25 @@ jobs:
 
           # 关闭 ANSI 颜色，确保下面对 `Compiling winget-accel` 的文本匹配稳定。
           $env:CARGO_TERM_COLOR = 'never'
-          (Get-Item src\main.rs).LastWriteTime = (Get-Date).AddMinutes(2)
-          $out = cargo build --release --offline 2>&1
-          $out | Select-String -Pattern 'Compiling|Finished' | ForEach-Object { $_.Line }
-          if (-not ($out | Select-String -Pattern 'Compiling winget-accel')) {
-            throw "没有真正重编（cargo 认为已是最新），这次的比较无效"
+          $source = Get-Item src\main.rs
+          $originalMtime = $source.LastWriteTime
+          try {
+            $source.LastWriteTime = (Get-Date).AddMinutes(2)
+            $out = cargo build --release --locked --offline 2>&1
+            $out | Select-String -Pattern 'Compiling|Finished' | ForEach-Object { $_.Line }
+            if (-not ($out | Select-String -Pattern 'Compiling winget-accel')) {
+              throw "没有真正重编（cargo 认为已是最新），这次的比较无效"
+            }
+            $rebuilt = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+            Write-Host "重编产物 = $rebuilt"
+            if ($shipped -ne $rebuilt) {
+              throw "发布产物不可复现：包内 $shipped，重编 $rebuilt（用户将无法核对 SHA256）"
+            }
+            Write-Host "可复现性通过：已打包的 exe 可由同一源码逐字节重建"
           }
-          $rebuilt = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
-          Write-Host "重编产物 = $rebuilt"
-          if ($shipped -ne $rebuilt) {
-            throw "发布产物不可复现：包内 $shipped，重编 $rebuilt（用户将无法核对 SHA256）"
+          finally {
+            $source.LastWriteTime = $originalMtime
           }
-          Write-Host "可复现性通过：已打包的 exe 可由同一源码逐字节重建"
 
 
       # env!("CARGO_PKG_VERSION") 是编译期常量，若某处缓存导致没重新编译，

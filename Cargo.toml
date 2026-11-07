@@ -49,10 +49,12 @@ http-body-util = "0.1.5"
 bytes = "1.12.1"
 # 复用现有 rustls 配置与 ring 后端，把 TLS 握手/流接入 Tokio。
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
-# 复用成熟的读写空闲超时适配器，避免自行实现 AsyncRead/AsyncWrite 计时。
+# 复用成熟超时计时器；薄 I/O 适配层在另一方向有字节进展时重置等待期限。
 tokio-io-timeout = "1.2.1"
 
 [dev-dependencies]
+# Virtual time exercises connection idle deadlines without minute-long unit tests.
+tokio = { version = "1.54.1", features = ["test-util"] }
 # Evaluate generated PAC with Windows' own engine; no registry/system proxy edits.
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinHttp"] }
 
