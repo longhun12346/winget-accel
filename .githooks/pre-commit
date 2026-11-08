@@ -39,11 +39,11 @@ if git grep -nE '\?\?\?' -- 'src/*.rs' 'docs/*.md' 'README.md' 2>/dev/null; then
     exit 1
 fi
 
-echo "[pre-commit] cargo test ..."
+echo "[pre-commit] cargo test --bin winget-accel --test-threads=1 ..."
 # 用 --quiet 但保留失败信息；输出捕获到临时文件，失败时才打印，
 # 避免每次提交都刷一屏测试输出。
 OUT=$(mktemp 2>/dev/null || echo /tmp/precommit.$$)
-if ! cargo test --quiet >"$OUT" 2>&1; then
+if ! cargo test --quiet --bin winget-accel -- --test-threads=1 >"$OUT" 2>&1; then
     echo "" >&2
     echo "[pre-commit] 单测失败。已拒绝提交。" >&2
     echo "------------ 测试输出 ------------" >&2
